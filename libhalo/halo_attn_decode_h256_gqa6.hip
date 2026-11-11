@@ -1,3 +1,7 @@
+/* NOTICE OF CHANGE (Apache-2.0 section 4(b)): this file was modified in the UNOFFICIAL fork
+ * github.com/jsaigou/radiance, not by the original authors. The original project is
+ * https://codeberg.org/StillDeadcode/radiance . The change is in decode_scratch(): the declare-time
+ * sweep now also covers q_len (see UNOFFICIAL-FORK.md and fork-notes/01-*). */
 /* Derived from libr4d/r4d_attn_decode_h256_gqa6.hip by the libhalo rename transform (2026-10-26),
  * then ported to gfx1151; see libhalo/README.md. */
 // Halo split-KV paged decode (also the MTP-verify shape), head_dim 256, 6 queries per KV head,
@@ -1230,11 +1234,21 @@ static int64_t decode_scratch(const RadArgs* a, long long row = 0, int rep = 1,
         /* max_ctx feeds only the split law. Zero would pick one split and undersize the buffer for
          * a launch that later picks more, so refuse. */
         if (r.max_ctx <= 0) return HALO_NO(RAD_E_INVAL);
+        /* The sweep covers q_len as well as the sequence count. The split law is not monotone in
+         * q_len either: it targets 192 workgroups while q_len * gqa <= 32 and 128 above, so for
+         * gqa 8 a 4-row verify step (q_len 4) takes more splits than the band's upper bound (q_len 5)
+         * and needs a larger partial buffer: 4 * 192 = 768 against 5 * 128 = 640 units. Sizing at
+         * the upper bound alone left an MTP depth-3 verify step with "scratch buffer absent or too
+         * small". The law is a closed form, so the extra sweep is cheap. */
+        const int q_hi = r.q_len > 0 ? r.q_len : 1;
         int64_t worst = 0;
-        for (long long n = 1; n <= max_seqs; ++n) {
-            r.num_seqs = (int)n;
-            const int64_t need = (int64_t)decode_scratch_bytes<OPT, WIN>(&r);
-            if (need > worst) worst = need;
+        for (int q = 1; q <= q_hi; ++q) {
+            r.q_len = q;
+            for (long long n = 1; n <= max_seqs; ++n) {
+                r.num_seqs = (int)n;
+                const int64_t need = (int64_t)decode_scratch_bytes<OPT, WIN>(&r);
+                if (need > worst) worst = need;
+            }
         }
         return worst;
     }
