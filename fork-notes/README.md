@@ -10,7 +10,8 @@ original author. This is an unofficial fork: see [`../UNOFFICIAL-FORK.md`](../UN
 | 01 | MTP speculation depth 3 aborts with "scratch buffer absent or too small" (`libhalo`, gqa 8) | **fixed** on branch `unofficial-fixes` |
 | 02 | `libhalo` is refused beside `libavx` (schema mismatches) and has 34 fewer ops than `libr4d` | not fixed; workaround `RADIANCE_KERNELS=libhalo` |
 | 03 | MTP speculation intermittently gives no speedup with 2+ concurrent streams | not fixed; cause not found, characterised |
-| 04 | Silent output corruption when 2+ long sequences run while another process (llama.cpp) uses the GPU | not fixed; cause not found; workaround `--max-num-seqs 1` while the GPU is shared |
+| 04 | Silent output corruption with 2+ concurrent sequences (earlier thought to need another process on the GPU: it does not) | **fixed** by note 05; this note records the symptom and how it was narrowed |
+| 05 | `libhalo` prefill split-KV merge overwrites decode rows in a mixed step (the cause of 04) | **fixed** on branch `unofficial-fixes` |
 
 Unrelated observation: with the FP8 KV cache, speculative decoding at temperature 0 is not bit-identical to non-speculative decoding
 (synonym-level divergence after a few hundred characters). `GUIDE.md` says greedy text matches; this may just be summation order across

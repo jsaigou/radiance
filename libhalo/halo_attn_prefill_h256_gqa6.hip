@@ -1,3 +1,8 @@
+/* NOTICE OF CHANGE (Apache-2.0 section 4(b)): this file was modified in the UNOFFICIAL fork
+ * github.com/jsaigou/radiance, not by the original authors. The original project is
+ * https://codeberg.org/StillDeadcode/radiance . The change is in halo_attn_prefill_merge(): the
+ * split-KV merge no longer touches token rows outside the launch's own sequence range (see
+ * UNOFFICIAL-FORK.md and fork-notes/05-*). */
 /* Derived from libr4d/r4d_attn_prefill_h256_gqa6.hip by the libhalo rename transform
  * (2026-10-26), then ported to gfx1151; see libhalo/README.md and libhalo/halo_dt16.h. */
 // Halo prefill. Transposed core: S^T = K.Q^T, one lane owns one query row, ROWS = 16*NWARPS,
@@ -878,15 +883,27 @@ static inline int64_t halo_prefill_scratch(const RadArgs* a, long long row = 0) 
 // Combine the splits' partials into bf16 out: one wave a (token, q head) row, HEAD_DIM / 32 dims a
 // lane. A row whose split 0 says l < 0 belongs to an empty sequence and is left as the plain kernel
 // leaves it.
+//
+// A ragged launch owns only the token rows [cu_q[0], cu_q[num_seqs]): a mixed step issues its
+// prefill half with cu_seqlens + D, so the first D rows (the decode half, already attended by the
+// previous launch) are outside every sequence. The kernel wrote no partials for them, so their
+// (m, l) pairs are whatever the shared scratch held, and merging them overwrote the decode rows'
+// attention output with stale data (silent corruption of a decoding sequence's token whenever a
+// split prefill chunk shared its step). Rows outside the range are left alone.
 template <int HEAD_DIM>
 __global__ __launch_bounds__(256)
 void halo_attn_prefill_merge(const float* __restrict__ part, uint16_t* __restrict__ out,
-                             int rows, int nsplit)
+                             int rows, int nsplit, const int* __restrict__ cu_q, int num_seqs,
+                             int q_heads)
 {
     constexpr int DPL = HEAD_DIM / 32;
     const int row = (int)blockIdx.x * 8 + (int)(threadIdx.x >> 5);
     const int lane = threadIdx.x & 31;
     if (row >= rows) return;
+    if (cu_q) {
+        const int tok = row / q_heads;
+        if (tok < cu_q[0] || tok >= cu_q[num_seqs]) return;
+    }
     const float* ml = part + (size_t)nsplit * rows * HEAD_DIM;
     if (ml[(size_t)row * 2 + 1] < 0.0f) return;
     float mx = -3.0e38f;
@@ -926,7 +943,8 @@ static int halo_prefill_launch(const HaloArgs* a, hipStream_t s) {
     if (r.splits > 1) {
         const int rows = halo_q_total(r) * r.q_heads;
         hipLaunchKernelGGL((halo_attn_prefill_merge<HEAD_DIM>), dim3((rows + 7) / 8), dim3(256),
-                           0, s, (const float*)r.scratch, (uint16_t*)r.out, rows, r.splits);
+                           0, s, (const float*)r.scratch, (uint16_t*)r.out, rows, r.splits,
+                           r.cu_q, r.num_seqs, r.q_heads);
         e = hipGetLastError();
         if (e != hipSuccess) return -100 - (int)e;
     }

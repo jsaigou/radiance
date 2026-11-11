@@ -25,7 +25,11 @@ Changes on `unofficial-fixes`, relative to the original:
 1. **Bug fix:** `libhalo/halo_attn_decode_h256_gqa6.hip` — MTP speculation at depth 3 aborted on Strix Halo with
    "scratch buffer absent or too small". The declare-time scratch sizing now also sweeps `q_len`. Details and verification:
    [`fork-notes/01-libhalo-mtp-depth3-scratch-undersized.md`](fork-notes/01-libhalo-mtp-depth3-scratch-undersized.md).
-2. This notice (`README.md` banner, this file, and the `fork-notes/` folder). No other files are changed.
+2. **Bug fix:** `libhalo/halo_attn_prefill_h256_gqa6.hip` — a mixed step (decoding rows plus two or more prefill chunks) silently overwrote the
+   decoding sequence's attention output with stale scratch, giving degenerate answers in roughly 10-25% of concurrent requests. The split-KV merge
+   now skips rows outside its launch's own sequence range. Details and verification:
+   [`fork-notes/05-libhalo-prefill-merge-corrupts-decode-rows.md`](fork-notes/05-libhalo-prefill-merge-corrupts-decode-rows.md).
+3. This notice (`README.md` banner, this file, and the `fork-notes/` folder). No other files are changed.
 
 Bugs we found but did **not** fix (descriptions only): [`fork-notes/`](fork-notes/).
 
