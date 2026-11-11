@@ -9,7 +9,7 @@ original author. This is an unofficial fork: see [`../UNOFFICIAL-FORK.md`](../UN
 |---|---|---|
 | 01 | MTP speculation depth 3 aborts with "scratch buffer absent or too small" (`libhalo`, gqa 8) | **fixed** on branch `unofficial-fixes` |
 | 02 | `libhalo` is refused beside `libavx` (schema mismatches) and has 34 fewer ops than `libr4d` | not fixed; workaround `RADIANCE_KERNELS=libhalo` |
-| 03 | MTP speculation intermittently gives no speedup with 2+ concurrent streams | not fixed; cause not found, characterised |
+| 03 | MTP speculation intermittently gave no speedup with 2+ concurrent streams | **not reproducible after the note-05 fix** (about 50 runs); cause never found; kept as a record |
 | 04 | Silent output corruption with 2+ concurrent sequences (earlier thought to need another process on the GPU: it does not) | **fixed** by note 05; this note records the symptom and how it was narrowed |
 | 05 | `libhalo` prefill split-KV merge overwrites decode rows in a mixed step (the cause of 04) | **fixed** on branch `unofficial-fixes` |
 

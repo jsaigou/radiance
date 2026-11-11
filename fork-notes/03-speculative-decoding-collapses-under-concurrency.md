@@ -1,6 +1,6 @@
 # MTP speculation intermittently gives no speedup with 2+ concurrent streams
 
-*Not fixed in this unofficial fork. Root cause not found: this is a characterisation. Not reported to, or confirmed by, the original author.*
+*Not fixed in this unofficial fork, and **no longer reproducible** on the build with the note-05 fix (see "Update 2026-11-11" below). The root cause was never found: this is a characterisation of what was observed before that fix. Not reported to, or confirmed by, the original author.*
 
 ## Summary
 
@@ -45,6 +45,18 @@ of the `/metrics` counters (`radiance:engine_steps_decode_total`, `...decode_tok
 | depth 2 | 6 of 10 |
 | `--no-prefix-cache` | 7 of 10 |
 | speculation off | 0 of 10 (stable: 40 / 71 / 98 / 113 / 174 tok/s at 1 / 2 / 3 / 4 / 8 streams) |
+
+## Update 2026-11-11: not reproduced after the note-05 fix
+
+The measurements above were taken before the prefill-merge fix in [note 05](05-libhalo-prefill-merge-corrupts-decode-rows.md). After that fix we re-measured on the same hardware and model
+(`qwen3.6-35b-a3b-fp8.rad`, `--kv-cache-dtype fp8`, `--max-model-len 131072`, `RADIANCE_KERNELS=libhalo`, speculative depth 4, `--max-num-seqs` 2, 4 and 8, mixed prose/code/json prompts, 400 tokens per request):
+
+- About 50 runs at 2 or more concurrent streams, 12 of them at exactly 4 streams: **no run fell into the slow mode.**
+- Tokens per row per step stayed at 2.0-2.2 (the slow mode was exactly 1.0); position-1 acceptance stayed at 0.63-0.79 (the slow mode was 0.08-0.41).
+- Aggregate decode at 4 streams: 127-136 tok/s with `--max-num-seqs 4`, against about 105 tok/s mean and 2x run-to-run variance before.
+
+We do not know why. It may be a side effect of the note-05 fix (the merge kernel corrupted decode rows in mixed steps, which could also have damaged the first draft position's inputs), or the earlier runs may have been affected by something we have not identified. We did not bisect it. Treat this note as a historical record of an
+observation that has not recurred on the fixed build, not as a current defect. A re-appearance (tokens per row near 1.0 at 2 or more streams) should be reported against the build with note 05's fix.
 
 ## Hypotheses (unverified)
 
