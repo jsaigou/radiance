@@ -1,3 +1,31 @@
+> # ⚠️ UNOFFICIAL FORK — this is not the original Radiance
+>
+> **The original project is at <https://codeberg.org/StillDeadcode/radiance>** (author: Deadcode / StillDeadcode;
+> project site <https://radiance.stilldeadco.de/>). Official releases, documentation, support and issue tracking are
+> there. **If you want Radiance, go there.** The README below the line is the original author's, unchanged.
+>
+> **This repository is unofficial.** It is maintained by a third party, is not affiliated with or endorsed by the
+> original author, and comes with no support from them. Please do not report problems with this fork to the original
+> author.
+>
+> **Why it exists.** We run Radiance on AMD Strix Halo (gfx1151), found a few bugs, and fixed one. We did not want to
+> create an account on Codeberg just to file them, so rather than keep the fixes private we publish them here, with the
+> findings written up, so that other Strix Halo users (and the original author, if useful) can find them.
+>
+> **How it differs from the original.** It contains **bug fixes that are not in the original**, and nothing else:
+>
+> | | |
+> |---|---|
+> | `main` branch | an exact mirror of the original (no changes), with all release tags |
+> | `unofficial-fixes` branch (default) | the original at commit `451b136` plus the fixes below, this banner, and notes under [`fork-notes/`](fork-notes/) |
+> | Fix 1 | MTP speculation depth 3 aborted with "scratch buffer absent or too small" on Strix Halo (`libhalo/halo_attn_decode_h256_gqa6.hip`) |
+>
+> Bugs we found but did **not** fix are described in [`fork-notes/`](fork-notes/). See
+> [`UNOFFICIAL-FORK.md`](UNOFFICIAL-FORK.md) for details. Everything is Apache-2.0 like the original; `LICENSE` and `NOTICE`
+> are unchanged. If you like Radiance, please support the original author (their Patreon link is in the README below).
+>
+> ---
+
 # radiance
 
 An inference server for AMD GPUs, in C++ and HIP: language models, and image, video, speech and
