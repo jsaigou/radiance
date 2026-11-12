@@ -23676,7 +23676,12 @@ static void moe_down_dec_case(const Plugin& pl, const MoeDnShape& sh, const char
             const void* fn = nullptr;
             const int rc = run(pins, &got, &fn);
             if (rc != RAD_OK) { ok(label.c_str(), false, "launch rc=" + std::to_string(rc)); continue; }
-            if (!fn || fn == fn0) {
+            /* The rule gives the 3- and 4-bit w64 forms the (tile, run) kernel below 200 rows (faster
+             * than moe_down_dec_kernel there); the bytes are still held to the same ones. */
+            const bool es_rule = v.dn == 0 && Tr < 200 &&
+                                 (what.find("w4nl64a8h") != std::string::npos ||
+                                  what.find("w3nl64a8h") != std::string::npos);
+            if (!fn || (fn == fn0 && !es_rule)) {
                 ok(label.c_str(), false, fn ? "dispatched the (tile, run) form's kernel"
                                             : "dispatched nothing");
                 continue;
