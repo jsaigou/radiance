@@ -749,6 +749,95 @@ static void esweep(const Plugin& pl, int trials, int reps) {
     }
 }
 
+
+/* layout: host-only tests of the w3nl64a8h (and w4) layout hooks. (a) a K that is not whole 128s must be
+ * refused by layout, relayout and unrelayout (RAD_E_SHAPE), writing nothing; (b) at accepted K, relayout
+ * into a guard-bracketed buffer writes inside it only, and unrelayout restores the original codes and
+ * scales exactly. Run under HALO_W3_IL=1 and 0 for the interleaved and planar forms (the layout reads
+ * the variable once per process, as the launcher does); both must restore the same codes. */
+static void layout_tests(const Plugin& pl) {
+    const RadKernelInfo* r = find(pl, "moe_gemm_w4a8_mod4");
+    if (!r || !r->unrelayout) { ok("layout: row and unrelayout hook present", false); return; }
+    const int64_t N = 1024;
+    for (const Fmt* F : { &kW3, &kW4 }) {
+        for (int64_t K : { 96, 160, 32, 128, 256, 2048 }) {
+            const bool want_refuse = K % 128 != 0;   /* w3: the 48-byte block; w4: the scale group */
+            const std::string tag = std::string(F->name) + " K=" + std::to_string(K);
+            Planes base = make_planes(*F, N, K, 0x51u);
+            const std::vector<RadParam> lp = {
+                PI("N", N), PI("K", K), PI("N_1", N), PI("K_1", K), PI("N_2", N), PI("K_2", K),
+                PI("N_3", N), PI("K_3", K), PI("group", 128), PS("dtype", F->name),
+            };
+            for (int operand : { 2, 3 }) {
+                const char* roles2[] = { "codes", "table" };
+                const char* roles3[] = { "scale", "scale.1" };
+                const char** ro = operand == 2 ? roles2 : roles3;
+                int sel[2];
+                RadTensor pt[2];
+                for (int i = 0; i < 2; ++i) { sel[i] = base.find(ro[i]); pt[i] = base.t(sel[i]); }
+                RadLayout L;
+                std::memset(&L, 0, sizeof L);
+                const int rl = r->layout(lp.data(), (int)lp.size(), operand, &base.enc, sel, pt, 2, &L);
+                if (want_refuse) {
+                    std::vector<uint8_t> g(4096, 0xA5);
+                    const int rr = r->relayout(lp.data(), (int)lp.size(), operand, &base.enc, sel, pt, 2,
+                                               g.data() + 64, 1024);
+                    bool clean = true;
+                    for (uint8_t b : g) clean = clean && b == 0xA5;
+                    // operand 3 (scales) is not K%128-restricted by this guard only if layout accepts it
+                    if (operand == 2)
+                        ok(tag + " operand 2: layout and relayout refuse", rl == RAD_E_SHAPE && rr == RAD_E_SHAPE && clean,
+                           "rc " + std::to_string(rl) + "/" + std::to_string(rr));
+                    continue;
+                }
+                if (rl != RAD_OK) { ok(tag + " layout accepted", false, "rc " + std::to_string(rl)); continue; }
+                const size_t gd = 256;
+                std::vector<uint8_t> buf((size_t)L.bytes + 2 * gd, 0xA5);
+                const int rr = r->relayout(lp.data(), (int)lp.size(), operand, &base.enc, sel, pt, 2,
+                                           buf.data() + gd, L.bytes);
+                bool guard = true;
+                for (size_t i = 0; i < gd; ++i) guard = guard && buf[i] == 0xA5 && buf[gd + (size_t)L.bytes + i] == 0xA5;
+                ok(tag + " operand " + std::to_string(operand) + " relayout stays inside the plane",
+                   rr == RAD_OK && guard, "rc " + std::to_string(rr));
+                // unrelayout into fresh planes, with a guard past each plane
+                Planes back = make_planes(*F, N, K, 0x99u);
+                std::vector<std::vector<uint8_t>> saved;
+                for (int i = 0; i < 2; ++i) {
+                    back.data[(size_t)sel[i]].assign(back.data[(size_t)sel[i]].size() + 64, 0);
+                    std::fill(back.data[(size_t)sel[i]].end() - 64, back.data[(size_t)sel[i]].end(), 0xA5);
+                }
+                RadTensor pb[2];
+                for (int i = 0; i < 2; ++i) {
+                    pb[i] = base.t(sel[i]);
+                    pb[i].data = back.data[(size_t)sel[i]].data();
+                }
+                const int ru = r->unrelayout(lp.data(), (int)lp.size(), operand, &base.enc, sel,
+                                             buf.data() + gd, L.bytes, pb, 2);
+                bool same = ru == RAD_OK, ginta = true;
+                for (int i = 0; i < 2 && same; ++i) {
+                    const size_t n = base.data[(size_t)sel[i]].size();
+                    same = same && std::memcmp(back.data[(size_t)sel[i]].data(), base.data[(size_t)sel[i]].data(), n) == 0;
+                    for (size_t j = n; j < n + 64; ++j) ginta = ginta && back.data[(size_t)sel[i]][j] == 0xA5;
+                }
+                ok(tag + " operand " + std::to_string(operand) + " relayout then unrelayout restores the original",
+                   same && ginta, "rc " + std::to_string(ru));
+            }
+        }
+    }
+    // unrelayout of an unaccepted K must refuse too
+    {
+        const int64_t K = 96;
+        Planes base = make_planes(kW3, N, K, 0x51u);
+        const std::vector<RadParam> lp = { PI("N", N), PI("K", K), PI("N_1", N), PI("K_1", K), PI("N_2", N), PI("K_2", K),
+                                           PI("N_3", N), PI("K_3", K), PI("group", 128), PS("dtype", kW3.name) };
+        int sel[2] = { base.find("codes"), base.find("table") };
+        RadTensor pt[2] = { base.t(sel[0]), base.t(sel[1]) };
+        std::vector<uint8_t> src((size_t)(40 * N), 0x5A);
+        const int ru = r->unrelayout(lp.data(), (int)lp.size(), 2, &base.enc, sel, src.data(), 36 * N, pt, 2);
+        ok("w3 K=96 unrelayout refuses", ru == RAD_E_SHAPE, "rc " + std::to_string(ru));
+    }
+}
+
 /* ------------------------------------------------------------------ the layout alone */
 /* The weight read the way the kernel's threads read it, nothing else: a block of 128 threads takes 64
  * rows, four threads a row (one 32-element segment each), the K loop in the kernel's order (start
@@ -855,6 +944,7 @@ int main(int argc, char** argv) {
         return g_fail ? 1 : 0;
     }
     if (mode == "decode") { decode(pl, argc > 3 ? std::atoi(argv[3]) : 9, argc > 4 ? std::atoi(argv[4]) : 200); return 0; }
+    if (mode == "layout") { layout_tests(pl); std::printf("%s (%d failures)\n", g_fail ? "FAILED" : "all passed", g_fail); return g_fail ? 1 : 0; }
     if (mode == "esweep") { esweep(pl, argc > 3 ? std::atoi(argv[3]) : 9, argc > 4 ? std::atoi(argv[4]) : 200); return 0; }
     if (mode == "bench") { bench(pl, argc > 3 ? std::atoi(argv[3]) : 96); return 0; }
     if (mode == "readpat") { readpat(argc > 3 ? std::atoi(argv[3]) : 20); return 0; }

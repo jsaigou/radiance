@@ -1012,6 +1012,9 @@ int moew4_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding*
     const bool w3 = moe_w3(p, n_p);
     const int  g64 = moe_w4_g64(p, n_p);             /* scale groups a 128 of K, or 0 */
     if ((w5 || w3) && g.K % 32) return RAD_E_SHAPE;   /* a sign word is 32 elements */
+    /* The 3-bit rows hold 48 bytes per 128 of K (interleaved) and the GEMM refuses any other K, so a
+     * K that is not whole 128s would have moew3_row write past the K/8*3-byte row. */
+    if (w3 && g.K % 128) return RAD_E_SHAPE;
     if (g64 ? !halo_enc::affine_table2(enc, w3 ? RAD_U3 : w5 ? RAD_U5 : RAD_U4, RAD_F8E4M3, 1,
                                       g.group / g64, RAD_F32, RAD_F32, w3 ? 8 : w5 ? 32 : 16, fw)
        : nl ? !halo_enc::affine_table(enc, RAD_U4, RAD_BF16, 1, g.group, RAD_F32, 16, fw)
@@ -1170,8 +1173,9 @@ void moew5_row(const uint8_t* s, uint8_t* d, int64_t K, uint8_t* nib, bool forwa
  * either way. The code is sign * 4 + magnitude because libquant's table lists its four magnitudes then
  * their negatives. */
 inline bool moew3_il() {
-    const char* e = std::getenv("HALO_W3_IL");
-    return !(e && *e == '0');
+    /* Read once, as halo_moe_gemm_q.hip's moeq_w3_il does, so the layout and the launcher agree. */
+    static const bool il = [] { const char* e = std::getenv("HALO_W3_IL"); return !(e && *e == '0'); }();
+    return il;
 }
 inline void moew3_at(bool il, int64_t K, int64_t c0, int64_t* mo, int64_t* so) {
     if (il) {
