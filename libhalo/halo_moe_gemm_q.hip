@@ -247,20 +247,34 @@ __device__ __forceinline__ void moeq_w5_expand(const uint32_t* p, uint32_t sg,
     for (uint32_t m = 0; m < 8; ++m) o[m] |= (sg << m) & 0x80808080u;
 }
 
-/* w3nl64a8h's 32 codes: eight magnitude indices of two bits per byte lane, one v_perm_b32 each four.
- * `p0`/`p1` hold elements 0..15 and 16..31 as halo_layout.cpp's moew3_row packs them: element
- * 16h + 4m + b is bit pair m of byte b of word h, so output dword 4h + m (elements 4(4h+m)..+3, E4M3
- * bytes) takes its four byte-lane selectors from (p_h >> 2m) & 0x03030303 and looks them up in the
- * one-dword table `tab` (the four magnitudes' E4M3 bytes). The sign dword is moeq_w5_expand's. */
-__device__ __forceinline__ void moeq_w3_expand(uint32_t p0, uint32_t p1, uint32_t sg, uint32_t tab,
-                                               uint32_t (&o)[8]) {
+/* w3nl64a8h's 32 codes straight to f16 at (row, k0) of an LDS tile, skipping the E4M3 step as
+ * moeq_stage_nl does for w4nl. `p0`/`p1` hold elements 0..15 and 16..31 as halo_layout.cpp's
+ * moew3_row packs them: element 16h + 4m + b is bit pair m of byte b of word h, so the four selector
+ * bytes of elements 4j..4j+3 (j = 4h + m) are (p_h >> 2m) & 0x03030303, one v_perm_b32 each into
+ * `th` (the four magnitudes' f16 high bytes) and `tl` (their low bytes; the launcher builds both
+ * from kW3nlMagPerm the way moeq_nl_tab does), with the sign dword's bit-7 merge (moeq_w5_expand's
+ * `sg << j`) joining the high byte. The bits are those moeq_stage makes of the E4M3 bytes, 2^-8
+ * times the code's value. About 9 VALU per four weights against 14 through the E4M3 bytes. */
+template <uint32_t PITCH>
+__device__ __forceinline__ void moeq_stage_w3(uint16_t* __restrict__ lds, uint32_t row, uint32_t k0,
+                                              uint32_t p0, uint32_t p1, uint32_t sg, uint32_t th,
+                                              uint32_t tl) {
+    uint16_t* q = lds + (size_t)row * (PITCH / 2u) + k0;
 #pragma unroll
-    for (uint32_t m = 0; m < 4; ++m) {
-        o[m]     = __builtin_amdgcn_perm(0u, tab, (p0 >> (2u * m)) & 0x03030303u);
-        o[4 + m] = __builtin_amdgcn_perm(0u, tab, (p1 >> (2u * m)) & 0x03030303u);
+    for (uint32_t i = 0; i < 4; ++i) {
+        const uint32_t p = (i >> 1) ? p1 : p0;
+        uint32_t d[4];
+#pragma unroll
+        for (uint32_t u = 0; u < 2; ++u) {
+            const uint32_t m = ((2u * i) & 3u) + u, j = 2u * i + u;
+            const uint32_t sel = (p >> (2u * m)) & 0x03030303u;
+            const uint32_t hi = __builtin_amdgcn_perm(0u, th, sel) | ((sg << j) & 0x80808080u);
+            const uint32_t lo = __builtin_amdgcn_perm(0u, tl, sel);
+            d[2 * u]     = __builtin_amdgcn_perm(hi, lo, 0x05010400u);
+            d[2 * u + 1] = __builtin_amdgcn_perm(hi, lo, 0x07030602u);
+        }
+        *(v4u*)(q + i * 8) = v4u{ d[0], d[1], d[2], d[3] };
     }
-#pragma unroll
-    for (uint32_t m = 0; m < 8; ++m) o[m] |= (sg << m) & 0x80808080u;
 }
 
 /* Where the 3-bit weight's thread loads sit in a row: its 32 elements at K index `seg` have their
@@ -326,7 +340,8 @@ __device__ __forceinline__ v16hf moeq_frag(const uint16_t* __restrict__ lds, uin
 }
 
 /* W4 5 (this port's): w3nl64a8h, form 4 with a two-bit magnitude plane (K/4 bytes a row) in place
- * of the nibble plane, so a thread reads 8 bytes of magnitudes and 4 of signs for its 32 elements.
+ * of the nibble plane, so a thread reads 8 bytes of magnitudes and 4 of signs for its 32 elements
+ * (12 bytes, against form 4's 20) and stages them with moeq_stage_w3.
  *
  * W4 is the weight's form (libr4d's numbering): 0 block E4M3 with a bf16 scale per 128x128 tile; 1
  * four-bit codes with a bf16 scale per (row, 128 of K); 2 the same codes with an E4M3 scale per
@@ -844,9 +859,11 @@ void moe_gemm_q_kernel(
                         if constexpr (W4 < 4) {
                             if (nl) { moeq_stage_nl<kPitch>(s_b, r, sk, w, tab.v); continue; }
                         }
-                        if constexpr (W4 == 5)
-                            moeq_w3_expand(w[0], w[1], bok[p] ? spre[sl][p] : 0u, tab.v[0], o);
-                        else if constexpr (W4 == 4)
+                        if constexpr (W4 == 5) {
+                            moeq_stage_w3<kPitch>(s_b, r, sk, w[0], w[1], bok[p] ? spre[sl][p] : 0u,
+                                                  tab.v[0], tab.v[1]);
+                            continue;
+                        } else if constexpr (W4 == 4)
                             moeq_w5_expand(w, bok[p] ? spre[sl][p] : 0u, tab.v, o);
                         else
                             moeq_w4_expand(w, tab.v, o);
@@ -1384,6 +1401,16 @@ int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
     uint32_t mode_nl = 0;
     if constexpr (W4 >= 1 && W4 <= 3)
         if (moeq_nl_tab(tab, &tabv)) mode_nl = kModeNl;
+    if constexpr (W4 == 5) {
+        /* v[0] the four magnitudes' f16 high bytes, v[1] their low bytes (the bits e4m3x4 makes of
+         * each E4M3 byte: its magnitude shifted into f16 bits 14..7). */
+        tabv = MoeTab{};
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t h = ((tab[0] >> (8 * i)) & 0x7Fu) << 7;
+            tabv.v[0] |= ((h >> 8) & 0xFFu) << (8 * i);
+            tabv.v[1] |= (h & 0xFFu) << (8 * i);
+        }
+    }
     const uint32_t mode_il = (W4 == 5 && moeq_w3_il()) ? kModeIl : 0u;
     const uint32_t mode = (a_sorted ? 1u : 0u) | (cshift << 1) | ((uint32_t)parts << 8) |
                           mode_nl | mode_il;
@@ -1793,8 +1820,8 @@ __global__ __launch_bounds__(4 * kWave) void moe_down_dec_kernel(
             if (r >= FN) continue;
             uint32_t o[8];
             if constexpr (W4 == 5) {
-                moeq_w3_expand(bpre[q].d[0], bpre[q].d[1], spre[q], tab.v[0], o);
-                moeq_stage<kPitch>(s_b, r, sk, o);
+                moeq_stage_w3<kPitch>(s_b, r, sk, bpre[q].d[0], bpre[q].d[1], spre[q], tab.v[0],
+                                      tab.v[1]);
             } else if constexpr (W4 == 4) {
                 moeq_w5_expand(bpre[q].d, spre[q], tab.v, o);
                 moeq_stage<kPitch>(s_b, r, sk, o);

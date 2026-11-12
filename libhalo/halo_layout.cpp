@@ -1161,7 +1161,7 @@ void moew5_row(const uint8_t* s, uint8_t* d, int64_t K, uint8_t* nib, bool forwa
  * two-bit magnitude indices and one sign dword,
  *
  *   magnitudes   element 16h + 4m + b is bits 2m..2m+1 of byte b of dword h (h 0..1, m 0..3, b 0..3),
- *                so moeq_w3_expand's output dword 4h + m reads (word_h >> 2m) & 0x03030303 as the
+ *                so moeq_stage_w3 reads (word_h >> 2m) & 0x03030303 as the
  *                four byte selectors of one v_perm_b32
  *   signs        moew5_sign_bit's order, so `sg << m` lines dword m's four signs up with E4M3's
  *
