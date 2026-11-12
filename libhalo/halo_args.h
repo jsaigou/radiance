@@ -261,7 +261,12 @@ enum {
     /* The same GEMM's 5-bit expert weight: per row, HALO_DT_MOEW4's nibble plane of the codes' low
      * four bits (the magnitude), then the sign bits, one dword per 32 elements in the order the
      * kernel merges them (halo_layout.cpp, moew5_row). A row is 5K/8 bytes. */
-    HALO_DT_MOEW5      = RAD_DT_PLUGIN_BASE + 8
+    HALO_DT_MOEW5      = RAD_DT_PLUGIN_BASE + 8,
+    /* The same GEMM's 3-bit expert weight (w3nl64a8h): per row, a plane of 2-bit magnitude indices
+     * (K/4 bytes) and the same sign dwords as HALO_DT_MOEW5 (K/8 bytes), interleaved per 128 of K as
+     * 32 bytes of magnitudes then 16 of signs (halo_layout.cpp, moew3_row; $HALO_W3_IL=0 keeps the two
+     * planes apart). A row is 3K/8 bytes. */
+    HALO_DT_MOEW3      = RAD_DT_PLUGIN_BASE + 9
 };
 
 /* The grouped MoE GEMM's code tables, as the four dwords w4_e4m3's byte permutes read
@@ -287,7 +292,15 @@ static constexpr float kW5nlTable[32] = {
     -0.8125f, -2.5f, -4.0f, -5.5f, -7.5f, -9.0f, -11.0f, -12.0f,
     -14.0f, -16.0f, -18.0f, -20.0f, -22.0f, -24.0f, -26.0f, -30.0f };
 
-/* The fixed second-level scale of `w4nl64a8h`, `w4nl32a8h` and `w5nl64a8h`: it multiplies a
+/* `w3nl64a8h` decodes libquant's `table=w3nl`: eight levels, four magnitudes ascending then their
+ * negatives (a code's bit 2 is its sign, bits 0..1 the magnitude index). The kernel takes the
+ * magnitude from kW3nlMagPerm (their four E4M3 bytes in one dword, 3.25 10 18 28) with one
+ * v_perm_b32 for four weights, and sets the sign bit from the sign plane as w5nl64a8h does. */
+static constexpr uint32_t kW3nlMagPerm[4] = { 0x5E595245u, 0u, 0u, 0u };
+static constexpr float kW3nlTable[8] = { 3.25f, 10.0f, 18.0f, 28.0f,
+                                         -3.25f, -10.0f, -18.0f, -28.0f };
+
+/* The fixed second-level scale of `w4nl64a8h`, `w4nl32a8h`, `w5nl64a8h` and `w3nl64a8h`: it multiplies a
  * weight's per-(row, 64 or 32 of K) E4M3 scale. A container states it (libquant's scale2_value=),
  * and the layout hook compares it with this before serving. Fixed rather than per row because the
  * experts' scales (with the rotation's 1/128 folded in) lie between 2^-15 and 2^-10.6 on

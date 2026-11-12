@@ -4634,11 +4634,14 @@ static const RadConstraint cMoeMx[] = {
  *
  * `w5nl64a8h` is w4nl64a8h at five bits: codes index libquant's 32-level w5nl table, whose high bit
  * is the sign; the kernel expands the low four as a w4nl magnitude and sets the sign from a bit
- * plane stored after each row's nibbles. */
+ * plane stored after each row's nibbles.
+ *
+ * `w3nl64a8h` is the same at three bits: codes index libquant's 8-level w3nl table (a sign over four
+ * magnitudes); the kernel reads a two-bit magnitude plane (K/4 bytes a row) and the sign plane. */
 static const RadConstraint cMoeGemmW4[] = {
     C_GE("M", 1), C_DIV("N", 64), C_DIV("K", 128), C_GE("n_expert", 1), C_LE("n_expert", 65536),
     C_GE("top_k", 1), C_EQ("group", 128),
-    C_IN("dtype", "w4a8 w4a8h w4nla8h w4nl64a8h w4nl32a8h w5nl64a8h"),
+    C_IN("dtype", "w4a8 w4a8h w4nla8h w4nl64a8h w4nl32a8h w5nl64a8h w3nl64a8h"),
 };
 /* The bf16 expert GEMM: 64-wide column tiles and 64-deep K passes, one table, no group. */
 static const RadConstraint cMoeGemmBf16[] = {
@@ -8074,7 +8077,8 @@ HALO_WIN_PAIR(512, 1) HALO_WIN_PAIR(512, 2) HALO_WIN_PAIR(512, 4) HALO_WIN_PAIR(
   "Hadamard rotation along K baked into both, and pairs with had_quant_act_fp8; dtype w4nla8h is "
   "w4a8h with the codes indexing libquant's w4nl levels, and w4nl64a8h / w4nl32a8h are w4nla8h "
   "with an E4M3 scale per row per 64 / 32 of K under a fixed 2^-13; w5nl64a8h is w4nl64a8h with "
-  "five-bit codes into libquant's w5nl levels, a sign bit plane after each row's nibbles",
+  "five-bit codes into libquant's w5nl levels, a sign bit plane after each row's nibbles; w3nl64a8h "
+  "is the same at three bits (libquant's w3nl levels, a two-bit magnitude plane and the sign plane)",
   RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
   ROW(cMoeGemmW4), NOTUNE,
   /* No shape function: the weight is a plugin-private packed plane whose byte count
