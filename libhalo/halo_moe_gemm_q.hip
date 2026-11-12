@@ -122,6 +122,15 @@
 #include <cstring>
 #include <type_traits>
 
+#ifndef TRACE
+#define TRACE 0
+#endif
+#ifndef DDB
+#define DDB 0
+#endif
+#ifndef ABL
+#define ABL 0
+#endif
 namespace {
 
 constexpr uint32_t kWave  = 32;
@@ -802,13 +811,13 @@ void moe_gemm_q_kernel(
                 for (uint32_t p = 0; p < kBP; ++p) {
                     if constexpr (W4 == 5) {
                         uint32_t mo, so;
-                        moeq_w3_off(il, K, cc + sk, &mo, &so);
+                        moeq_w3_off(il, K, ((ABL & 4) ? 0u : cc) + sk, &mo, &so);
                         const v2u b0 = *(moeq_g2)(bsrc[p] + mo);
                         bpre[sl][p].d[0] = b0[0];
                         bpre[sl][p].d[1] = b0[1];
                         spre[sl][p] = *(moeq_g1)(bsrc[p] + so);
                     } else if constexpr (W4) {
-                        const v4u b0 = *(moeq_g4)(bsrc[p] + ((cc + sk) >> 1));
+                        const v4u b0 = *(moeq_g4)(bsrc[p] + ((((ABL & 4) ? 0u : cc) + sk) >> 1));
 #pragma unroll
                         for (int x = 0; x < 4; ++x) bpre[sl][p].d[x] = b0[x];
                         if constexpr (W4 == 4)
@@ -822,7 +831,7 @@ void moe_gemm_q_kernel(
             };
             /* `s_tok` is settled by the barrier above the run loop and never rewritten, so priming
              * before the loop's own barrier is safe. */
-            const uint32_t np = K / FKP;
+            const uint32_t np = (ABL & 8) ? ((ABL >> 4) & 15u) : K / FKP;
             /* Every slot is issued every pass, past the tile's end too (the last pass again, which
              * the caches already hold): an issue under a condition would leave the waitcnt pass
              * unsure which loads are the newest, and it would wait for all of them. */
@@ -832,12 +841,16 @@ void moe_gemm_q_kernel(
             /* The K loop's barriers order LDS only; no thread reads another's global writes inside
              * it. Pass ps is ring slot ps % kPD, so the loop steps kPD passes with the slot loop
              * unrolled inside, every slot index a constant. */
+            uint64_t trv[6] = {0,0,0,0,0,0}, trl = TRACE ? clock64() : 0, trw0 = TRACE ? wall_clock64() : 0;
+#define TRM(i) do { if (TRACE) { uint64_t n_ = clock64(); trv[i] += n_ - trl; trl = n_; } } while (0)
             for (uint32_t ps0 = 0; ps0 < np; ps0 += kPD) {
 #pragma unroll
             for (uint32_t sl = 0; sl < kPD; ++sl) {
                 const uint32_t ps = ps0 + sl;
                 if (ps >= np) break;
+                TRM(0);
                 lds_barrier();                   /* the previous pass's reads are done */
+                TRM(1);
 #pragma unroll
                 for (uint32_t p = 0; p < kAP; ++p) {
                     const uint32_t r = sn + p * kRPP;
@@ -856,6 +869,10 @@ void moe_gemm_q_kernel(
                         uint32_t w[4];
 #pragma unroll
                         for (int x = 0; x < 4; ++x) w[x] = bok[p] ? bpre[sl][p].d[x] : 0u;
+                        if (ABL & 2) {
+                            *(v4u*)(s_b + (size_t)r * (kPitch / 2u) + sk) = v4u{ w[0], w[1], w[2], w[3] };
+                            continue;
+                        }
                         if constexpr (W4 < 4) {
                             if (nl) { moeq_stage_nl<kPitch>(s_b, r, sk, w, tab.v); continue; }
                         }
@@ -895,8 +912,10 @@ void moe_gemm_q_kernel(
                         s_ws[nn] = sok ? halo_fp8::bscale(pws[sl][0]) * kMoeF16Fix : 0.0f;
                     }
                 }
+                TRM(2);
                 issue(sl, kpos(ps + kPD < np ? ps + kPD : np - 1));
                 lds_barrier();
+                TRM(3);
 
                 if (!wlive) continue;
                 /* One K step of the tile into `acc`; `fresh` starts from zero instead of the held
@@ -966,7 +985,9 @@ void moe_gemm_q_kernel(
                         ksteps(std::integral_constant<uint32_t, 1u>{});
                 } else {
                     ksteps(std::integral_constant<uint32_t, WM>{});
+                    if (ABL & 1) ksteps(std::integral_constant<uint32_t, WM>{});
                 }
+                TRM(4);
                 {
                     /* The forms differ only in what the weight scale varies over:
                      *
@@ -1051,6 +1072,11 @@ void moe_gemm_q_kernel(
             }
             }
 
+            if (TRACE && ES && blockIdx.x == 0 && blockIdx.y == 0 && lane == 0 && wave < 2)
+                printf("TR w%u wall %llu clk %llu | pre %llu bar1 %llu stage %llu issue+bar2 %llu mma %llu\n", wave,
+                       (unsigned long long)(wall_clock64() - trw0), (unsigned long long)(trl - 0),
+                       (unsigned long long)trv[0], (unsigned long long)trv[1], (unsigned long long)trv[2],
+                       (unsigned long long)trv[3], (unsigned long long)trv[4]);
             /* The store: for a fixed accumulator slot sixteen lanes hold sixteen consecutive
              * columns, so it is coalesced across the wave. */
 #pragma unroll
@@ -1466,7 +1492,14 @@ int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
             for (int q = 0; q < ncls; ++q)
                 fk2 = fk2 && Kc[q] % (2 * (long long)kBlock) == 0;
         }
+        static const int es_shape = [] { const char* e = std::getenv("HALO_ES_SHAPE"); return e ? std::atoi(e) : 0; }();
         if constexpr (W4 >= 2) {
+            if (es_shape == 1 && Kc[0] % kFK == 0) rc = go(&moe_gemm_q_kernel<W4, true, 4, 4, 1, kFK>, dim3(tiles * 16u, ny), dim3(4 * kWave), nullptr);
+            else if (es_shape == 2 && fk2) rc = go(&moe_gemm_q_kernel<W4, true, 2, 2, 1, 2 * kFK>, dim3(tiles * 16u, ny * 2u), dim3(2 * kWave), nullptr);
+            else if (es_shape == 3) rc = go(&moe_gemm_q_kernel<W4, true, 2, 2, 1, kFK>, dim3(tiles * 16u, ny * 2u), dim3(2 * kWave), nullptr);
+            else if (es_shape == 4 && fk2) rc = go(&moe_gemm_q_kernel<W4, true, 1, 1, 1, 2 * kFK>, dim3(tiles * 16u, ny * 4u), dim3(1 * kWave), nullptr);
+            else if (es_shape == 5) rc = go(&moe_gemm_q_kernel<W4, true, 1, 1, 1, kFK>, dim3(tiles * 16u, ny * 4u), dim3(1 * kWave), nullptr);
+            else
             if (fk2)
                 rc = go(&moe_gemm_q_kernel<W4, true, 4, 4, 1, 2 * kFK>,
                         dim3(tiles * 16u, ny), dim3(4 * kWave), nullptr);
@@ -1806,8 +1839,12 @@ __global__ __launch_bounds__(4 * kWave) void moe_down_dec_kernel(
     Pass cur{(uint32_t)__builtin_ctz(npm), 0u};
     issue(cur);
     for (uint32_t p = 0; p < P; ++p) {
-        __syncthreads();                         /* the previous pass's reads are done */
-        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "global");
+        if (DDB & 1) {
+            lds_barrier();                       /* the previous pass's reads are done */
+        } else {
+            __syncthreads();
+            __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "global");
+        }
 #pragma unroll
         for (uint32_t q = 0; q < kAP; ++q) {
             const uint32_t r = sn + q * kRPP;
@@ -1854,7 +1891,7 @@ __global__ __launch_bounds__(4 * kWave) void moe_down_dec_kernel(
         }
         const Pass nxt = advance(cur);
         if (p + 1 < P) issue(nxt);
-        __syncthreads();
+        if (DDB & 1) lds_barrier(); else __syncthreads();
 
         /* moe_gemm_q_kernel's K step and fold at one M tile by one N tile a wave. */
         auto kstep = [&](uint32_t ks, v8f& acc, bool fresh = false) {

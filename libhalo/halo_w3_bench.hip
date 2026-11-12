@@ -686,6 +686,69 @@ static void decode(const Plugin& pl, int trials, int reps) {
     }
 }
 
+struct Cell2 { std::vector<Proj> layers; std::vector<Call> cs; };
+
+/* esweep: one token routed to E experts (top_k = E), E = 1..32, both shapes, w3 and w4 interleaved;
+ * the per-launch time against the number of active experts separates the fixed cost of a launch
+ * (ramp, tail, dispatch) from the per-expert streaming rate. Reports us and GB/s of expert bytes. */
+static void esweep(const Plugin& pl, int trials, int reps) {
+    const int64_t ne = 256;
+    const Fmt* fmts[] = { &kW3, &kW4 };
+    const int L = 3, R = 8;
+    const int64_t Es[] = { 8, 16, 32, 64, 128, 192 };
+    if (const char* dd = std::getenv("W3_DDEC")) { if (pl.pin_ddec) pl.pin_ddec(std::atoi(dd)); }
+    const char* eE = std::getenv("W3_E"); const char* eS = std::getenv("W3_SHAPE");
+    for (int si = 0; si < 2; ++si) {
+        if (eS && std::atoi(eS) != si) continue;
+        const Shape& S = si ? kDN : kGU;
+        for (int64_t E : Es) {
+            if (eE && std::atoll(eE) != E) continue;
+            const int64_t rows = S.sorted_op ? E : 1;
+            std::vector<uint8_t> aq; std::vector<float> as;
+            draw_act(rows, S.K, 0x55u, &aq, &as);
+            Cell2 cell[2];
+            double bytes_e = 0;
+            for (int fi = 0; fi < 2; ++fi) {
+                std::vector<Planes> base;
+                for (int b = 0; b < 8; ++b) base.push_back(make_planes(*fmts[fi], S.N, S.K, 0x77u + (uint32_t)b));
+                cell[fi].layers.resize(L);
+                for (int l = 0; l < L; ++l) {
+                    build_proj(pl, cell[fi].layers[(size_t)l], *fmts[fi], S.N, S.K, ne, S.sorted_op, base);
+                    cell[fi].layers[(size_t)l].top_k = E;
+                }
+                bytes_e = (double)(cell[fi].layers[0].wbytes_expert + cell[fi].layers[0].sbytes_expert);
+                cell[fi].cs.resize((size_t)(L * R));
+                double act = 0;
+                for (int l = 0; l < L; ++l)
+                    for (int r = 0; r < R; ++r) {
+                        std::vector<int32_t> off, sorted;
+                        route(1, E, ne, 0x1234567ull * (uint64_t)(r + 1) + (uint64_t)E, false, off, sorted);
+                        make_call(cell[fi].layers[(size_t)l], 1, off, sorted, aq, as, cell[fi].cs[(size_t)(l * R + r)], S.sorted_op);
+                        act += (double)cell[fi].cs[(size_t)(l * R + r)].active;
+                    }
+                (void)act;
+            }
+            std::vector<double> t[2];
+            for (int tr = 0; tr < trials; ++tr)
+                for (int fi = 0; fi < 2; ++fi)
+                    t[fi].push_back(time_calls(pl, cell[fi].cs, cell[fi].layers[0].row, reps) * 1e3);
+            std::printf("%-8s E=%-3lld", S.name, (long long)E);
+            for (int fi = 0; fi < 2; ++fi) {
+                std::sort(t[fi].begin(), t[fi].end());
+                const double med = t[fi][t[fi].size() / 2];
+                std::printf("  %s %7.1f us (min %7.1f) %6.1f GB/s |", fmts[fi]->name, med, t[fi].front(),
+                            (double)E * bytes_e / (med * 1e-6) / 1e9);
+            }
+            std::printf("\n");
+            std::fflush(stdout);
+            for (int fi = 0; fi < 2; ++fi) {
+                for (Call& c : cell[fi].cs) free_call(c);
+                for (Proj& p : cell[fi].layers) free_proj(p);
+            }
+        }
+    }
+}
+
 /* ------------------------------------------------------------------ the layout alone */
 /* The weight read the way the kernel's threads read it, nothing else: a block of 128 threads takes 64
  * rows, four threads a row (one 32-element segment each), the K loop in the kernel's order (start
@@ -792,6 +855,7 @@ int main(int argc, char** argv) {
         return g_fail ? 1 : 0;
     }
     if (mode == "decode") { decode(pl, argc > 3 ? std::atoi(argv[3]) : 9, argc > 4 ? std::atoi(argv[4]) : 200); return 0; }
+    if (mode == "esweep") { esweep(pl, argc > 3 ? std::atoi(argv[3]) : 9, argc > 4 ? std::atoi(argv[4]) : 200); return 0; }
     if (mode == "bench") { bench(pl, argc > 3 ? std::atoi(argv[3]) : 96); return 0; }
     if (mode == "readpat") { readpat(argc > 3 ? std::atoi(argv[3]) : 20); return 0; }
     return 2;
