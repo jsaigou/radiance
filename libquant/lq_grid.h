@@ -13,7 +13,7 @@
  *   table=T         a scalar codebook: each code indexes a table of values, which a block's scale
  *                   multiplies. nf4 (QLoRA's NormalFloat), iq4nl (llama.cpp's IQ4_NL values),
  *                   w4nl (the rotated expert grid libr4d's w4nla8h kernel decodes), w5nl (its
- *                   32-level form, libr4d's w5nl64a8h),
+ *                   32-level form, libr4d's w5nl64a8h), w3nl (its 8-level form, libhalo's w3nl64a8h),
  *                   binary {-1, +1}, ternary {-1, 0, +1}, or the values themselves, `;`-separated.
  *                   The codes are the narrowest unsigned width that indexes it.
  *   group=N         one scale per N columns of a row -- block [1 x N]

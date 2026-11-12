@@ -19,7 +19,7 @@
       "code dtype: i2..i8, i16, i32 (signed, symmetric), u1..u8, u16 with zero= (asymmetric), "  \
       "fp8_e4m3, fp8_e5m2, fp6_e2m3, fp6_e3m2, fp4_e2m1" },                                      \
     { "table", RAD_P_STR, nullptr,                                                               \
-      "a codebook the codes index: nf4, iq4nl, w4nl, w5nl, binary, ternary, or values "          \
+      "a codebook the codes index: nf4, iq4nl, w4nl, w5nl, w3nl, binary, ternary, or values "          \
       "separated by ;" },                                                                        \
     { "vq", RAD_P_STR, nullptr,                                                                \
       "a vector codebook file: one codeword a line, its integers (-127..127) separated by "     \

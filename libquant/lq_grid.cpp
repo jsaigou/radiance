@@ -99,6 +99,14 @@ const std::vector<NamedTable>& named_tables() {
                     14.0f, 16.0f, 18.0f, 20.0f, 22.0f, 24.0f, 26.0f, 30.0f,
                     -0.8125f, -2.5f, -4.0f, -5.5f, -7.5f, -9.0f, -11.0f, -12.0f,
                     -14.0f, -16.0f, -18.0f, -20.0f, -22.0f, -24.0f, -26.0f, -30.0f } },
+        /* The 8-level form for the three-bit routed experts (w3nl64a8h): four magnitudes fitted the
+         * same way at groups of 64 on rotated Qwen3.6-35B-A3B experts (alternating least squares of
+         * the levels and the block scales; tests/w3_emulate_test.cpp, W3_TOP), the top level at 28
+         * and each rounded to E4M3. Magnitudes ascending, then their negatives, so a code's high bit
+         * is its sign and its low two bits index the magnitude. Same relative error (within 0.5%) for
+         * any top level from 12 to 40, so the choice is one of where the scales sit under the fixed
+         * 2^-13. About 2.0x the output error of w4nl and 3.8x that of w5nl under the same scales. */
+        { "w3nl", { 3.25f, 10.0f, 18.0f, 28.0f, -3.25f, -10.0f, -18.0f, -28.0f } },
         /* A one-bit weight: a sign and the block's scale. */
         { "binary", { -1.0f, 1.0f } },
         /* BitNet's ternary weight, a two-bit code with one code unused. */
@@ -117,7 +125,7 @@ bool parse_table(const char* s, std::vector<float>* out, std::string* why) {
         char* end = nullptr;
         const float v = std::strtof(p, &end);
         if (end == p || !std::isfinite(v)) {
-            if (why) *why = fmt("table=%s is neither nf4, iq4nl, w4nl, w5nl, binary, ternary nor a "
+            if (why) *why = fmt("table=%s is neither nf4, iq4nl, w4nl, w5nl, w3nl, binary, ternary nor a "
                                 "`;`-separated list of values", s);
             return false;
         }
