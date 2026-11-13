@@ -1794,7 +1794,15 @@ int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
                              rc = go(&moe_gemm_q_kernel<W4, true, 2, 2, 1, kFK, 2, 1, 4, 2>, gr, bl, nullptr); break;
                     case 16: if (!k_ok) return HALO_NO(RAD_E_UNSUPPORTED);
                              rc = go(&moe_gemm_q_kernel<W4, true, 2, 2, 1, kFK, 2, 1, 1, 2>, gr, bl, nullptr); break;
-                    default: rc = go(&moe_gemm_q_kernel<W4, true, 2, 2, 1, kFK, 2, 1, 2>, gr, bl, nullptr); break;
+                    /* The rule stages RA = 2 activation rows: it is the fastest of the forms at
+                     * every decode-band E measured (1.24-1.30x the 32-column LDS form on w3,
+                     * 1.10-1.17x on w4; docs/radiance-regdq-kernel.md in the ai-mode repo). Only
+                     * the staged form needs the K bound, so a longer K keeps the register form
+                     * without it rather than refusing a model the older rule served. */
+                    default:
+                             if (k_ok) rc = go(&moe_gemm_q_kernel<W4, true, 2, 2, 1, kFK, 2, 1, 2, 2>, gr, bl, nullptr);
+                             else      rc = go(&moe_gemm_q_kernel<W4, true, 2, 2, 1, kFK, 2, 1, 2>, gr, bl, nullptr);
+                             break;
                     }
                     done = true;
                 } else if (g_moe_fk_pin == 0 || g_moe_fk_pin == 3 || (g_moe_fk_pin >= 4 && g_moe_fk_pin <= 24)) {
