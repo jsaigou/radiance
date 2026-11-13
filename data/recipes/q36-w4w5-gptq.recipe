@@ -1,0 +1,42 @@
+# q36-w4w5-gptq.recipe -- Qwen3.6-35B-A3B from the official bf16 checkpoint: the same candidate
+# as q36-w4w5-rtn.recipe, with the routed experts chosen by GPTQ against recorded Hessians:
+#
+#   * the dense trunk exactly as the FP8 container holds it (block FP8, bf16 scale per 128x128),
+#   * the routed experts at the nearest fast codebook formats to the Unsloth UD map
+#     (UD Q4_K gate/up -> w4nl64a8h; UD Q5_K/Q6_K down -> w5nl64a8h),
+#   * the MTP draft head derived from output.weight, as the FP8 container does.
+#
+# CALIB is the directory a Radiance calibration run wrote (radiance --calib-corpus ... --calib-dir
+# CALIB). Convert with --reuse q36-w4w5-rtn.rad so the trunk (whose rules did not change) is copied
+# instead of re-quantised:
+#
+#   CALIB=<calib dir> rad-convert <Qwen3.6-35B-A3B bf16 dir> \
+#       --set quantization_config.quant_method=fp8 \
+#       --recipe data/recipes/q36-w4w5-gptq.recipe --reuse q36-w4w5-rtn.rad -o q36-w4w5-gptq.rad
+#
+# Everything not named here is served as the bf16 checkpoint holds it, which is what the FP8
+# container holds too (token_embd, norms, router, ssm_a_log/alpha/beta/conv1d/dt, mtp.fc, nextn).
+#
+# The source is a bf16 release with no quantization_config, so tell rad-convert which release's
+# descriptor this conversion targets (see tools/rad_convert.cpp, "The quantisation descriptor ...
+# is derived from quantization_config"). Plan-only reports the same size as the RTN recipe,
+# 20.92 GiB (the UD GGUF is 21.65 GiB, the FP8 .rad 34.6 GiB).
+# Repo: jsaigou/radiance (PUBLIC, unofficial fork), local branch q36-w4w5-pilot.
+
+# experts first (the first rule that matches a weight decides it)
+blk.*.ffn_gate_up_exps.*.weight   gptq table=w4nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* scale2_value=0.0001220703125 transform=fwht128 rule=search cd=3 calib=$CALIB
+blk.*.ffn_down_exps.*.weight      gptq table=w5nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* scale2_value=0.0001220703125 transform=fwht128 rule=search cd=3 calib=$CALIB
+
+# dense trunk: the served container's encodings
+blk.*.ssm_inz.weight              rtn codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ssm_out.weight              rtn codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.attn_qg.weight              rtn codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.attn_k.weight               rtn codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.attn_v.weight               rtn codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.attn_output.weight          rtn codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_gate_up_shexp.weight    rtn codes=fp8_e4m3 block=128x128 scale=bf16
+blk.*.ffn_down_shexp.weight       rtn codes=fp8_e4m3 block=128x128 scale=bf16
+output.weight                     rtn codes=fp8_e4m3 block=128x128 scale=bf16
+
+# MTP draft head, derived from the (quantised) output.weight
+mtp.draft_head.weight             rtn codes=u2 group=128 scale=f16 zero=u8
