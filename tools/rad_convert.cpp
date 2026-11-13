@@ -20,6 +20,7 @@
 #include "format/imatrix.h"
 #include "format/quantise.h"
 #include "format/recipe.h"
+#include "format/sha256.h"
 #include "plugin/registry.h"
 #include "text/tokenizer.h"
 #include "rad_plugin.h"
@@ -383,6 +384,10 @@ void usage() {
         "                       quantiser writes the same bytes on a card as on the host; with\n"
         "                       no quantiser plugin that has a device path, refused\n"
         "      --plan-only      declare, plan every weight's encoding, print the plan, and stop\n"
+"      --plan-json F    write the plan as JSON: per weight its sources, encoding, bytes,\n"
+"                       exactness class and provenance (also with a real conversion)\n"
+"      --plan-sha256    with --plan-json: add the sha256 of every weight's dequantised f32\n"
+"                       values (little-endian, row-major), read back from the source\n"
         "                       before writing anything\n"
         "      --report N       the worst N quantisation errors to print (default 20)\n"
         "  -v, --verbose\n"
@@ -423,7 +428,8 @@ int main(int argc, char** argv) {
     int      max_spec = kMaxSpecDefault;
     bool     max_spec_given = false;
     int      report_n = 20;
-    bool     verbose = false, plan_only = false, list_quant = false;
+    bool     verbose = false, plan_only = false, list_quant = false, plan_sha = false;
+    std::string plan_json;
     std::string reuse_path, changed_path;
     std::vector<std::string> reuse_more;   /* --reuse given again: more containers to copy from */
     std::vector<std::string> lora_paths;
@@ -473,6 +479,8 @@ int main(int argc, char** argv) {
                                        max_spec_given = true; }
         else if (a == "--draft-model") draft_dir = next("--draft-model");
         else if (a == "--plan-only") plan_only = true;
+        else if (a == "--plan-json") plan_json = next("--plan-json");
+        else if (a == "--plan-sha256") plan_sha = true;
         else if (a == "--report")    report_n = (int)num("--report", 0, INT32_MAX);
         else if (a == "--reuse") {
             const std::string r = next("--reuse");
@@ -1066,6 +1074,163 @@ int main(int argc, char** argv) {
                          (long long)n, (long long)rounded, (long long)n_round,
                          rad_dtype_name(f.scale), max_rel);
         }
+    }
+
+    /* ---------------------------------------------------------------- exactness and provenance
+     *
+     * What each planned weight is, relative to the checkpoint's own values (docs/
+     * radiance-gguf-plugin.md):
+     *   exact-planes        a GGUF block tensor written as its own planes; every dequantised value
+     *                       unchanged (import ggml=planes, or no rule)
+     *   exact-copy          bytes of a float tensor as stored, in its dtype
+     *   exact-copy(permuted) the same, rows or runs in another order (RAD_MAP_REGROUP, ROWS)
+     *   exact-cast          a float widened (bf16/f16 -> f32) or kept
+     *   derived             computed at convert from float values (RAD_MAP_NEGLOG)
+     *   lossy(<quantiser>)  a recipe rule quantises it
+     *   imported            any other imported form (GPTQ, CT-INT4, FP8, ...) */
+    auto exactness = [&](const Logical& L) -> std::string {
+        const bool derived = !L.src.derived.empty();
+        if (L.rule) {
+            const std::string& q = L.rule->rule->quantizer;
+            if (q == "cast") {
+                const uint32_t tdt = L.enc.plane[0].dtype;
+                const uint32_t sdt = derived ? (uint32_t)RAD_F32
+                                   : L.src.trivial ? L.src.enc.plane[0].dtype : (uint32_t)RAD_DT_INVALID;
+                const bool exact = sdt == tdt ||
+                                   (tdt == RAD_F32 && (sdt == RAD_BF16 || sdt == RAD_F16));
+                if (derived) return exact ? "derived" : "derived+lossy(cast)";
+                if (exact) return "exact-cast";
+            }
+            return "lossy(" + q + ")";
+        }
+        if (L.import_rule || L.src.ggml_blocks)
+            return L.src.ggml_blocks ? (L.src.col_segments.empty() && L.src.pieces.size() < 3
+                                            ? "exact-planes" : "exact-planes(permuted)")
+                                     : "imported";
+        if (L.src.trivial) return L.src.pieces.size() > 2 ? "exact-copy(permuted)" : "exact-copy";
+        return derived ? "derived" : "imported";
+    };
+    const int64_t nextn_layers = rad_meta_geti(&meta.m, (std::string(meta.m.arch_id) + ".nextn_predict_layers").c_str(), 0);
+    auto provenance = [&](const Logical& L) -> std::string {
+        if (!L.src.derived.empty()) return ck.is_gguf() ? "derived-from-gguf" : "derived";
+        if (ck.is_gguf() && nextn_layers > 0 &&
+            (L.src.name.rfind("mtp.", 0) == 0 || (L.layer >= meta.m.n_layers - nextn_layers && L.layer >= 0)))
+            return "gguf-mtp-M1";
+        return ck.is_gguf() ? "gguf" : "checkpoint";
+    };
+    auto plan_bytes = [&](const Logical* L) {
+        int64_t b = 0;
+        for (int k = 0; k < L->enc.n_planes; ++k)
+            b += rad_enc_plane_bytes(&L->enc.plane[k], L->src.rows, L->src.cols);
+        return b;
+    };
+    auto role_of = [&](const std::string& n) {
+        std::string r = n;
+        auto sub = [&](const std::string& from, const char* to) {
+            size_t p = r.find(from);
+            if (p == std::string::npos) return;
+            size_t e = p + from.size();
+            while (e < r.size() && isdigit((unsigned char)r[e])) ++e;
+            r.replace(p + from.size(), e - p - from.size(), to);
+        };
+        if (r.rfind("blk.", 0) == 0) sub("blk.", "*");
+        const size_t x = r.find("_exps.");
+        if (x != std::string::npos) sub("_exps.", "*");
+        return r;
+    };
+    {
+        /* by exactness class and by role, always */
+        std::map<std::string, std::pair<int64_t, int64_t>> by_class;
+        struct RoleRow { int64_t n = 0, bytes = 0; std::string enc, cls, src; };
+        std::map<std::string, RoleRow> by_role;
+        int64_t total = 0;
+        for (const Logical* L : plan) {
+            const int64_t b = plan_bytes(L);
+            const std::string cls = exactness(*L);
+            total += b;
+            by_class[cls].first++;
+            by_class[cls].second += b;
+            RoleRow& rr = by_role[role_of(L->src.name)];
+            rr.n++;
+            rr.bytes += b;
+            const std::string e = enc_name(L->enc);
+            if (rr.enc.find(e) == std::string::npos) rr.enc += (rr.enc.empty() ? "" : " | ") + e;
+            if (rr.cls.find(cls) == std::string::npos) rr.cls += (rr.cls.empty() ? "" : " | ") + cls;
+            for (const SrcTensor* p : L->src.pieces) {
+                const char* tn = p->rad_dtype != RAD_DT_INVALID ? rad_dtype_name(p->rad_dtype)
+                                 : gguf_dtype(p->ggml) ? gguf_dtype(p->ggml)->name : "?";
+                if (rr.src.find(tn) == std::string::npos) rr.src += (rr.src.empty() ? "" : ",") + std::string(tn);
+            }
+        }
+        RAD_INFO("exactness  (weights, bytes written, share)");
+        for (const auto& [cls, v] : by_class)
+            RAD_INFO("  %-24s %7lld weight(s) %12s %6.2f%%", cls.c_str(), (long long)v.first,
+                     humanb(v.second).c_str(), total ? 100.0 * (double)v.second / (double)total : 0.0);
+        RAD_INFO("roles  (source type -> written encoding; exactness)");
+        for (const auto& [role, rr] : by_role)
+            RAD_INFO("  %-34s %6lld %11s  %-8s -> %s; %s", role.c_str(), (long long)rr.n,
+                     humanb(rr.bytes).c_str(), rr.src.c_str(), rr.enc.c_str(), rr.cls.c_str());
+    }
+    if (!plan_json.empty()) {
+        nlohmann::json J;
+        J["tool"] = "rad-convert plan";
+        J["source"] = ck.path();
+        J["arch"] = meta.m.arch_id;
+        J["quant"] = meta.quant;
+        J["plugin"] = plugins.arch_plugin;
+        J["recipe"] = recipe.text();
+        nlohmann::json arr = nlohmann::json::array();
+        std::vector<nlohmann::json> rec(plan.size());
+        std::vector<std::string> sha(plan.size());
+        if (plan_sha) {
+            RAD_INFO("--plan-sha256: hashing the dequantised f32 values of %zu weight(s) ...", plan.size());
+            std::atomic<int> failed{ 0 };
+#pragma omp parallel for schedule(dynamic, 1)
+            for (int64_t i = 0; i < (int64_t)plan.size(); ++i) {
+                const Logical& L = *plan[(size_t)i];
+                Sha256 h;
+                const int64_t rows_per = std::max<int64_t>(1, (8 << 20) / std::max<int64_t>(1, L.src.cols));
+                std::vector<float> buf((size_t)(rows_per * L.src.cols));
+                std::string why;
+                for (int64_t r = 0; r < L.src.rows; r += rows_per) {
+                    const int64_t nr = std::min(rows_per, L.src.rows - r);
+                    if (ckpt_rows_f32(L.src, r, nr, buf.data(), &why) < 0) { ++failed; break; }
+                    h.update(buf.data(), (size_t)(nr * L.src.cols) * 4);
+                }
+                sha[(size_t)i] = h.hex();
+            }
+            if (failed) { RAD_ERR("--plan-sha256: %d weight(s) cannot be read as f32", failed.load()); return 1; }
+        }
+        for (size_t i = 0; i < plan.size(); ++i) {
+            const Logical& L = *plan[i];
+            nlohmann::json j;
+            j["name"] = L.src.name;
+            j["shape"] = std::vector<int64_t>(L.src.shape, L.src.shape + L.src.rank);
+            nlohmann::json srcs = nlohmann::json::array();
+            for (const SrcTensor* p : L.src.pieces)
+                srcs.push_back({ { "tensor", p->name },
+                                 { "type", p->rad_dtype != RAD_DT_INVALID ? rad_dtype_name(p->rad_dtype)
+                                           : gguf_dtype(p->ggml) ? gguf_dtype(p->ggml)->name : "?" },
+                                 { "bytes", p->bytes } });
+            if (srcs.size() > 8) { srcs = nlohmann::json::array({ srcs[0], "... " + std::to_string(srcs.size()) + " pieces" }); }
+            j["sources"] = srcs;
+            j["encoding"] = enc_name(L.enc);
+            j["bytes"] = plan_bytes(&L);
+            j["exactness"] = exactness(L);
+            j["provenance"] = provenance(L);
+            j["rule"] = L.rule ? L.rule->rule->quantizer + " " + L.rule->rule->options_text()
+                      : L.import_rule ? std::string(kImportRule) + " " + L.import_rule->options_text() : "";
+            j["layer"] = L.layer; j["expert"] = L.expert; j["slot"] = L.slot;
+            if (plan_sha) j["sha256_dequant_f32"] = sha[i];
+            if (!L.src.derived.empty()) j["note"] = L.src.why;
+            arr.push_back(std::move(j));
+        }
+        J["weights"] = std::move(arr);
+        std::ofstream jf(plan_json);
+        jf << J.dump(1) << "\n";
+        if (!jf) { RAD_ERR("cannot write %s", plan_json.c_str()); return 1; }
+        RAD_INFO("plan written to %s (%zu weights%s)", plan_json.c_str(), plan.size(),
+                 plan_sha ? ", with sha256" : "");
     }
 
     if (plan_only) {

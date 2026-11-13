@@ -165,11 +165,16 @@ int rad_tools_load_plugins(const std::string& home, const std::vector<std::strin
         if (p.kind == RAD_PLUGIN_KERNEL) {
             out->kernels.push_back({ p.name, p.version });
         } else if (p.kind == RAD_PLUGIN_ARCH && !arch_id.empty() && p.arch_id == arch_id &&
-                   p.arch_quant == quant) {
+                   (p.arch_quant == quant ||
+                    /* A descriptor ending in '*' claims every descriptor with that prefix
+                     * (qwen35moe_gguf: any gguf_ftype_N); the container keeps its own. */
+                    (!p.arch_quant.empty() && p.arch_quant.back() == '*' &&
+                     quant.compare(0, p.arch_quant.size() - 1, p.arch_quant, 0,
+                                   p.arch_quant.size() - 1) == 0))) {
             out->arch_plugin  = p.name;
             out->arch_version = p.version;
             out->arch_id      = p.arch_id;
-            out->arch_quant   = p.arch_quant;
+            out->arch_quant   = (!p.arch_quant.empty() && p.arch_quant.back() == '*') ? quant : p.arch_quant;
         }
     }
 

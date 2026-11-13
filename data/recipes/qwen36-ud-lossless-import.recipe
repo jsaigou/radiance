@@ -1,0 +1,15 @@
+# Qwen3.6-35B-A3B Unsloth Dynamic GGUF -> .rad, Route A: lossless. Every quantised tensor is written
+# as the planes of its own ggml blocks (Q8_0, Q4_K, Q5_K, Q6_K), so the dequantised f32 value of
+# every element is the GGUF's, bit for bit; the per-tensor type mix Unsloth chose is kept as it is.
+#
+#   rad-convert Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL.gguf -o ud.rad \
+#       --recipe data/recipes/qwen36-ud-lossless-import.recipe --tokenizer <tokenizer.json> \
+#       --plan-json ud.plan.json --plan-sha256 -v          # add --plan-only to stop after the plan
+#
+# Converter-only: no kernel reads these planes yet (docs/radiance-gguf-plugin.md).
+#
+# A_log = log(-ssm_a), regrouped by the plugin's name map; stored f32 (a float rule, not a quantiser)
+blk.*.ssm_a_log         cast dtype=f32
+# everything else a GGUF holds as blocks: its own planes. A float tensor (norms, router, the
+# delta net's small tensors) declines the rule and is kept as stored (f32, w + 1 for norms)
+*.weight                import ggml=planes

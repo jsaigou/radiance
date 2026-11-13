@@ -1,4 +1,4 @@
-/* ggml_planes.h -- llama.cpp's Q8_0, Q4_K and Q6_K blocks as the affine planes libquant/lq_ggml.cpp
+/* ggml_planes.h -- llama.cpp's Q8_0, Q4_K, Q5_K and Q6_K blocks as the affine planes libquant/lq_ggml.cpp
  * writes them, for reading a GGUF without a recipe. The core cannot call libquant, so this is the
  * reader's copy; quant_ggml_test holds the two to the same encoding, and checkpoint_test decodes
  * the planes against the block definition.
@@ -131,6 +131,30 @@ inline void split_q6_K(const uint8_t* blocks, int64_t nb, size_t bb, uint8_t* co
     c.flush();
 }
 
+/* block_q5_K: d f16 @0, dmin f16 @2, scales u8[12] @4, qh u8[32] @16, qs u8[128] @48. The scale and
+ * min are Q4_K's; the code of value v is the Q4_K nibble plus bit (v / 32) of qh[v % 32] as its
+ * fifth bit (llama.cpp's dequantize_row_q5_K: u1/u2 walk the bits two a 64-value chunk). */
+inline void split_q5_K(const uint8_t* blocks, int64_t nb, size_t bb, uint8_t* const* row) {
+    Bits c(row[0]), s(row[1]), m(row[3]);
+    for (int64_t i = 0; i < nb; ++i) {
+        const uint8_t* b = blocks + bb * i;
+        const uint8_t *qh = b + 16, *qs = b + 48;
+        for (int v = 0; v < kQK_K; ++v)
+            c.put(k_low4(qs, v) | (uint32_t)((qh[v % 32] >> (v / 32)) & 1u) << 4, 5);
+        for (int j = 0; j < kQK_K / 32; ++j) {
+            uint32_t sc, mn;
+            k4_scale_min(j, b + 4, &sc, &mn);
+            s.put(sc, 6);
+            m.put(mn, 6);
+        }
+        copy16(row[2], i, b);
+        copy16(row[4], i, b + 2);
+    }
+    c.flush();
+    s.flush();
+    m.flush();
+}
+
 /* A plane as lq_ggml's encoding_of lists it: one row high, `block` values wide. */
 struct Plane {
     const char* role;
@@ -152,6 +176,10 @@ inline constexpr Type kTypes[] = {
       { { "codes", RAD_U4, 1 }, { "scale", RAD_U6, 32 }, { "scale.1", RAD_F16, 256 },
         { "min", RAD_U6, 32 }, { "min.1", RAD_F16, 256 } },
       split_q4_K },
+    { 13,
+      { { "codes", RAD_U5, 1 }, { "scale", RAD_U6, 32 }, { "scale.1", RAD_F16, 256 },
+        { "min", RAD_U6, 32 }, { "min.1", RAD_F16, 256 } },
+      split_q5_K },
     { 14, { { "codes", RAD_I6, 1 }, { "scale", RAD_I8, 16 }, { "scale.1", RAD_F16, 256 } },
       split_q6_K },
 };
