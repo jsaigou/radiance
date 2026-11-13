@@ -126,6 +126,7 @@ namespace {
 
 constexpr uint32_t kWave  = 32;
 constexpr uint32_t kBlock = 128;   /* the fp8 scale block, along K and along N */
+constexpr uint32_t kRegKMax = 2048;  /* the staged-activation register path's K limit (LDS rows) */
 constexpr uint32_t kFK    = 128;   /* K elements staged per pass: exactly one scale block */
 
 /* 2^16: what e4m3x4 leaves out of the two operands' product (2^-8 each; see the file header).
@@ -331,6 +332,38 @@ __device__ __forceinline__ void moeq_stage_nl(uint16_t* __restrict__ lds, uint32
     }
 }
 
+/* The register-path forms of moeq_stage_nl and moeq_stage_w3: the same permutes on the same
+ * operands, but for one packed dword (eight w4nl codes, or one 16-element step of w3 codes) and
+ * returning the f16 dwords instead of storing them, so the values are the staged tile's bit for
+ * bit. */
+__device__ __forceinline__ void moeq_nl_dw(uint32_t p, const uint32_t (&tab)[4], uint32_t* d) {
+    const uint32_t mlo = p & 0x07070707u, mhi = (p >> 4) & 0x07070707u;
+    const uint32_t hlo = __builtin_amdgcn_perm(tab[1], tab[0], mlo) | ((p << 4) & 0x80808080u);
+    const uint32_t llo = __builtin_amdgcn_perm(tab[3], tab[2], mlo);
+    const uint32_t hhi = __builtin_amdgcn_perm(tab[1], tab[0], mhi) | (p & 0x80808080u);
+    const uint32_t lhi = __builtin_amdgcn_perm(tab[3], tab[2], mhi);
+    d[0] = __builtin_amdgcn_perm(hlo, llo, 0x05010400u);
+    d[1] = __builtin_amdgcn_perm(hlo, llo, 0x07030602u);
+    d[2] = __builtin_amdgcn_perm(hhi, lhi, 0x05010400u);
+    d[3] = __builtin_amdgcn_perm(hhi, lhi, 0x07030602u);
+}
+/* Step H (0 or 1) of a 32-element w3 segment: elements 16H..16H+15, from the magnitude dword
+ * `p` (= p_H of moeq_stage_w3) and the segment's sign dword `sg`. d holds the step's 8 dwords. */
+__device__ __forceinline__ void moeq_w3_step(uint32_t H, uint32_t p, uint32_t sg, uint32_t th, uint32_t tl,
+                                             uint32_t* d) {
+#pragma unroll
+    for (uint32_t ip = 0; ip < 2; ++ip)
+#pragma unroll
+        for (uint32_t u = 0; u < 2; ++u) {
+            const uint32_t m = 2u * ip + u, j = 4u * H + 2u * ip + u;
+            const uint32_t sel = (p >> (2u * m)) & 0x03030303u;
+            const uint32_t hi = __builtin_amdgcn_perm(0u, th, sel) | ((sg << j) & 0x80808080u);
+            const uint32_t lo = __builtin_amdgcn_perm(0u, tl, sel);
+            d[4 * ip + 2 * u]     = __builtin_amdgcn_perm(hi, lo, 0x05010400u);
+            d[4 * ip + 2 * u + 1] = __builtin_amdgcn_perm(hi, lo, 0x07030602u);
+        }
+}
+
 /* A fragment: lane l holds row (row0 + (l & 15)) at k [ks, ks + 16), all sixteen in one v16bf --
  * one 32-byte read, and lanes 16-31 read the same address (halo_wmma.h's fragment map). */
 template <uint32_t PITCH>
@@ -369,7 +402,7 @@ __device__ __forceinline__ v16hf moeq_frag(const uint16_t* __restrict__ lds, uin
  * occupancy, 18% slower. The floor is two blocks a WGP (MTP * WGN / 2 waves a SIMD); not at W4 3,
  * whose four scale groups' accumulators would spill under it. */
 template <int W4, bool ES, uint32_t NTL, uint32_t WGN, uint32_t HC, uint32_t FKP, uint32_t MTP = 2,
-          uint32_t WMP = 1>
+          uint32_t WMP = 1, uint32_t REG = 0, uint32_t RA = 0>
 __global__ __launch_bounds__((ES ? 1u : MTP / WMP) * WGN * kWave)
 __attribute__((amdgpu_waves_per_eu(!ES && MTP >= 4u && W4 != 3 ? MTP / WMP * WGN / 2u : 1u)))
 void moe_gemm_q_kernel(
@@ -409,14 +442,17 @@ void moe_gemm_q_kernel(
     /* Passes in flight: the K loop's register ring (see the pipelining note at the loop). */
     constexpr uint32_t kPD = WM > 1u ? 1u : 2u;
 
-    __shared__ uint16_t s_a[FM * (kPitch / 2u)];
-    __shared__ uint16_t s_b[FN * (kPitch / 2u)];
+    __shared__ uint16_t s_a[REG ? 1 : FM * (kPitch / 2u)];
+    __shared__ uint16_t s_b[REG ? 1 : FN * (kPitch / 2u)];
     __shared__ int32_t  s_tok[FM];
     /* The pass's scales: one per activation row, and one per weight column (w4) or one for the
      * block (fp8), for each 128-wide block of the pass. See "the scales ride with the tile" at the
      * K loop. */
-    __shared__ float    s_as[kBpS * FM];
-    __shared__ float    s_ws[kSubT * FN];
+    __shared__ float    s_as[REG ? 1 : kBpS * FM];
+    __shared__ float    s_ws[REG ? 1 : kSubT * FN];
+    /* the staged-activation register path: RA rows and a zero row of f16, and their scales */
+    __shared__ uint16_t s_ra[REG && RA ? (RA + 1) * kRegKMax : 1];
+    __shared__ float    s_rsc[REG && RA ? (RA + 1) * 16 : 1];
 
     /* The wave index through readfirstlane: the compiler does not know tid / 32 is wave-uniform, and
      * the per-M-tile run test below would otherwise branch on exec around the WMMA, with every
@@ -730,6 +766,261 @@ void moe_gemm_q_kernel(
              * column's weight scale, which loaded after the WMMA would be scattered dependent
              * loads. So the thread staging a row or column loads its scale with the tile, one pass
              * ahead, and the fold reads them from LDS. Bit-identical. */
+            if constexpr (REG && RA == 0) {
+            /* The register path (ES, 32 columns, two waves, one 128-wide block a pass, w4nl64 or
+             * w3nl64): no LDS tile and no block barrier in the K loop. Lane l of wave `wgn` is column
+             * wgn*16 + (l & 15) for the weight and row (l & 15) for the activation, and lanes 16-31
+             * replicate lanes 0-15 (halo_wmma.h's fragment map), so each lane loads and dequantises
+             * its own row's 16-element K chunk for each of the pass's eight WMMA steps. The f16
+             * values are the ones moeq_stage_nl / moeq_stage_w3 / moeq_stage store, and the WMMA
+             * chain and the fold are the LDS form's, so the bytes are the same. The activation
+             * scale of output row 2t + (l >> 4) reaches the fold through ds_bpermute (no barrier). */
+            static_assert(ES && NTL == 2 && WGN == 2 && FKP == kFK && WM == 1 && WN == 1 &&
+                          kSub == 2 && kBpS == 1 && (W4 == 2 || W4 == 5),
+                          "the register path is the 32-column two-wave w4nl64 / w3nl64 decode form");
+            /* REG is the ring depth in passes (2..4), or 10*A + B for an activation ring of A and a
+             * weight ring of B passes (the activation is L2-resident and costs 32 VGPRs a slot). */
+            constexpr uint32_t kPDR = REG < 10u ? REG : REG % 10u;
+            constexpr uint32_t kPA  = REG < 10u ? REG : REG / 10u;
+            static_assert(kPDR % kPA == 0, "the activation ring divides the weight ring");
+            constexpr uint32_t kNB  = W4 == 5 ? 3u : 4u;   /* 16-byte weight loads a pass */
+            const uint32_t ar = lane & 15u;
+            const uint32_t wr = wgn * 16u + ar;
+            const int32_t  tokr = s_tok[ar];
+            const bool aok = tokr >= 0 && (r0 + ar) >= rs && (r0 + ar) < re;
+            const bool wok = (j0 + wr) < fc;
+            const uint8_t* asrc = Aq + (size_t)(aok ? tokr : 0) * a_ld;
+            const float*   asp  = As + (size_t)(aok ? tokr : 0) * as_ld;
+            const uint8_t* bsrc = Wp + (size_t)(wn0 + (wok ? wr : 0u)) * w_ld;
+            const uint8_t* wsp  = (const uint8_t*)Wsp + (size_t)(wn0 + (wok ? wr : 0u)) * ws_ld * 2u;
+
+            v4u      ra[kPA][8];
+            v4u      rb[kPDR][kNB];
+            float    pas[kPA];
+            uint32_t pws[kPDR];
+            auto issueA = [&](uint32_t sl, uint32_t cc) {
+                pas[sl] = asp[cc / kBlock];
+#pragma unroll
+                for (uint32_t q = 0; q < 8; ++q) ra[sl][q] = *(moeq_g4)(asrc + cc + 16u * q);
+            };
+            auto issueB = [&](uint32_t sl, uint32_t cc) {
+                pws[sl] = ldg_u16((const uint16_t*)wsp + cc / kBlock);
+                if constexpr (W4 == 5) {
+                    uint32_t mo, so;
+                    moeq_w3_off(il, K, cc, &mo, &so);
+                    rb[sl][0] = *(moeq_g4)(bsrc + mo);
+                    rb[sl][1] = *(moeq_g4)(bsrc + mo + 16u);
+                    rb[sl][2] = *(moeq_g4)(bsrc + so);
+                } else {
+#pragma unroll
+                    for (uint32_t q = 0; q < 4; ++q) rb[sl][q] = *(moeq_g4)(bsrc + (cc >> 1) + 16u * q);
+                }
+            };
+            const uint32_t np = K / FKP;
+#pragma unroll
+            for (uint32_t sl = 0; sl < kPDR; ++sl) issueB(sl, kpos(sl < np ? sl : np - 1));
+#pragma unroll
+            for (uint32_t sl = 0; sl < kPA; ++sl) issueA(sl, kpos(sl < np ? sl : np - 1));
+
+            for (uint32_t ps0 = 0; ps0 < np; ps0 += kPDR) {
+#pragma unroll
+            for (uint32_t sl = 0; sl < kPDR; ++sl) {
+                const uint32_t ps = ps0 + sl;
+                if (ps >= np) break;
+#pragma unroll
+                for (uint32_t st = 0; st < 8; ++st) {
+                    uint32_t da[8], db[8];
+#pragma unroll
+                    for (uint32_t x = 0; x < 4; ++x)
+                        halo_hcf::e4m3x4(aok ? ra[sl % kPA][st][x] : 0u, da[2 * x], da[2 * x + 1]);
+                    if constexpr (W4 == 5) {
+                        const uint32_t pm = wok ? rb[sl][st >> 2][st & 3u] : 0u;
+                        const uint32_t sg = wok ? rb[sl][2][st >> 1] : 0u;
+                        moeq_w3_step(st & 1u, pm, sg, tab.v[0], tab.v[1], db);
+                    } else {
+                        moeq_nl_dw(wok ? rb[sl][st >> 1][(st & 1u) * 2u] : 0u, tab.v, db);
+                        moeq_nl_dw(wok ? rb[sl][st >> 1][(st & 1u) * 2u + 1u] : 0u, tab.v, db + 4);
+                    }
+                    const v16hf af = halo_hcf::frag(da), bf = halo_hcf::frag(db);
+                    if (st < 4) raw[0][0] = halo::mma(af, bf, st == 0 ? v8f(0.f) : raw[0][0]);
+                    else        rx[0][0][0] = halo::mma(af, bf, st == 4 ? v8f(0.f) : rx[0][0][0]);
+                }
+                {
+                    const float am = aok ? pas[sl % kPA] : 0.0f;
+                    float asv[8];
+#pragma unroll
+                    for (uint32_t t = 0; t < 8; ++t)
+                        asv[t] = __builtin_bit_cast(float, __builtin_amdgcn_ds_bpermute(
+                            (int)(((2u * t + (lane >> 4)) << 2)), __builtin_bit_cast(int, am)));
+                    float wq[2];
+#pragma unroll
+                    for (uint32_t q = 0; q < 2; ++q)
+                        wq[q] = halo_fp8::e4m3((uint32_t)(((wok ? pws[sl] : 0u) >> (8 * q)) & 0xFFu)) *
+                                (kW4G64Scale * kMoeF16Fix);
+#pragma unroll
+                    for (uint32_t t = 0; t < 8; ++t) {
+                        float v = raw[0][0][t] * wq[0];
+                        v += rx[0][0][0][t] * wq[1];
+                        out[0][0][t] += v * asv[t];
+                    }
+                }
+                issueB(sl, kpos(ps + kPDR < np ? ps + kPDR : np - 1));
+                issueA(sl % kPA, kpos(ps + kPA < np ? ps + kPA : np - 1));
+            }
+            }
+            } else if constexpr (REG) {
+            /* The register path with the activation staged once. The register path above dequantises
+             * the activation tile in every wave every pass (320 VALU a pass, 15 of 16 rows dead at
+             * one token, and lanes 16-31 repeat lanes 0-15), more than the weight itself. Here the
+             * block dequantises the run's first RA rows to f16 into LDS once, before the K loop, with
+             * one barrier; a fragment is then two ds_read_b128 a K step, and the activation scales of
+             * the rows are in LDS too. A run longer than RA rows is taken RA at a time (the weight is
+             * read again for each chunk; the host picks this form only where runs are short). The f16
+             * values, the WMMA chain and the fold are the LDS form's, so the bytes are the same. */
+            static_assert(ES && NTL == 2 && WGN == 2 && FKP == kFK && WM == 1 && WN == 1 &&
+                          kSub == 2 && kBpS == 1 && (W4 == 2 || W4 == 5) && RA >= 1 && RA <= 3,
+                          "the staged-activation register path is the 32-column w4nl64 / w3nl64 form");
+            constexpr uint32_t kPDR = REG;
+            constexpr uint32_t kNB  = W4 == 5 ? 3u : 4u;
+            constexpr uint32_t kIt  = (RA * (kRegKMax / 16u) + NTHR - 1u) / NTHR;
+            const uint32_t ar = lane & 15u;
+            const uint32_t wr = wgn * 16u + ar;
+            const bool wok = (j0 + wr) < fc;
+            const uint8_t* bsrc = Wp + (size_t)(wn0 + (wok ? wr : 0u)) * w_ld;
+            const uint8_t* wsp  = (const uint8_t*)Wsp + (size_t)(wn0 + (wok ? wr : 0u)) * ws_ld * 2u;
+            v4u      rb[kPDR][kNB];
+            uint32_t pws[kPDR];
+            auto issueB = [&](uint32_t sl, uint32_t cc) {
+                pws[sl] = ldg_u16((const uint16_t*)wsp + cc / kBlock);
+                if constexpr (W4 == 5) {
+                    uint32_t mo, so;
+                    moeq_w3_off(il, K, cc, &mo, &so);
+                    rb[sl][0] = *(moeq_g4)(bsrc + mo);
+                    rb[sl][1] = *(moeq_g4)(bsrc + mo + 16u);
+                    rb[sl][2] = *(moeq_g4)(bsrc + so);
+                } else {
+#pragma unroll
+                    for (uint32_t q = 0; q < 4; ++q) rb[sl][q] = *(moeq_g4)(bsrc + (cc >> 1) + 16u * q);
+                }
+            };
+            const uint32_t np = K / FKP;
+            const uint32_t cpr = K / 16u;                 /* 16-element chunks a staged row */
+            for (uint32_t rcb = rs; rcb < re; rcb += RA) {
+                const uint32_t rce = (rcb + RA < re) ? rcb + RA : re;
+                const uint32_t nrows = rce - rcb;
+                const uint32_t j0r = rcb - r0;            /* tile row of the chunk's first row */
+                if (rcb != rs) lds_barrier();             /* the last chunk's fragment reads are done */
+                /* the activation loads first: the staging below waits on them (vmcnt counts in
+                 * order), then the weight ring primes behind them */
+                v4u abuf[kIt];
+#pragma unroll
+                for (uint32_t i = 0; i < kIt; ++i) {
+                    const uint32_t c = tid + i * NTHR;
+                    const uint32_t jr = c / cpr, kc = c - jr * cpr;
+                    const int32_t tk = (c < RA * cpr && jr < nrows) ? s_tok[j0r + jr] : -1;
+                    abuf[i] = *(moeq_g4)(Aq + (size_t)(tk >= 0 ? tk : 0) * a_ld + 16u * kc);
+                }
+#pragma unroll
+                for (uint32_t sl = 0; sl < kPDR; ++sl) issueB(sl, kpos(sl < np ? sl : np - 1));
+#pragma unroll
+                for (uint32_t i = 0; i < kIt; ++i) {
+                    const uint32_t c = tid + i * NTHR;
+                    const uint32_t jr = c / cpr, kc = c - jr * cpr;
+                    if (c < RA * cpr) {
+                        const bool v = jr < nrows && s_tok[j0r + jr] >= 0;
+                        uint32_t d[8];
+#pragma unroll
+                        for (uint32_t x = 0; x < 4; ++x)
+                            halo_hcf::e4m3x4(v ? abuf[i][x] : 0u, d[2 * x], d[2 * x + 1]);
+                        uint16_t* q = s_ra + (size_t)jr * kRegKMax + 16u * kc;
+                        *(v4u*)q       = v4u{ d[0], d[1], d[2], d[3] };
+                        *(v4u*)(q + 8) = v4u{ d[4], d[5], d[6], d[7] };
+                    }
+                }
+                /* the zero row (a lane with no live row reads it) and the rows' activation scales */
+                for (uint32_t c = tid; c < cpr; c += NTHR) {
+                    uint16_t* q = s_ra + (size_t)RA * kRegKMax + 16u * c;
+                    *(v4u*)q       = v4u{ 0u, 0u, 0u, 0u };
+                    *(v4u*)(q + 8) = v4u{ 0u, 0u, 0u, 0u };
+                }
+                for (uint32_t c = tid; c < (RA + 1u) * 16u; c += NTHR) {
+                    const uint32_t jr = c / 16u, kb = c % 16u;
+                    float sv = 0.0f;
+                    if (jr < RA && jr < nrows && kb < np) {
+                        const int32_t tk = s_tok[j0r + jr];
+                        if (tk >= 0) sv = As[(size_t)tk * as_ld + kb];
+                    }
+                    s_rsc[c] = sv;
+                }
+                lds_barrier();
+
+                /* this lane's fragment row (the live row it holds, else the zero row) and the
+                 * scale rows of its eight output rows */
+                const uint32_t ju = ar - j0r;
+                const uint32_t jsel = ju < nrows ? ju : RA;
+                const uint16_t* abase = s_ra + (size_t)jsel * kRegKMax;
+                uint32_t sbase[8];
+#pragma unroll
+                for (uint32_t t = 0; t < 8; ++t) {
+                    const uint32_t u = 2u * t + (lane >> 4) - j0r;
+                    sbase[t] = (u < nrows ? u : RA) * 16u;
+                }
+                out[0][0] = v8f(0.f);
+
+                for (uint32_t ps0 = 0; ps0 < np; ps0 += kPDR) {
+#pragma unroll
+                for (uint32_t sl = 0; sl < kPDR; ++sl) {
+                    const uint32_t ps = ps0 + sl;
+                    if (ps >= np) break;
+                    const uint32_t cc = kpos(ps);
+#pragma unroll
+                    for (uint32_t st = 0; st < 8; ++st) {
+                        uint32_t db[8];
+                        if constexpr (W4 == 5) {
+                            const uint32_t pm = wok ? rb[sl][st >> 2][st & 3u] : 0u;
+                            const uint32_t sg = wok ? rb[sl][2][st >> 1] : 0u;
+                            moeq_w3_step(st & 1u, pm, sg, tab.v[0], tab.v[1], db);
+                        } else {
+                            moeq_nl_dw(wok ? rb[sl][st >> 1][(st & 1u) * 2u] : 0u, tab.v, db);
+                            moeq_nl_dw(wok ? rb[sl][st >> 1][(st & 1u) * 2u + 1u] : 0u, tab.v, db + 4);
+                        }
+                        const v16hf af = halo::mk_ldg<v16hf>(abase + cc + 16u * st);
+                        const v16hf bf = halo_hcf::frag(db);
+                        if (st < 4) raw[0][0] = halo::mma(af, bf, st == 0 ? v8f(0.f) : raw[0][0]);
+                        else        rx[0][0][0] = halo::mma(af, bf, st == 4 ? v8f(0.f) : rx[0][0][0]);
+                    }
+                    {
+                        const uint32_t kb = cc / kBlock;
+                        float asv[8];
+#pragma unroll
+                        for (uint32_t t = 0; t < 8; ++t) asv[t] = s_rsc[sbase[t] + kb];
+                        float wq[2];
+#pragma unroll
+                        for (uint32_t q = 0; q < 2; ++q)
+                            wq[q] = halo_fp8::e4m3((uint32_t)(((wok ? pws[sl] : 0u) >> (8 * q)) & 0xFFu)) *
+                                    (kW4G64Scale * kMoeF16Fix);
+#pragma unroll
+                        for (uint32_t t = 0; t < 8; ++t) {
+                            float v = raw[0][0][t] * wq[0];
+                            v += rx[0][0][0][t] * wq[1];
+                            out[0][0][t] += v * asv[t];
+                        }
+                    }
+                    issueB(sl, kpos(ps + kPDR < np ? ps + kPDR : np - 1));
+                }
+                }
+
+                /* this chunk's rows */
+#pragma unroll
+                for (uint32_t t = 0; t < 8; ++t) {
+                    const uint32_t r = halo::d_row(lane, t);
+                    const uint32_t c = wgn * 16u + halo::d_col(lane);
+                    const uint32_t row = r0 + r;
+                    if (row < rcb || row >= rce || n0 + c >= N) continue;
+                    Y[(size_t)row * y_ld + n0 + c] = halo::f32_to_bf16(out[0][0][t]);
+                }
+            }
+            } else {
             struct Stage { uint32_t d[kSeg / 4u]; };  /* kSeg K elements, the plane's packed form */
             Stage apre[kPD][kAP];
             Stage bpre[kPD][kBP];                     /* W4: only d[0..3] (16 packed bytes) used */
@@ -1050,9 +1341,11 @@ void moe_gemm_q_kernel(
                 }
             }
             }
+            } /* !REG */
 
             /* The store: for a fixed accumulator slot sixteen lanes hold sixteen consecutive
              * columns, so it is coalesced across the wave. */
+            if constexpr (!(REG && RA > 0)) {
 #pragma unroll
             for (uint32_t i = 0; i < WM; ++i)
 #pragma unroll
@@ -1065,6 +1358,7 @@ void moe_gemm_q_kernel(
                         if (r >= FM || row < rs || row >= re || n0 + c >= N) continue;
                         Y[(size_t)row * y_ld + n0 + c] = halo::f32_to_bf16(out[i][j][t]);
                     }
+            }
 
             rs = re;
             ++run;
@@ -1199,7 +1493,9 @@ static bool moeq_nl_tab(const uint32_t* tab, MoeTab* out) {
 /* 0 the rule; 1 the run-aligned prefill form, 2 the (tile, run) decode form, 3 the uniform prefill
  * grid, whatever the band. Every form's bytes are the same; the selftest compares them. */
 static int g_moe_prefill_form = 0;
-/* The decode form's staged K: 0 the rule, 1 one 128-wide block a pass, 2 two wherever allowed. */
+/* The decode form's staged K: 0 the rule, 1 one 128-wide block a pass, 2 two wherever allowed.
+ * 3 the 32-column LDS-staged form (w4nl64 / w3nl64), 4 the register-dequant form (the rule's
+ * choice for those two formats; same bytes). */
 static int g_moe_fk_pin = 0;
 /* The aligned form's column tile on the down projection: 0 the rule, 1 never the 256-column tile,
  * 2 it (refused where the shape cannot take it or the launch is not aligned). */
@@ -1477,9 +1773,41 @@ int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
              * blocks a WGP, so a decode step's 128 blocks ran in 2.1 rounds; this one needs 14 KB.
              * The pins keep the older forms reachable (the selftest holds them to the same bytes). */
             constexpr bool kSmall = (W4 == 2 || W4 == 5);
-            if (kSmall && g_moe_fk_pin == 0)
+            /* The register path (pin 0 or 4) needs the nl code table at w4; w3 always has it. */
+            const bool reg_ok = (W4 == 5 || mode_nl != 0u);
+            bool done = false;
+            if constexpr (kSmall) {
+                const bool k_ok = Kc[0] <= (long long)kRegKMax && Kc[1] <= (long long)kRegKMax &&
+                                  Kc[2] <= (long long)kRegKMax && Kc[3] <= (long long)kRegKMax;
+                const int pn = g_moe_fk_pin;
+                if (reg_ok && (pn == 0 || (pn >= 4 && pn <= 7) || (pn >= 9 && pn <= 11) || pn == 16)) {
+                    const dim3 gr(tiles * 16u, ny * 2u), bl(2 * kWave);
+                    switch (pn) {
+                    case 5:  rc = go(&moe_gemm_q_kernel<W4, true, 2, 2, 1, kFK, 2, 1, 3>, gr, bl, nullptr); break;
+                    case 6:  rc = go(&moe_gemm_q_kernel<W4, true, 2, 2, 1, kFK, 2, 1, 4>, gr, bl, nullptr); break;
+                    case 7:  rc = go(&moe_gemm_q_kernel<W4, true, 2, 2, 1, kFK, 2, 1, 1>, gr, bl, nullptr); break;
+                    case 9:  if (!k_ok) return HALO_NO(RAD_E_UNSUPPORTED);
+                             rc = go(&moe_gemm_q_kernel<W4, true, 2, 2, 1, kFK, 2, 1, 2, 2>, gr, bl, nullptr); break;
+                    case 10: if (!k_ok) return HALO_NO(RAD_E_UNSUPPORTED);
+                             rc = go(&moe_gemm_q_kernel<W4, true, 2, 2, 1, kFK, 2, 1, 3, 2>, gr, bl, nullptr); break;
+                    case 11: if (!k_ok) return HALO_NO(RAD_E_UNSUPPORTED);
+                             rc = go(&moe_gemm_q_kernel<W4, true, 2, 2, 1, kFK, 2, 1, 4, 2>, gr, bl, nullptr); break;
+                    case 16: if (!k_ok) return HALO_NO(RAD_E_UNSUPPORTED);
+                             rc = go(&moe_gemm_q_kernel<W4, true, 2, 2, 1, kFK, 2, 1, 1, 2>, gr, bl, nullptr); break;
+                    default: rc = go(&moe_gemm_q_kernel<W4, true, 2, 2, 1, kFK, 2, 1, 2>, gr, bl, nullptr); break;
+                    }
+                    done = true;
+                } else if (g_moe_fk_pin == 0 || g_moe_fk_pin == 3 || (g_moe_fk_pin >= 4 && g_moe_fk_pin <= 24)) {
+                    rc = go(&moe_gemm_q_kernel<W4, true, 2, 2, 1, kFK>, dim3(tiles * 16u, ny * 2u),
+                            dim3(2 * kWave), nullptr);
+                    done = true;
+                }
+            }
+            if (done) {}
+            else if (g_moe_fk_pin == 8) {   /* a measurement pin: the 32-column form at any W4 >= 2 */
                 rc = go(&moe_gemm_q_kernel<W4, true, 2, 2, 1, kFK>, dim3(tiles * 16u, ny * 2u),
                         dim3(2 * kWave), nullptr);
+            }
             else if (fk2)
                 rc = go(&moe_gemm_q_kernel<W4, true, 4, 4, 1, 2 * kFK>,
                         dim3(tiles * 16u, ny), dim3(4 * kWave), nullptr);

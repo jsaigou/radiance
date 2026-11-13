@@ -510,6 +510,10 @@ static void check_case(const Plugin& pl, const Fmt& F, const char* label, int64_
                               { "aligned prefill, wide down tile", 1, 1, -1, 2 },
                               { "decode (tile,run) 1 block/pass", 2, 1, -1, 0 },
                               { "decode (tile,run) 2 blocks/pass", 2, 2, -1, 0 },
+                              { "decode 32-col LDS-staged", 2, 3, -1, 0 },
+                              { "decode 32-col register dequant", 2, 4, -1, 0 },
+                              { "decode 32-col register dequant, staged A", 2, 9, -1, 0 },
+                              { "decode 32-col register dequant, staged A, depth 4", 2, 11, -1, 0 },
                               { "uniform prefill", 3, 1, -1, 0 }, { "decode kernel G=1", 2, 1, 1, 0 },
                               { "decode kernel G=4", 2, 1, 4, 0 } };
         std::vector<uint16_t> form0;
@@ -591,7 +595,13 @@ static const Shape kDN = { "down", 2048, 512, true };
 
 static void bench(const Plugin& pl, int reps) {
     const int64_t ne = 256, top_k = 8;
-    const int64_t Ms[] = { 1, 2, 4, 8, 32, 128, 512 };
+    int64_t Ms[] = { 1, 2, 4, 8, 32, 128, 512 };
+    /* $W3_MS="a,b,c,d,e,f,g" replaces the token counts; $W3_FK / $W3_DDEC pin the decode forms */
+    if (const char* mm = std::getenv("W3_MS"))
+        std::sscanf(mm, "%lld,%lld,%lld,%lld,%lld,%lld,%lld", (long long*)&Ms[0], (long long*)&Ms[1], (long long*)&Ms[2],
+                    (long long*)&Ms[3], (long long*)&Ms[4], (long long*)&Ms[5], (long long*)&Ms[6]);
+    if (const char* dd = std::getenv("W3_DDEC")) { if (pl.pin_ddec) pl.pin_ddec(std::atoi(dd)); }
+    if (const char* fk = std::getenv("W3_FK")) { if (pl.pin_fk) pl.pin_fk(std::atoi(fk)); }
     const Fmt* fmts[] = { &kW3, &kW4, &kW5 };
     const int L = 3, R = 8;
     std::printf("bench: %d layers x %d routings cycled, %d launches a point\n", L, R, reps);
@@ -621,10 +631,30 @@ static void bench(const Plugin& pl, int reps) {
                         act += (double)cs[(size_t)(l * R + r)].active;
                     }
                 act /= (double)(L * R);
-                const double ms = time_calls(pl, cs, layers[0].row, reps);
+                /* $W3_AB="a,b,..": time the pin_fk values alternately (5 rounds, median each) and print one
+                 * line a pin; without it one line with whatever $W3_FK pinned. */
+                int abp[6]; int nab = 0;
+                if (const char* ab = std::getenv("W3_AB")) {
+                    const char* q = ab;
+                    while (*q && nab < 6) { abp[nab++] = std::atoi(q); while (*q && *q != ',') ++q; if (*q == ',') ++q; }
+                }
+                const int npv = nab ? nab : 1;
+                std::vector<double> tv[6];
+                for (int rd = 0; rd < (nab ? 5 : 1); ++rd)
+                    for (int pv = 0; pv < npv; ++pv) {
+                        if (nab && pl.pin_fk) pl.pin_fk(abp[pv]);
+                        tv[pv].push_back(time_calls(pl, cs, layers[0].row, reps));
+                    }
+                if (nab && pl.pin_fk) pl.pin_fk(0);
                 const double bytes_e = (double)(layers[0].wbytes_expert + layers[0].sbytes_expert);
-                std::printf("%-10s %-8s %5lld %9.1f %9.1f %10.0f %9.1f\n", F.name, S.name, (long long)Tr,
-                            ms * 1e3, act * bytes_e / (ms * 1e-3) / 1e9, bytes_e, act);
+                double ms = 0;
+                for (int pv = 0; pv < npv; ++pv) {
+                    std::sort(tv[pv].begin(), tv[pv].end());
+                    ms = tv[pv][tv[pv].size() / 2];
+                    std::printf("%-10s %-8s %5lld %9.1f %9.1f %10.0f %9.1f%s\n", F.name, S.name, (long long)Tr,
+                                ms * 1e3, act * bytes_e / (ms * 1e-3) / 1e9, bytes_e, act,
+                                nab ? (std::string("  pin ") + std::to_string(abp[pv])).c_str() : "");
+                }
                 if (M == 1) dec_us[fi][si] = ms * 1e3;
                 for (Call& c : cs) free_call(c);
             }
@@ -693,9 +723,12 @@ struct Cell2 { std::vector<Proj> layers; std::vector<Call> cs; };
  * (ramp, tail, dispatch) from the per-expert streaming rate. Reports us and GB/s of expert bytes. */
 static void esweep(const Plugin& pl, int trials, int reps) {
     const int64_t ne = 256;
-    const Fmt* fmts[] = { &kW3, &kW4 };
+    /* $W3_FMT="a,b": the two formats (3, 4 or 5 bits) to interleave; default 3,4 */
+    int fa = 3, fb = 4;
+    if (const char* ff = std::getenv("W3_FMT")) std::sscanf(ff, "%d,%d", &fa, &fb);
+    const Fmt* fmts[] = { fa == 5 ? &kW5 : fa == 4 ? &kW4 : &kW3, fb == 5 ? &kW5 : fb == 4 ? &kW4 : &kW3 };
     const int L = 3, R = 8;
-    const int64_t Es[] = { 8, 16, 32, 64, 128, 192 };
+    const int64_t Es[] = { 1, 2, 4, 8, 16, 32, 64, 128, 192 };
     if (const char* dd = std::getenv("W3_DDEC")) { if (pl.pin_ddec) pl.pin_ddec(std::atoi(dd)); }
     const char* eE = std::getenv("W3_E"); const char* eS = std::getenv("W3_SHAPE");
     for (int si = 0; si < 2; ++si) {
@@ -707,7 +740,7 @@ static void esweep(const Plugin& pl, int trials, int reps) {
             std::vector<uint8_t> aq; std::vector<float> as;
             draw_act(rows, S.K, 0x55u, &aq, &as);
             Cell2 cell[2];
-            double bytes_e = 0;
+            double bytes_e = 0, bytes_f[2] = { 0, 0 };
             for (int fi = 0; fi < 2; ++fi) {
                 std::vector<Planes> base;
                 for (int b = 0; b < 8; ++b) base.push_back(make_planes(*fmts[fi], S.N, S.K, 0x77u + (uint32_t)b));
@@ -717,6 +750,7 @@ static void esweep(const Plugin& pl, int trials, int reps) {
                     cell[fi].layers[(size_t)l].top_k = E;
                 }
                 bytes_e = (double)(cell[fi].layers[0].wbytes_expert + cell[fi].layers[0].sbytes_expert);
+                bytes_f[fi] = bytes_e;   /* each format's own bytes (an earlier version printed both with the last one's) */
                 cell[fi].cs.resize((size_t)(L * R));
                 double act = 0;
                 for (int l = 0; l < L; ++l)
@@ -728,17 +762,33 @@ static void esweep(const Plugin& pl, int trials, int reps) {
                     }
                 (void)act;
             }
-            std::vector<double> t[2];
+            /* $W3_AB="a,b": alternate the decode pin_fk values a and b (3 the LDS-staged 32-column
+             * form, 4 the register-dequant form) trial by trial inside this one process, so the two
+             * are timed on the same pages and the same device state. Otherwise the pin is $W3_FK. */
+            int pins[6] = { -1, -1, -1, -1, -1, -1 };
+            int npin = 0;
+            if (const char* ab = std::getenv("W3_AB")) {
+                const char* q = ab;
+                while (*q && npin < 6) { pins[npin++] = std::atoi(q); while (*q && *q != ',') ++q; if (*q == ',') ++q; }
+            } else {
+                pins[npin++] = std::getenv("W3_FK") ? std::atoi(std::getenv("W3_FK")) : 0;
+            }
+            std::vector<double> t[2][6];
             for (int tr = 0; tr < trials; ++tr)
                 for (int fi = 0; fi < 2; ++fi)
-                    t[fi].push_back(time_calls(pl, cell[fi].cs, cell[fi].layers[0].row, reps) * 1e3);
+                    for (int pi = 0; pi < npin; ++pi) {
+                        if (pl.pin_fk) pl.pin_fk(pins[pi]);
+                        t[fi][pi].push_back(time_calls(pl, cell[fi].cs, cell[fi].layers[0].row, reps) * 1e3);
+                    }
+            if (pl.pin_fk) pl.pin_fk(0);
             std::printf("%-8s E=%-3lld", S.name, (long long)E);
-            for (int fi = 0; fi < 2; ++fi) {
-                std::sort(t[fi].begin(), t[fi].end());
-                const double med = t[fi][t[fi].size() / 2];
-                std::printf("  %s %7.1f us (min %7.1f) %6.1f GB/s |", fmts[fi]->name, med, t[fi].front(),
-                            (double)E * bytes_e / (med * 1e-6) / 1e9);
-            }
+            for (int fi = 0; fi < 2; ++fi)
+                for (int pi = 0; pi < npin; ++pi) {
+                    std::sort(t[fi][pi].begin(), t[fi][pi].end());
+                    const double med = t[fi][pi][t[fi][pi].size() / 2];
+                    std::printf("  %s/p%d %7.1f us (min %7.1f) %6.1f GB/s |", fmts[fi]->name, pins[pi], med,
+                                t[fi][pi].front(), (double)E * bytes_f[fi] / (med * 1e-6) / 1e9);
+                }
             std::printf("\n");
             std::fflush(stdout);
             for (int fi = 0; fi < 2; ++fi) {
