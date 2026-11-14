@@ -920,6 +920,20 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                           nm.ckpt("model.language_model.embed_tokens.weight")));
     RAD_ARCH_TRY(map_copy_alt(b, nm.f("output.weight"), nm.ckpt("lm_head.weight"),
                               nm.ckpt("model.language_model.embed_tokens.weight")));
+    /* The dense logits rows read bf16, block fp8 or int8. A Q6_K/Q8_0 head (Unsloth's map holds
+     * output.weight at Q6_K) has no logits kernel, and `logits_gemm` carries only one weight
+     * operand for the three planes; map it to i8 in the recipe instead, which the served container
+     * already does (fork-notes/q6k-dense-arch-note.md, ud_map's mirror recipe). */
+    {
+        RadEncoding oe{};
+        if (weight_enc(b, nm.f("output.weight"), &oe) && !linear_is_logits_head(oe)) {
+            char en[256];
+            rad_enc_format(&oe, en, sizeof en);
+            fprintf(stderr, "radiance: 'output.weight' is %s, which no logits_gemm row reads; "
+                            "store it as i8*bf16[1x128], block fp8 or bf16\n", en);
+            return RAD_E_DTYPE;
+        }
+    }
     m.w_tok = decl_w(b, nm.f("token_embd.weight"), RAD_BF16, {g.n_vocab, g.n_embd},
                      RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
     m.w_lm_head = decl_w(b, nm.f("output.weight"),

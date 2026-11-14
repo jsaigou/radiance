@@ -101,7 +101,12 @@ struct PleLayer {
     /* The table is llama.cpp's IQ4_NL: u4 codes and an f16 scale per 32 values (the Unsloth UD
      * release's form), not E4M3 with one scale for all of it. */
     bool       table_iq4 = false;
+    /* The two projections are bf16 as the checkpoint ships them (the FP8 release's
+     * `modules_to_not_convert`), or the ggml Q8_0 / Q6_K forms when a UD map keeps Unsloth's
+     * planes. See `key_form`: 0 bf16, 1 Q8_0, 2 Q6_K. */
     rad_weight w_key = 0, w_value = 0, w_nk = 0, w_nq = 0, w_nc = 0, w_conv = 0;
+    rad_weight w_key_scale = 0, w_value_scale = 0, w_key_ref = 0, w_value_ref = 0;
+    int        key_form = 0, value_form = 0;
 
     rad_kvgroup kv_tok = 0, kv_conv = 0;
     rad_buf b_ids = 0, b_emb = 0, b_embd = 0, b_k = 0, b_v = 0, b_gv = 0, b_gvn = 0, b_out = 0;
@@ -239,13 +244,69 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
                    RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
 
     /* ---- the projections and the three gains ------------------------------------------------ */
-    /* bf16: the FP8 checkpoint's `modules_to_not_convert` names both projections. */
-    RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.ple_key.weight", layer), src.key_proj));
-    w_key = decl_w(b, nm.f("blk.%d.ple_key.weight", layer), RAD_BF16, {HN, c.embed_dim},
-                   RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
-    RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.ple_value.weight", layer), src.value_proj));
-    w_value = decl_w(b, nm.f("blk.%d.ple_value.weight", layer), RAD_BF16,
-                     {g.n_embd, c.embed_dim}, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
+    /* bf16 as the FP8 checkpoint's `modules_to_not_convert` ships them, or the ggml Q8_0/Q6_K
+     * planes a UD map keeps. Both forms read the bf16 embedding directly. */
+    const char* kn = nm.f("blk.%d.ple_key.weight", layer);
+    const char* vn = nm.f("blk.%d.ple_value.weight", layer);
+    RAD_ARCH_TRY(map_copy(b, kn, src.key_proj));
+    RAD_ARCH_TRY(map_copy(b, vn, src.value_proj));
+    {
+        RadEncoding ke{}, ve{};
+        const bool kk = weight_enc(b, kn, &ke), vk = weight_enc(b, vn, &ve);
+        key_form = kk && linear_is_q6k(ke) ? 2 : kk && linear_is_q80(ke) ? 1 : 0;
+        value_form = vk && linear_is_q6k(ve) ? 2 : vk && linear_is_q80(ve) ? 1 : 0;
+        if (key_form != value_form) {
+            fprintf(stderr, "radiance: ple: the key and value projections are different formats; "
+                            "a UD map must store both alike or both bf16\n");
+            return RAD_E_DTYPE;
+        }
+        const int64_t kK = c.embed_dim, vb = key_form == 2 ? 256 : key_form == 1 ? 32 : 0;
+        if (key_form && (HN % 16 || g.n_embd % 16 || kK % vb)) {
+            fprintf(stderr, "radiance: ple: a ggml %s projection needs rows in 16s and K in whole "
+                            "%lld-value blocks (key %lldx%lld, value %lldx%lld)\n",
+                    key_form == 2 ? "Q6_K" : "Q8_0", (long long)vb, (long long)HN,
+                    (long long)kK, (long long)g.n_embd, (long long)kK);
+            return RAD_E_DTYPE;
+        }
+    }
+    if (key_form == 2) {
+        w_key = decl_view(b, kn, nullptr, "codes", RAD_I6, {HN, c.embed_dim},
+                          RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
+        w_key_scale = decl_view(b, nm.f("%s.scale", kn), kn, "scale", RAD_I8,
+                                {HN, c.embed_dim / 16}, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
+                                grp_model());
+        w_key_ref = decl_view(b, nm.f("%s.scale1", kn), kn, "scale.1", RAD_F16,
+                              {HN, c.embed_dim / 256}, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
+                              grp_model());
+    } else if (key_form == 1) {
+        w_key = decl_view(b, kn, nullptr, "codes", RAD_I8, {HN, c.embed_dim},
+                          RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
+        w_key_scale = decl_view(b, nm.f("%s.scale", kn), kn, "scale", RAD_F16,
+                                {HN, c.embed_dim / 32}, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE,
+                                grp_model());
+    } else {
+        w_key = decl_w(b, kn, RAD_BF16, {HN, c.embed_dim},
+                       RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
+    }
+    if (value_form == 2) {
+        w_value = decl_view(b, vn, nullptr, "codes", RAD_I6, {g.n_embd, c.embed_dim},
+                            RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
+        w_value_scale = decl_view(b, nm.f("%s.scale", vn), vn, "scale", RAD_I8,
+                                  {g.n_embd, c.embed_dim / 16}, RAD_ACCESS_PER_TOKEN,
+                                  RAD_SHARD_NONE, grp_model());
+        w_value_ref = decl_view(b, nm.f("%s.scale1", vn), vn, "scale.1", RAD_F16,
+                                {g.n_embd, c.embed_dim / 256}, RAD_ACCESS_PER_TOKEN,
+                                RAD_SHARD_NONE, grp_model());
+    } else if (value_form == 1) {
+        w_value = decl_view(b, vn, nullptr, "codes", RAD_I8, {g.n_embd, c.embed_dim},
+                            RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
+        w_value_scale = decl_view(b, nm.f("%s.scale", vn), vn, "scale", RAD_F16,
+                                  {g.n_embd, c.embed_dim / 32}, RAD_ACCESS_PER_TOKEN,
+                                  RAD_SHARD_NONE, grp_model());
+    } else {
+        w_value = decl_w(b, vn, RAD_BF16, {g.n_embd, c.embed_dim},
+                         RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
+    }
 
     RAD_ARCH_TRY(map_copy(b, nm.f("blk.%d.ple_norm_key.weight", layer), src.norm_key));
     w_nk = decl_w(b, nm.f("blk.%d.ple_norm_key.weight", layer), RAD_F32, {HN},
@@ -375,16 +436,46 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
                      RAD_NOWEIGHTS),
                  {b_emb}, {b_embd});
 
-    op_key = rw(b, RAD_OP(b, "gemm_nt",
-                   RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", HN),
-                              RAD_INT("K", c.embed_dim), RAD_STR("dtype", g.dtype)),
-                   RAD_WEIGHTS(w_key)),
-               {b_embd}, {b_k});
-    op_value = rw(b, RAD_OP(b, "gemm_nt",
-                     RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", g.n_embd),
-                                RAD_INT("K", c.embed_dim), RAD_STR("dtype", g.dtype)),
-                     RAD_WEIGHTS(w_value)),
-                 {b_embd}, {b_v});
+    if (key_form == 2)
+        op_key = rw(b, RAD_OP(b, "gemm_nt_q",
+                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", HN),
+                                    RAD_INT("K", c.embed_dim), RAD_INT("group", 256),
+                                    RAD_STR("dtype", "q6k")),
+                         RAD_WEIGHTS(w_key, w_key_scale, w_key_ref)),
+                     {b_embd}, {b_k});
+    else if (key_form == 1)
+        op_key = rw(b, RAD_OP(b, "gemm_nt_q",
+                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", HN),
+                                    RAD_INT("K", c.embed_dim), RAD_INT("group", 32),
+                                    RAD_STR("dtype", "q80a16")),
+                         RAD_WEIGHTS(w_key, w_key_scale)),
+                     {b_embd}, {b_k});
+    else
+        op_key = rw(b, RAD_OP(b, "gemm_nt",
+                       RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", HN),
+                                  RAD_INT("K", c.embed_dim), RAD_STR("dtype", g.dtype)),
+                       RAD_WEIGHTS(w_key)),
+                   {b_embd}, {b_k});
+    if (value_form == 2)
+        op_value = rw(b, RAD_OP(b, "gemm_nt_q",
+                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", g.n_embd),
+                                      RAD_INT("K", c.embed_dim), RAD_INT("group", 256),
+                                      RAD_STR("dtype", "q6k")),
+                           RAD_WEIGHTS(w_value, w_value_scale, w_value_ref)),
+                       {b_embd}, {b_v});
+    else if (value_form == 1)
+        op_value = rw(b, RAD_OP(b, "gemm_nt_q",
+                           RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", g.n_embd),
+                                      RAD_INT("K", c.embed_dim), RAD_INT("group", 32),
+                                      RAD_STR("dtype", "q80a16")),
+                           RAD_WEIGHTS(w_value, w_value_scale)),
+                       {b_embd}, {b_v});
+    else
+        op_value = rw(b, RAD_OP(b, "gemm_nt",
+                         RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok), RAD_INT("N", g.n_embd),
+                                    RAD_INT("K", c.embed_dim), RAD_STR("dtype", g.dtype)),
+                         RAD_WEIGHTS(w_value)),
+                     {b_embd}, {b_v});
 
     /* `q` is the incoming stream, un-normed; the op applies all three norms because the third is
      * over bytes it writes. */
@@ -486,8 +577,22 @@ inline void PleLayer::step(RadCtx* c_, const RadBatch* batch) const {
                 A > 0 ? brow_slice(b_ids, T, A, c.heads) : RAD_NONE);
 
     RAD_ISSUE_N(c_, op_embd,  T, brows(b_emb, T), brows(b_embd, T));
-    RAD_ISSUE_N(c_, op_key,   T, brows(b_embd, T), RAD_W(w_key),   brows(b_k, T));
-    RAD_ISSUE_N(c_, op_value, T, brows(b_embd, T), RAD_W(w_value), brows(b_v, T));
+    if (key_form == 2)
+        RAD_ISSUE_N(c_, op_key, T, brows(b_embd, T), RAD_NONE, RAD_W(w_key),
+                    RAD_W(w_key_scale), brows(b_k, T), RAD_NONE, RAD_W(w_key_ref));
+    else if (key_form == 1)
+        RAD_ISSUE_N(c_, op_key, T, brows(b_embd, T), RAD_NONE, RAD_W(w_key),
+                    RAD_W(w_key_scale), brows(b_k, T), RAD_NONE, RAD_NONE);
+    else
+        RAD_ISSUE_N(c_, op_key,   T, brows(b_embd, T), RAD_W(w_key),   brows(b_k, T));
+    if (value_form == 2)
+        RAD_ISSUE_N(c_, op_value, T, brows(b_embd, T), RAD_NONE, RAD_W(w_value),
+                    RAD_W(w_value_scale), brows(b_v, T), RAD_NONE, RAD_W(w_value_ref));
+    else if (value_form == 1)
+        RAD_ISSUE_N(c_, op_value, T, brows(b_embd, T), RAD_NONE, RAD_W(w_value),
+                    RAD_W(w_value_scale), brows(b_v, T), RAD_NONE, RAD_NONE);
+    else
+        RAD_ISSUE_N(c_, op_value, T, brows(b_embd, T), RAD_W(w_value), brows(b_v, T));
 
     RAD_ISSUE_N(c_, op_gate, T,
                 brows(b_k, T), brows(w.h, T), brows(b_v, T),
