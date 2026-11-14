@@ -2715,6 +2715,44 @@ TEST(q50_expert_declarations_choose_the_unrotated_bf16_activation_path) {
             CHECK_EQ(w.d.dtype, (uint32_t)RAD_F16);
 }
 
+/* Q2_0 is the third unrotated form: u2 codes at an f16 scale per 64, bf16 activations. */
+TEST(q20_expert_declarations_choose_the_unrotated_bf16_activation_path) {
+    using namespace rad::arch;
+    RadModelMeta meta = qwen4exp_meta();
+    RadEncoding q2 = rad_enc_affine(RAD_U2, RAD_F16, 1, 64);
+    REQUIRE(rad_enc_valid(&q2));
+    CHECK_EQ(MoeFP8::format_of(q2), 12);
+    const RadEncoding row8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 1, 128);
+    RadEncoding u2 = rad_enc_affine(RAD_U2, RAD_F16, 1, 128);
+    rad_enc_add_plane(&u2, "zero", RAD_U8, 1, 128);
+
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok = 2048; c.max_seqs = 8; c.max_spec = 3; c.max_ctx = 200000;
+    RadBuilder b;
+    b.encs = { { "ffn_gate_up_exps", q2 }, { "ffn_down_exps", q2 },
+               { "_hc_down.weight", row8 }, { "_hc_up.weight", row8 },
+               { "fc_hidden", row8 }, { "fc_embedding", row8 }, { "draft_head", u2 } };
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+    const qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[0];
+    CHECK_EQ(m.moecfg.expert_w4, 1);
+    CHECK_EQ(m.moecfg.expert_rot, 0);
+    CHECK_EQ(m.moecfg.expert_nl, 0);
+    CHECK_EQ(m.moecfg.expert_q20, 1);
+    int q20_ops = 0, hq_ops = 0;
+    for (const RecOp& o : b.ops) {
+        if (o.op.rfind("moe_gemm", 0) == 0)
+            for (const auto& p : o.p)
+                if (p.key == "dtype" && p.sval == "q20a16") ++q20_ops;
+        if (o.op == "had_quant_act_fp8") ++hq_ops;
+    }
+    CHECK(q20_ops > 0);
+    CHECK_EQ(hq_ops, 0);
+    for (const RecWeight& w : b.weights)
+        if (w.name.find("_exps.") != std::string::npos && w.name.size() > 6 &&
+            w.name.compare(w.name.size() - 6, 6, ".scale") == 0)
+            CHECK_EQ(w.d.dtype, (uint32_t)RAD_F16);
+}
+
 TEST(mxfp4_expert_declarations_preserve_tp4_and_tp8_scale_geometry_and_movement_groups) {
     using namespace rad::arch;
     const RadEncoding mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);

@@ -209,6 +209,12 @@ static bool moe_q50(const RadParam* p, int n_p) {
     const char* d = halo_pgets(p, n_p, "dtype");
     return d && std::strcmp(d, "q50a16") == 0;
 }
+/* `q20a16` is GGUF Q2_0 as stored: u2 codes (0..3 naming -1, 0, +1, +2) and an f16 scale per
+ * (row, 64 of K), unrotated, bf16 activations. The canonical u2 plane is the GGUF layout. */
+static bool moe_q20(const RadParam* p, int n_p) {
+    const char* d = halo_pgets(p, n_p, "dtype");
+    return d && std::strcmp(d, "q20a16") == 0;
+}
 /* `w5nl64a8h` is w4nl64a8h at five bits: `u5*fp8_e4m3[1x64]*f32[*x*]/fwht128`, codes indexing
  * libquant's 32-entry `table=w5nl`. Its codes view relays each row into HALO_DT_MOEW5 (the low four
  * bits of every code as w4nla8h's nibble plane, then each code's high bit, the sign, one dword per
@@ -1025,13 +1031,16 @@ int moew4_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding*
     const bool w3 = moe_w3(p, n_p);
     const bool iq4 = moe_iq4(p, n_p);
     const bool q50 = moe_q50(p, n_p);
+    const bool q20 = moe_q20(p, n_p);
     const int  g64 = moe_w4_g64(p, n_p);             /* scale groups a 128 of K, or 0 */
     if ((iq4 || q50) && g.K % 32) return RAD_E_SHAPE; /* an f16 scale per 32 of K */
+    if (q20 && g.K % 64) return RAD_E_SHAPE;          /* an f16 scale per 64 of K */
     if ((w5 || w3) && g.K % 32) return RAD_E_SHAPE;   /* a sign word is 32 elements */
     /* The 3-bit rows hold 48 bytes per 128 of K (interleaved) and the GEMM refuses any other K, so a
      * K that is not whole 128s would have moew3_row write past the K/8*3-byte row. */
     if (w3 && g.K % 128) return RAD_E_SHAPE;
-    if (q50 ? !halo_enc::affine(enc, RAD_I5, RAD_F16, 1, 32)
+    if (q20 ? !halo_enc::affine(enc, RAD_U2, RAD_F16, 1, 64)
+       : q50 ? !halo_enc::affine(enc, RAD_I5, RAD_F16, 1, 32)
        : iq4 ? !halo_enc::affine_table(enc, RAD_U4, RAD_F16, 1, 32, RAD_I8, 16, "")
        : g64 ? !halo_enc::affine_table2(enc, w3 ? RAD_U3 : w5 ? RAD_U5 : RAD_U4, RAD_F8E4M3, 1,
                                       g.group / g64, RAD_F32, RAD_F32, w3 ? 8 : w5 ? 32 : 16, fw)
@@ -1040,10 +1049,11 @@ int moew4_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding*
         return RAD_E_DTYPE;
     if (gout) *gout = g;
     if (operand == Q_BSCALE) {
-        if (iq4 || q50) {
-            if (!selects(enc, sel, n, "scale") || !dims(pl[0], g.N, g.K / 32))
+        if (iq4 || q50 || q20) {
+            if (!selects(enc, sel, n, "scale") ||
+                !dims(pl[0], g.N, g.K / (q20 ? 64 : 32)))
                 return RAD_E_SHAPE;
-            return RAD_E_UNSUPPORTED;                /* f16 per (row, 32 of K), as it is */
+            return RAD_E_UNSUPPORTED;                /* f16 per (row, 32 or 64 of K), as it is */
         }
         if (g64) {
             if (!selects(enc, sel, n, "scale", "scale.1") ||
@@ -1068,6 +1078,10 @@ int moew4_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding*
         if (!selects(enc, sel, n, "codes") || !dims(pl[0], g.N, g.K)) return RAD_E_SHAPE;
         fill(out, "halo.moeq50.w.g32", HALO_DT_MOEW5, g.N, g.K, g.N * (g.K / 8) * 5);
         return RAD_OK;
+    }
+    if (q20) {
+        if (!selects(enc, sel, n, "codes") || !dims(pl[0], g.N, g.K)) return RAD_E_SHAPE;
+        return RAD_E_UNSUPPORTED;                /* the canonical u2 plane, as it is */
     }
     if (nl ? !selects(enc, sel, n, "codes", "table") || !dims(pl[1], 1, w3 ? 8 : w5 ? 32 : 16)
            : !selects(enc, sel, n, "codes"))
@@ -1286,7 +1300,8 @@ int moew4_relayout_by(MoeViewFn view, const RadParam* p, int n_p, int operand,
     if (rc != RAD_OK) return rc;
     if (dst_bytes != L.bytes) return RAD_E_SHAPE;
     if (v.operand == Q_BSCALE) {                     /* g64 forms: the second level is fixed */
-        if (moe_iq4(v.p, v.n) || moe_q50(v.p, v.n)) return RAD_E_UNSUPPORTED;   /* f16 per 32 */
+        if (moe_iq4(v.p, v.n) || moe_q50(v.p, v.n) || moe_q20(v.p, v.n))
+            return RAD_E_UNSUPPORTED;                /* f16 per 32 or 64, stored as it is */
         float s2 = 0.0f;
         std::memcpy(&s2, pdata(pl[1]), sizeof s2);
         if (s2 != kW4G64Scale) return RAD_E_DTYPE;

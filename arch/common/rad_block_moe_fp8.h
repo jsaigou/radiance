@@ -258,6 +258,9 @@ struct MoeFP8 {
          * rotation, bf16 activations. The GGUF Q5_0 plane as stored; a two's complement 5-bit
          * code, so the kernel stages the low nibble and subtracts 16 when the high bit is set. */
         int     expert_q50   = 0;
+        /* Q2_0 (dtype `q20a16`): u2 codes naming (-1, 0, +1, +2) times an f16 scale per (row,
+         * 64 of K), no rotation, bf16 activations. The GGUF Q2_0 plane as stored. */
+        int     expert_q20   = 0;
         /* Scales per 64 of K: one E4M3 byte under a fixed 2^-13 (dtype `w4nl64a8h`, libr4d's
          * kW4G64Scale), the same bytes as one bf16 per 128. Only with `expert_nl`. The scale views
          * select the fixed second level, which the relayout checks against the kernel's constant.
@@ -482,9 +485,9 @@ struct MoeFP8 {
      * scales per 32 with bf16 activations; RAD_E_DTYPE otherwise. */
     static int format_of(const RadEncoding& e);
     /* format_of's numbers as the grouped GEMMs' dtype strings. */
-    static constexpr const char* kServed[12] = { "fp8a8", "w4a8", "w4a8h", "bf16", "w4nla8h",
+    static constexpr const char* kServed[13] = { "fp8a8", "w4a8", "w4a8h", "bf16", "w4nla8h",
                                                 "w4nl64a8h", "w4nl32a8h", "w5nl64a8h", "mxfp4a8", "fp8a8f32",
-                                                "iq4nl32a16", "q50a16" };
+                                                "iq4nl32a16", "q50a16", "q20a16" };
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                  const Wire& wire, const Src& src, bool fold = false, bool add_out = true,
@@ -533,6 +536,11 @@ inline int MoeFP8::format_of(const RadEncoding& e) {
     if (e.n_planes == 2 && sc && sc->dtype == RAD_F16 && sc->block[0] == 1 &&
         sc->block[1] == 32 && e.plane[0].dtype == RAD_I5 && !e.transform[0])
         return 11;
+    /* Q2_0 as GGUF stores it: u2 codes (0..3 naming -1, 0, +1, +2), an f16 scale per 64 of K, no
+     * transform. */
+    if (e.n_planes == 2 && sc && sc->dtype == RAD_F16 && sc->block[0] == 1 &&
+        sc->block[1] == 64 && e.plane[0].dtype == RAD_U2 && !e.transform[0])
+        return 12;
     /* The codebook at E4M3 scales per 64 or 32 of K under one fixed f32 (w4nl64a8h, w4nl32a8h),
      * and its five-bit form per 64 (w5nl64a8h). */
     if (e.n_planes == 4 && sc && sc->dtype == RAD_F8E4M3) {
@@ -657,7 +665,7 @@ inline int MoeFP8::probe(RadBuilder* b, Names& nm, int l, const Src& src, Config
         if (f != 3) break;
     }
     cfg->expert_w4   = (f == 1 || f == 2 || f == 4 || f == 5 || f == 6 || f == 7 || f == 10 ||
-                          f == 11) ? 1 : 0;
+                          f == 11 || f == 12) ? 1 : 0;
     cfg->expert_rot  = (f == 2 || f == 4 || f == 5 || f == 6 || f == 7) ? 1 : 0;
     cfg->expert_nl   = (f == 4 || f == 5 || f == 6 || f == 7 || f == 10) ? 1 : 0;
     cfg->expert_g64  = (f == 5 || f == 7) ? 2 : f == 6 ? 4 : 0;
@@ -667,6 +675,7 @@ inline int MoeFP8::probe(RadBuilder* b, Names& nm, int l, const Src& src, Config
     cfg->expert_f32_scale = f == 9 ? 1 : 0;
     cfg->expert_iq4  = f == 10 ? 1 : 0;
     cfg->expert_q50  = f == 11 ? 1 : 0;
+    cfg->expert_q20  = f == 12 ? 1 : 0;
     return RAD_OK;
 }
 
@@ -746,7 +755,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     prot.clear();
     {
         const int want = c.expert_f32_scale ? 9 : c.expert_mx ? 8 : c.expert_bf16 ? 3
-                       : c.expert_iq4 ? 10 : c.expert_q50 ? 11
+                       : c.expert_iq4 ? 10 : c.expert_q50 ? 11 : c.expert_q20 ? 12
                        : c.expert_w5 ? 7 : c.expert_g64 == 4 ? 6
                        : c.expert_g64 ? 5 : c.expert_nl ? 4
                        : c.expert_w4 ? (c.expert_rot ? 2 : 1) : 0;
@@ -985,7 +994,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * relayout sees it. */
     auto edt_of = [&](int f) {
         return f == 8 ? (uint32_t)RAD_FP4E2M1 : f == 7 ? (uint32_t)RAD_U5
-             : c.expert_q50 ? (uint32_t)RAD_I5 : c.expert_nl ? (uint32_t)RAD_U4
+             : c.expert_q50 ? (uint32_t)RAD_I5 : c.expert_q20 ? (uint32_t)RAD_U2
+         : c.expert_nl ? (uint32_t)RAD_U4
              : c.expert_w4 ? (uint32_t)RAD_I4 : (uint32_t)RAD_F8E4M3;
     };
     const uint32_t edt[2] = { edt_of(fmt[0]), edt_of(fmt[1]) };
@@ -1005,11 +1015,12 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * Rotation exists only for the 4-bit plane (the fp8 layout hook has no rotated form). A
      * codebook is rotated, except IQ4_NL (expert_iq4), which is served unrotated at f16 scales
      * per 32 with bf16 activations; other combinations are refused. */
-    const bool unrot = c.expert_iq4 || c.expert_q50;
+    const bool unrot = c.expert_iq4 || c.expert_q50 || c.expert_q20;
     if ((c.expert_rot && !c.expert_w4) ||
         (c.expert_nl && !c.expert_rot && !c.expert_iq4) ||
         (c.expert_iq4 && (!c.expert_nl || c.expert_rot || !c.expert_w4)) ||
-        (c.expert_q50 && (c.expert_nl || c.expert_rot || !c.expert_w4))) {
+        (c.expert_q50 && (c.expert_nl || c.expert_rot || !c.expert_w4)) ||
+        (c.expert_q20 && (c.expert_nl || c.expert_rot || !c.expert_w4))) {
         fprintf(stderr, "radiance: rotated experts (expert_rot) require the 4-bit expert format, "
                         "a codebook (expert_nl) the rotated one, and IQ4_NL (expert_iq4) the "
                         "unrotated 4-bit plane; there is no rotated E4M3 expert plane\n");
@@ -1036,7 +1047,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                           : c.expert_g64       ? (uint32_t)RAD_F8E4M3
                           : unrot              ? (uint32_t)RAD_F16 : (uint32_t)RAD_BF16;
     const int64_t  sgk    = c.expert_mx ? RAD_MX_GROUP
-                          : c.expert_g64 ? 1 : unrot ? 32 : RAD_FP8_BLOCK;
+                          : c.expert_g64 ? 1 : c.expert_q20 ? 64 : unrot ? 32 : RAD_FP8_BLOCK;
     const char*    escale = c.expert_g64 ? "scale,scale.1" : "scale";
     /* This class's slice of each expert: gate and up rows [lo, hi), down columns [lo, hi), scale
      * planes the same in their own units. */
