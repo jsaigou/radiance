@@ -559,6 +559,8 @@ int halo_rad_rope_table            (const RadArgs*, RadStream);
 int halo_rad_gemm_fp8a16_m1  (const RadArgs*, RadStream);
 int halo_rad_gemm_q80a16_mv  (const RadArgs*, RadStream);
 int halo_rad_gemm_q80a16_wmma(const RadArgs*, RadStream);
+int halo_rad_gemm_q6ka16_mv  (const RadArgs*, RadStream);
+int halo_rad_gemm_q6ka16_wmma(const RadArgs*, RadStream);
 int halo_rad_gemm_fp8a8_m16  (const RadArgs*, RadStream);
 int halo_rad_gemm_fp8a8_gated_m16(const RadArgs*, RadStream);
 int64_t halo_rad_gemm_fp8a8_gated_m16_scratch(const RadArgs*);
@@ -620,6 +622,7 @@ HALO_HOOKS(mtp_e4m3)
 HALO_HOOKS(w4)
 HALO_HOOKS(w2a8)
 HALO_HOOKS(q80)
+HALO_HOOKS(q6k)
 HALO_HOOKS(moe_w4)
 HALO_HOOKS(moe_w4_mod4)
 #undef HALO_HOOKS

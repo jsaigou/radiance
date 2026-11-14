@@ -88,6 +88,7 @@ set(HALO_UNITS
   "halo_gemm_mxfp4a8_tiled|"
   "halo_gemm_nt_bias|"
   "halo_gemm_nt_f32|"
+  "halo_gemm_q6ka16|"
   "halo_gemm_q80a16|"
   "halo_gemm_w2a8_nt|"
   "halo_gemm_w4a16_nt_m64|"
