@@ -560,6 +560,15 @@ def _env_pairs(pairs):
     return env
 
 
+def _child_env(args, base=None):
+    env = dict(base) if base is not None else _env_pairs(getattr(args, "env", []))
+    if getattr(args, "home", None):
+        env["RADIANCE_HOME"] = args.home
+    if getattr(args, "kernels", None):
+        env.setdefault("RADIANCE_KERNELS", args.kernels)
+    return env
+
+
 def _tool(args, name, attr, env_word):
     v = getattr(args, attr, None)
     if v:
@@ -690,17 +699,18 @@ def build(args):
 
     if getattr(args, "dry_run", False):
         # Emit the recipe and the plan, print the exact command, run nothing.
+        cmd = _convert_command(args, recipe_path, out, declared_json, args.plan_only)
+        data["command"] = cmd
         open(recipe_path, "w").write(data["recipe"])
         with open(plan_json, "w") as f:
             json.dump(data, f, indent=1)
-        cmd = _convert_command(args, recipe_path, out, declared_json, args.plan_only)
-        data["command"] = cmd
         print("dry run: recipe " + recipe_path + ", plan " + plan_json)
         print("+ " + shlex.join(cmd))
         return 0
 
     # The declared plan lets the plan check coverage and gives verify the source names. Generate it
     # first, from the recipe we are about to use; this also proves the recipe is accepted.
+    open(recipe_path, "w").write(data["recipe"])
     cmd0 = _convert_command(args, recipe_path, out, declared_json, plan_only=True)
     rc, text = _run(cmd0, log_path + ".plan", env=_env_pairs(args.env),
                     timeout=args.timeout, dry=False)
@@ -779,15 +789,17 @@ _CALIB_RE = re.compile(r"calibration wrote .*after (\d+) tokens")
 def calibrate(args):
     """Drive a calibration batch run (the ENV tap, not just --calib-dir), then a GPTQ convert
     with --reuse the RTN container."""
+    if not args.convert_only and not args.corpus:
+        sys.exit("ud_map calibrate: give --corpus (or --convert-only)")
     os.makedirs(args.calib_dir, exist_ok=True)
     args._source_quant = source_quant(args.source) if getattr(args, "source", None) else None
     report = dict(tool="ud_map calibrate", calib_dir=args.calib_dir, tokens=args.tokens,
                   corpus=args.corpus, model=args.model, phases=[])
-    radiance = _tool(args, "radiance", "radiance", "RADIANCE_RADIANCE")
-    env = _env_pairs(args.env)
+    env = _child_env(args)
     env["RADIANCE_CALIB_DIR"] = args.calib_dir
     env["RADIANCE_CALIB_TOKENS"] = str(args.tokens)
     if not args.convert_only:
+        radiance = _tool(args, "radiance", "radiance", "RADIANCE_RADIANCE")
         cmd = [radiance, "--model", args.model, "--calib-corpus", args.corpus,
                "--calib-dir", args.calib_dir,
                "--max-model-len", str(args.max_model_len), "--tp", str(args.tp),
@@ -796,8 +808,6 @@ def calibrate(args):
                "--max-num-seqs", str(args.max_num_seqs)]
         if args.num_speculative_tokens is not None:
             cmd += ["--num-speculative-tokens", str(args.num_speculative_tokens)]
-        if args.home:
-            cmd += ["--home", args.home]
         if args.kernels:
             cmd += ["--kernels", args.kernels]
         cmd += list(args.extra_arg or [])
@@ -824,7 +834,8 @@ def calibrate(args):
             gguf = args.gguf if isinstance(args.gguf, list) else [args.gguf]
             arch = load_all(gguf)[0].get("general.architecture", "?")
             policy = _choose_policy(args, arch)
-            ns = _plan_namespace(args, None, policy, gptq=True)
+            args.gptq = True
+            ns = _plan_namespace(args, None, policy)
             data, _, _, _ = compute_plan(ns)
             recipe = args.recipe_out or (args.out + ".gptq.recipe")
             open(recipe, "w").write(data["recipe"])
@@ -834,7 +845,7 @@ def calibrate(args):
         cmd = _convert_command(args, recipe, args.out, None, plan_only=False)
         if args.reuse is None:
             cmd += ["--reuse", args.model]
-        env2 = dict(env)
+        env2 = _child_env(args, env)
         env2["CALIB"] = args.calib_dir
         log = args.log or (args.out + ".convert.log")
         rc, text = _run(cmd, log, env=env2, timeout=args.timeout)
@@ -1035,6 +1046,21 @@ class Refs:
     def source(self, name, row_limit=None):
         """(source array or None, note)."""
         import numpy as np
+        if name.startswith("v."):
+            m = re.fullmatch(r"v\.blk\.(\d+)\.(qkv|proj|fc1|fc2|norm1|norm2)\.(weight|bias)", name)
+            if m:
+                blk, part, kind = m.group(1), m.group(2), m.group(3)
+                p = {"qkv": f"attn.qkv.{kind}", "proj": f"attn.proj.{kind}",
+                     "fc1": f"mlp.linear_fc1.{kind}", "fc2": f"mlp.linear_fc2.{kind}",
+                     "norm1": f"norm1.{kind}", "norm2": f"norm2.{kind}"}[part]
+                return self._src(f"model.visual.blocks.{blk}.{p}", row_limit=row_limit), ""
+            m = re.fullmatch(r"v\.(patch|pos|merger\.fc1|merger\.fc2|merger\.norm)\.(weight|bias)", name)
+            if m:
+                p = {"patch": "patch_embed.proj", "pos": "pos_embed",
+                     "merger.fc1": "merger.linear_fc1", "merger.fc2": "merger.linear_fc2",
+                     "merger.norm": "merger.norm"}[m.group(1)]
+                return self._src(f"model.visual.{p}.{m.group(2)}", row_limit=row_limit), ""
+            return None, "no source rule"
         if name == "token_embd.weight":
             return self._src("model.language_model.embed_tokens.weight", row_limit=row_limit), ""
         if name == "output.weight":
@@ -1103,6 +1129,8 @@ class Refs:
     def gguf(self, name, row_limit=None):
         """(GGUF array or None, note). Value-head order and the -exp(A_log) convention are undone."""
         import numpy as np
+        if name.startswith("v."):
+            return None, "not in the text GGUF"
         if name in ("token_embd.weight", "output.weight", "output_norm.weight"):
             return self._gg(name, row_limit=row_limit), ""
         if name == "mtp.draft_head.weight":
@@ -1201,6 +1229,8 @@ class Refs:
 def _rad_role(name):
     if "ffn_gate_up_exps" in name:
         return "routed-expert gate/up"
+    if name.startswith("v."):
+        return "vision"
     return role_of(name)
 
 
@@ -1251,6 +1281,19 @@ def verify(args):
     names = [e.name for e in rf.entries]
     if args.only:
         names = [n for n in names if re.search(args.only, n)]
+    expert_sample = getattr(args, "max_experts", 0) or 0
+    if expert_sample:
+        keep, seen = [], collections.Counter()
+        for n in names:
+            m = re.fullmatch(r"blk\.(\d+)\.(ffn_gate_up_exps|ffn_down_exps)\.(\d+)\.weight", n)
+            if not m:
+                keep.append(n)
+                continue
+            key = (m.group(1), m.group(2))
+            seen[key] += 1
+            if seen[key] <= expert_sample:
+                keep.append(n)
+        names = keep
     rows = []
     tot = 0
     by_role = collections.defaultdict(lambda: [0, 0])
@@ -1351,7 +1394,8 @@ def verify(args):
             bad.append("no source reference")
         elif e_rmse is not None and e_rmse > tol:
             bad.append(f"source RMSE {e_rmse:.3f} > {tol:.3f}")
-        if ga is None and gg is not None and not draft and not getattr(args, "skip_gguf", False):
+        if (ga is None and gg is not None and not draft and not name.startswith("v.")
+                and not getattr(args, "skip_gguf", False)):
             bad.append("no GGUF reference")
         elif g_rmse is not None and g_rmse > tol:
             bad.append(f"GGUF RMSE {g_rmse:.3f} > {tol:.3f}")
@@ -1404,6 +1448,8 @@ def verify(args):
                   gguf=(args.gguf if isinstance(args.gguf, list) else [args.gguf]) if args.gguf else None,
                   policy=policy, tol=args.tol, draft_tol=args.draft_tol,
                   weights=len(rows), bytes=tot,
+                  container_bytes=os.path.getsize(args.rad),
+                  expert_sample_per_layer=(expert_sample or None),
                   rmse_source=src_rmse, rmse_gguf=gg_rmse,
                   hash_equal_source=f"{hash_ok}/{hash_n}",
                   missing_source=missing_src, missing_gguf=missing_gg,
@@ -1446,8 +1492,6 @@ def _kld_run(args, model, mode, out_json=None, ref_dir=None):
            "--kv-cache-dtype", args.kv_cache_dtype]
     if args.num_speculative_tokens is not None:
         cmd += ["--num-speculative-tokens", str(args.num_speculative_tokens)]
-    if args.home:
-        cmd += ["--home", args.home]
     if args.kernels:
         cmd += ["--kernels", args.kernels]
     if mode == "record":
@@ -1464,6 +1508,8 @@ def _kld_run(args, model, mode, out_json=None, ref_dir=None):
 
 
 def score_kld(args):
+    if not args.reference or not args.corpus:
+        sys.exit("ud_map score kld: give --reference and --corpus")
     os.makedirs(args.out_dir, exist_ok=True)
     ref_dir = args.ref_dir or os.path.join(args.out_dir, "kld-ref")
     report = dict(tool="ud_map score kld", reference=args.reference, corpus=args.corpus,
@@ -1471,7 +1517,7 @@ def score_kld(args):
     if args.record and not os.path.exists(os.path.join(ref_dir, "kld.json")):
         cmd = _kld_run(args, args.reference, "record", ref_dir=ref_dir)
         rc, text = _run(cmd, os.path.join(args.out_dir, "kld-record.log"),
-                        env=_env_pairs(args.env), timeout=args.timeout)
+                        env=_child_env(args), timeout=args.timeout)
         report["phases"].append(dict(name="record", command=cmd, rc=rc,
                                      log=os.path.join(args.out_dir, "kld-record.log")))
         if rc != 0:
@@ -1485,7 +1531,7 @@ def score_kld(args):
         out_json = os.path.join(args.out_dir, f"{name}.kld.json")
         cmd = _kld_run(args, path, "score", out_json=out_json, ref_dir=ref_dir)
         rc, text = _run(cmd, os.path.join(args.out_dir, f"{name}.log"),
-                        env=_env_pairs(args.env), timeout=args.timeout)
+                        env=_child_env(args), timeout=args.timeout)
         rec = dict(name=name, model=path, rc=rc, kld_json=out_json if rc == 0 else None)
         if rc == 0 and os.path.exists(out_json):
             d = json.load(open(out_json))
@@ -1531,8 +1577,6 @@ def _server_cmd(args, model, port, max_model_len=None, spec=None):
         spec = args.num_speculative_tokens
     if spec is not None:
         cmd += ["--num-speculative-tokens", str(spec)]
-    if args.home:
-        cmd += ["--home", args.home]
     if args.kernels:
         cmd += ["--kernels", args.kernels]
     if getattr(args, "api_key", None):
@@ -1673,10 +1717,12 @@ def _grade(item, rec):
 
 
 def score_quality(args):
+    if not args.model or not args.evalset:
+        sys.exit("ud_map score quality: give --model and --evalset")
     os.makedirs(args.out_dir, exist_ok=True)
     key = args.api_key
     port = args.port or _free_port()
-    env = _env_pairs(args.env)
+    env = _child_env(args)
     if key:
         env["RADIANCE_UD_MAP_KEY"] = key
     cmd = _server_cmd(args, args.model, port)
@@ -1741,7 +1787,7 @@ def _measure_one(args, name, path):
     import threading
     key = args.api_key
     port = args.port or _free_port()
-    env = _env_pairs(args.env)
+    env = _child_env(args)
     if key:
         env["RADIANCE_UD_MAP_KEY"] = key
     spec = args.num_speculative_tokens if args.num_speculative_tokens is not None else 2
@@ -1758,7 +1804,7 @@ def _measure_one(args, name, path):
                  "ember glacier thistle anchor mosaic canyon willow cipher falcon").split()
         import random
         r = random.Random(7)
-        prefill = " ".join(r.choice(words) for _ in range(6000))
+        prefill = " ".join(r.choice(words) for _ in range(4000))
         recs = []
         th = [threading.Thread(target=lambda i=i: recs.append(
             _chat(port, key, f"Variant {name}-{i}: Write a detailed story.", 200)))
@@ -1832,10 +1878,12 @@ def variations(args):
     if args.measure:
         for spec in args.container or []:
             name, _, path = spec.partition("=")
-            rec = _measure_one(args, name, path)
-            report["measurements"].append(rec)
-            print(f'measure {name}: ' + json.dumps(
-                {k: v for k, v in rec.items() if k not in ("metrics_delta", "model")}))
+            for rep in range(max(1, args.reps)):
+                rec = _measure_one(args, name if args.reps == 1 else f"{name}-r{rep}", path)
+                rec["rep"] = rep
+                report["measurements"].append(rec)
+                print(f'measure {name} r{rep}: ' + json.dumps(
+                    {k: v for k, v in rec.items() if k not in ("metrics_delta", "model")}))
     if args.out_dir:
         if args.plan_json:
             with open(args.plan_json, "w") as f:
@@ -1958,6 +2006,8 @@ def main():
     v.add_argument("--policy", choices=["auto", "lossless", "quantised"], default="auto")
     v.add_argument("--skip-gguf", action="store_true")
     v.add_argument("--allow-missing", action="store_true")
+    v.add_argument("--max-experts", type=int, default=0,
+                   help="check at most N experts per (layer, projection); 0 checks every one")
     v.set_defaults(fn=verify)
 
     sc = sp.add_parser("score", help="the KL mode or the existing quality sets")
