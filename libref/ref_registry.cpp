@@ -785,7 +785,10 @@ static const RadParamSpec pEmbed[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_voc
                                        /* embed_lookup_q's: the scale its layout quantises with;
                                         * a parameter because a global scale needs the whole
                                         * table and the transform sees one block. */
-                                       P_F64O("wscale") };
+                                       P_F64O("wscale"),
+                                       /* The table's stored form for the shape hook: "iq4_nl" is
+                                        * u4 codes and an f16 scale per 32 values. */
+                                       P_STRO("wform") };
 /* embed_lookup's list: pEmbed plus `mult`, the factor every gathered row is multiplied by (Gemma's
  * sqrt(hidden)). embed_lookup_q has its table scale instead. */
 static const RadParamSpec pEmbedM[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_vocab"),
@@ -2259,7 +2262,12 @@ static int ref_check_dtypes(const char* op, const RadArgs* a) {
         const RadTensor& t = a->t[i];
         if (!t.data) continue;
         const int role = sc->operands[i].role;
-        if (role != RAD_OPD_OUT && !ref_readable(t.dtype) && !ref_joined_weight(t, role))
+        /* IQ4_NL's codes: a u4 weight operand libref reads in ref_embed_lookup_q itself (through
+         * rad_load_f32), not through ld_dt, which deliberately has no u4 case (cast refuses it). */
+        const bool iq4_codes = t.dtype == RAD_U4 && role == RAD_OPD_WEIGHT &&
+                               std::strcmp(op, "embed_lookup_q") == 0;
+        if (role != RAD_OPD_OUT && !ref_readable(t.dtype) && !ref_joined_weight(t, role) &&
+            !iq4_codes)
             return RAD_E_DTYPE;
         if ((role == RAD_OPD_OUT || role == RAD_OPD_INOUT) && !ref_storable(t.dtype))
             return RAD_E_DTYPE;

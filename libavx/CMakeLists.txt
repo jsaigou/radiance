@@ -132,6 +132,13 @@ if(TARGET rad_core)
 endif()
 set_target_properties(rad-avx-check PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${AVX_OUT_DIR})
 
+# The IQ4_NL n-gram gather over a real table: host correctness against tools/ud_repack's decode,
+# and a random-row throughput number. dlopens the plugins, like the other harnesses.
+add_executable(rad-avx-iq4 avx_iq4_check.cpp)
+target_include_directories(rad-avx-iq4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(rad-avx-iq4 PRIVATE radiance::abi ${CMAKE_DL_LIBS} Threads::Threads)
+set_target_properties(rad-avx-iq4 PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${AVX_OUT_DIR})
+
 add_executable(rad-avx-bench avx_bench.cpp avx_cases.cpp)
 target_include_directories(rad-avx-bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(rad-avx-bench PRIVATE radiance::abi ${CMAKE_DL_LIBS})

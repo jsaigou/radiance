@@ -901,7 +901,7 @@ static const RadOperandSpec oSubI32[] = { OPD("x"), OPD("s"), OUT("y") };
 /* ---- vocabulary edges --------------------------------------------------------------------- */
 static const RadParamSpec pEmbed[]    = { P_INT("M"), P_INT("n_embd"), P_INT("n_vocab"),
                                           P_STR("dtype"), P_INTO("vocab_offset"),
-                                          P_F64O("wscale") };
+                                          P_F64O("wscale"), P_STRO("wform") };
 static const RadParamSpec pEmbedM[]   = { P_INT("M"), P_INT("n_embd"), P_INT("n_vocab"),
                                           P_STR("dtype"), P_INTO("vocab_offset"),
                                           P_F64O("wscale"), P_F64O("mult") };

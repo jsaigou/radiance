@@ -248,6 +248,20 @@ extern "C" int halo_shape_embed_lookup_q(const RadParam* p, int n_p, int operand
     const int64_t nv = pi(p, n_p, "n_vocab");
     const int64_t vo = pi(p, n_p, "vocab_offset", 0);
     const uint32_t D = dt_act(p, n_p, "dtype");
+    const char* wf = rad_param_gets(p, n_p, "wform", nullptr);
+    /* IQ4_NL: u4 codes (element 2k low, 2k+1 high) and one f16 per 32 values, the GGUF's
+     * per-block scale. `ne` must be whole 32s, as a scale block is. */
+    if (wf && !std::strcmp(wf, "iq4_nl")) {
+        if (ne % 32) return -1;
+        const RadOpdDesc q4[] = {
+            opd_idx(M, 0, vo + nv),
+            opd((uint32_t)RAD_U4, nv, ne),
+            opd((uint32_t)RAD_F16, nv, ne / 32),
+            opd(D, M, ne),
+            opd_none(),
+        };
+        HALO_PICK(q4);
+    }
     const RadOpdDesc l[] = {
         opd_idx(M, 0, vo + nv),
         opd((uint32_t)RAD_F8E4M3, nv, ne),

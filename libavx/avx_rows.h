@@ -16,13 +16,19 @@
 namespace avx {
 
 /* dst[i][0, n) = lut[src[i][0, n)] for every i < count: E4M3 codes through a table of all 256
- * codes already scaled and rounded to bf16. */
-typedef void (*RowDecode)(const uint8_t* const* src, uint16_t* const* dst, int64_t count,
-                          int64_t n, const uint16_t* lut);
+ * codes already scaled and rounded to bf16. `sc[i]`, when the call's table carries a per-32 scale
+ * (IQ4_NL), is row i's scale plane; the E4M3 and bf16 decoders ignore it.
+ *
+ * `lut` is the call's decode context: the 256-entry bf16 table for E4M3, or the 16-entry i8
+ * codebook for IQ4_NL. */
+typedef void (*RowDecode)(const uint8_t* const* src, const uint16_t* const* sc,
+                          uint16_t* const* dst, int64_t count, int64_t n, const void* lut);
 
 /* One call's gather, validated by the caller: `ids` holds M row ids, `tab` n_vocab rows of n_embd
- * elements -- E4M3 codes, or bf16 as stored -- `row_bytes` apart, `out` M rows of n_embd bf16
- * `x_ld` elements apart. The row cache and the reads deal in `row_bytes`; the decode in elements.
+ * elements -- E4M3 codes, bf16 as stored, or u4 IQ4_NL codes -- `row_bytes` apart, `out` M rows of
+ * n_embd bf16 `x_ld` elements apart. The row cache and the reads deal in `row_bytes`; the decode in
+ * elements. For IQ4_NL `scales` is the [n_vocab, n_embd / 32] f16 plane, `scale_row_bytes` apart,
+ * read as memory rather than through the row cache (it is a tenth of the codes' bytes).
  * `ahead` holds n_ahead ids a later call will gather, or is null. rank and world_size are the
  * call's. */
 struct RowGather {
@@ -32,6 +38,8 @@ struct RowGather {
     int64_t        n_vocab, n_embd, voff;
     int64_t        row_bytes;
     float          scale;
+    const uint8_t* scales;          /* IQ4_NL: f16 per 32 values, or null */
+    int64_t        scale_row_bytes;
     uint16_t*      out;
     int64_t        x_ld;
     const int32_t* ahead;

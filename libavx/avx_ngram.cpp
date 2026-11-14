@@ -65,12 +65,13 @@ namespace {
  * cache and the set words over 4 MiB, so each is an L3 or DRAM miss. */
 constexpr long long kPrefetchRows = 8;
 
-/* One read of a row's aligned span: row m of the call, its key, and its cache slot (-1: decoded
- * straight from the read, not cached). */
+/* One read of a row's aligned span: row m of the call, its key, its cache slot (-1: decoded
+ * straight from the read, not cached), and its scale row for a table that has one. */
 struct SpanRead {
     long long m;
     uint64_t  key;
     int64_t   slot;
+    const uint16_t* sc = nullptr;
 };
 
 /* Per-thread working state for a call, kept between calls so steady-state calls do not
@@ -84,11 +85,13 @@ struct Gather {
     /* One decode batch: each row's source and destination and, for cached rows, its call index
      * and the slot word it was read under. */
     std::vector<const uint8_t*> src;
+    std::vector<const uint16_t*> scsrc;   /* row i's scale row, for a table with a per-32 scale */
     std::vector<uint16_t*>      dst;
     std::vector<long long>      dm;
     std::vector<uint64_t>       dw;
-    /* Sources and destinations for rows decoded from a read's bounce buffer. */
+    /* Sources, scale rows and destinations for rows decoded from a read's bounce buffer. */
     std::vector<const uint8_t*> bsrc;
+    std::vector<const uint16_t*> bscsrc;
     std::vector<uint16_t*>      bdst;
     uint8_t*              bounce = nullptr;
     size_t                bounce_bytes = 0;
@@ -572,6 +575,12 @@ int ring_errno() {
     return e;
 }
 
+/* kvalues_iq4nl: the fixed 16-level codebook of llama.cpp's IQ4_NL and IQ4_XS, the value a u4 code
+ * in the table stands for. The encoding carries it as a TABLE "table" plane; the kernels read this
+ * constant, as the GGUF dequantiser does, so the IQ4_NL gather needs no third operand. */
+const int8_t k_iq4_nl_level[16] = { -127, -104, -83, -65, -49, -35, -22, -10,
+                                     1,    13,   25,  38,  53,  69,  89,  113 };
+
 /* Rows read from table files by this process, every thread together (avx_ngram_reads). */
 std::atomic<uint64_t> g_rows_read{0};
 
@@ -580,7 +589,7 @@ std::atomic<uint64_t> g_rows_read{0};
  * read, every unpublished claim is released (word back to EMPTY) so no thread waits on it. */
 int read_and_publish(const TableFile& tf, RowCache& rc, ReadRing& rr, Gather& g,
                      const SpanRead* reads, size_t total, long long n, long long ne,
-                     avx::RowDecode decode, const uint16_t* lut, uint16_t* out, long long x_ld) {
+                     avx::RowDecode decode, const void* lut, uint16_t* out, long long x_ld) {
     const long long A      = tf.align;
     const long long stride = ((n + A - 1) / A + 1) * A;
     for (size_t b = 0; b < total;) {
@@ -597,12 +606,14 @@ int read_and_publish(const TableFile& tf, RowCache& rc, ReadRing& rr, Gather& g,
         }
         g_rows_read.fetch_add(cnt, std::memory_order_relaxed);
         g.bsrc.clear();
+        g.bscsrc.clear();
         g.bdst.clear();
         for (unsigned i = 0; i < cnt; ++i) {
             const SpanRead& r = reads[b + i];
             const uint8_t* row = bounce + (size_t)i * stride + (r.key & (uint64_t)(A - 1));
             if (r.slot < 0) {
                 g.bsrc.push_back(row);
+                g.bscsrc.push_back(r.sc);
                 g.bdst.push_back(out + r.m * x_ld);
                 continue;
             }
@@ -612,7 +623,8 @@ int read_and_publish(const TableFile& tf, RowCache& rc, ReadRing& rr, Gather& g,
         }
         rc.published.fetch_add(1, std::memory_order_release);
         rc.published.notify_all();
-        if (!g.bsrc.empty()) decode(g.bsrc.data(), g.bdst.data(), (int64_t)g.bsrc.size(), ne, lut);
+        if (!g.bsrc.empty())
+            decode(g.bsrc.data(), g.bscsrc.data(), g.bdst.data(), (int64_t)g.bsrc.size(), ne, lut);
         b += cnt;
     }
     return RAD_OK;
@@ -642,7 +654,7 @@ struct UrgentReads {
 };
 
 int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowGather& q,
-                    avx::RowDecode decode, const uint16_t* lut) {
+                    avx::RowDecode decode, const void* lut) {
     Gather& g = gather_state();
     const uint64_t me = owner_tag();
     if (!me) return RAD_E_UNSUPPORTED;
@@ -651,8 +663,12 @@ int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::
     auto row_of = [&](long long m) { return (long long)q.ids[m] - q.voff; };
     auto pad    = [&](long long id) { return id < 0 || id >= q.n_vocab; };
     auto key_of = [&](long long m) { return (uint64_t)(base + row_of(m) * n); };
+    auto sc_of  = [&](long long m) {
+        return q.scales ? (const uint16_t*)(q.scales + row_of(m) * q.scale_row_bytes) : nullptr;
+    };
 
     g.src.clear();
+    g.scsrc.clear();
     g.dst.clear();
     g.dm.clear();
     g.dw.clear();
@@ -670,6 +686,7 @@ int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::
         g.slot[m] = s;
         if (f == RowCache::HIT) {
             g.src.push_back(rc.data + (size_t)s * (size_t)n);
+            g.scsrc.push_back(sc_of(m));
             g.dst.push_back(dst);
             g.dm.push_back(m);
             g.dw.push_back(RowCache::ready(key));
@@ -680,7 +697,7 @@ int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::
             g.waits.push_back(m);
         } else {
             /* The reader's THEIRS, MINE (a row twice in one call) and NONE are read directly. */
-            g.reads.push_back({m, key, f == RowCache::CLAIMED ? s : -1});
+            g.reads.push_back({m, key, f == RowCache::CLAIMED ? s : -1, sc_of(m)});
         }
     }
     const UrgentReads urgent;
@@ -692,6 +709,7 @@ int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::
         for (const SpanRead& r : g.reads) {
             if (r.slot < 0) continue;
             g.src.push_back(rc.data + (size_t)r.slot * (size_t)n);
+            g.scsrc.push_back(r.sc);
             g.dst.push_back(q.out + r.m * x_ld);
             g.dm.push_back(r.m);
             g.dw.push_back(RowCache::ready(r.key));
@@ -708,6 +726,7 @@ int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::
             const uint64_t x   = rc.word[g.slot[m]].load(std::memory_order_acquire);
             if (x == RowCache::ready(key)) {
                 g.src.push_back(rc.data + (size_t)g.slot[m] * (size_t)n);
+                g.scsrc.push_back(sc_of(m));
                 g.dst.push_back(q.out + m * x_ld);
                 g.dm.push_back(m);
                 g.dw.push_back(x);
@@ -722,7 +741,7 @@ int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::
     if (!g.src.empty()) {
         /* The seqlock, as gather_rows reads it: a row whose word changed during the decode was
          * taken over, and is read again directly. */
-        decode(g.src.data(), g.dst.data(), (int64_t)g.src.size(), ne, lut);
+        decode(g.src.data(), g.scsrc.data(), g.dst.data(), (int64_t)g.src.size(), ne, lut);
         std::atomic_thread_fence(std::memory_order_acquire);
         for (size_t i = 0; i < g.dm.size(); ++i)
             if (rc.word[g.slot[g.dm[i]]].load(std::memory_order_relaxed) != g.dw[i])
@@ -730,7 +749,7 @@ int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::
     }
     if (g.again.empty()) return RAD_OK;
     g.reads.clear();
-    for (long long m : g.again) g.reads.push_back({m, key_of(m), -1});
+    for (long long m : g.again) g.reads.push_back({m, key_of(m), -1, sc_of(m)});
     return read_and_publish(tf, rc, rr, g, g.reads.data(), g.reads.size(), n, ne, decode, lut,
                             q.out, x_ld);
 }
@@ -739,7 +758,7 @@ int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::
  * starting at row `first`, read this thread's claims, wait for rows other threads are reading, then
  * decode from the cache. A row whose slot is taken over during the decode is read again directly. */
 int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowGather& q,
-                long long first, avx::RowDecode decode, const uint16_t* lut) {
+                long long first, avx::RowDecode decode, const void* lut) {
     /* A decode step's rows are read on demand; a prefill chunk's tens of thousands, whose future is
      * known, go through the claims and the read-ahead queue. */
     if (q.M <= kOnDemandMaxRows) return gather_ondemand(tf, rc, rr, q, decode, lut);
@@ -752,6 +771,9 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
     auto row_of = [&](long long m) { return (long long)q.ids[m] - q.voff; };
     auto pad    = [&](long long id) { return id < 0 || id >= q.n_vocab; };
     auto key_of = [&](long long m) { return (uint64_t)(base + row_of(m) * n); };
+    auto sc_of  = [&](long long m) {
+        return q.scales ? (const uint16_t*)(q.scales + row_of(m) * q.scale_row_bytes) : nullptr;
+    };
     auto at     = [&](long long j) { return first + j < M ? first + j : first + j - M; };
 
     g.slot.resize((size_t)M);
@@ -772,8 +794,12 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
         const RowCache::Found f = rc.find_or_claim(key, me, &s);
         g.slot[m] = s;
         g.kind[m] = (uint8_t)f;
-        if (f == RowCache::CLAIMED)     g.reads.push_back({m, key, s});
-        else if (f == RowCache::NONE) { g.reads.push_back({m, key, -1}); g.kind[m] = Gather::DONE; }
+        if (f == RowCache::CLAIMED) {
+            g.reads.push_back({m, key, s, sc_of(m)});
+        } else if (f == RowCache::NONE) {
+            g.reads.push_back({m, key, -1, sc_of(m)});
+            g.kind[m] = Gather::DONE;
+        }
         else if (f == RowCache::THEIRS) g.waits.push_back(m);
     }
 
@@ -802,6 +828,7 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
     /* Decode all READY rows in one batch: each word is read before the bytes and again after the
      * batch (the seqlock), and rows whose word changed are read again. */
     g.src.clear();
+    g.scsrc.clear();
     g.dst.clear();
     g.dm.clear();
     g.dw.clear();
@@ -814,11 +841,13 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
         const uint64_t w1 = rc.word[s].load(std::memory_order_acquire);
         if (w1 != RowCache::ready(key_of(m))) { g.again.push_back(m); continue; }
         g.src.push_back(rc.data + (size_t)s * (size_t)n);
+        g.scsrc.push_back(sc_of(m));
         g.dst.push_back(dst);
         g.dm.push_back(m);
         g.dw.push_back(w1);
     }
-    if (!g.src.empty()) decode(g.src.data(), g.dst.data(), (int64_t)g.src.size(), ne, lut);
+    if (!g.src.empty())
+        decode(g.src.data(), g.scsrc.data(), g.dst.data(), (int64_t)g.src.size(), ne, lut);
     std::atomic_thread_fence(std::memory_order_acquire);
     for (size_t i = 0; i < g.dm.size(); ++i)
         if (rc.word[g.slot[g.dm[i]]].load(std::memory_order_relaxed) != g.dw[i])
@@ -826,7 +855,7 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
 
     if (g.again.empty()) return RAD_OK;
     g.reads.clear();
-    for (long long m : g.again) g.reads.push_back({m, key_of(m), -1});
+    for (long long m : g.again) g.reads.push_back({m, key_of(m), -1, sc_of(m)});
     return read_and_publish(tf, rc, rr, g, g.reads.data(), g.reads.size(), n, ne, decode, lut,
                             q.out, x_ld);
 }
@@ -1144,7 +1173,7 @@ extern "C" uint64_t avx_ngram_reads(void) {
 
 int avx::row_gather(const RowGather& q, RowDecode decode) {
     if (!decode || !q.ids || !q.tab || !q.out || q.M <= 0 || q.n_embd <= 0 || q.n_vocab <= 0 ||
-        q.row_bytes < q.n_embd)
+        q.row_bytes <= 0)
         return RAD_E_INVAL;
 
     /* Cost has two regimes: repeated prompts hit the cache and read nothing, while varied serving
@@ -1152,10 +1181,12 @@ int avx::row_gather(const RowGather& q, RowDecode decode) {
      * only measures the first. /proc/<pid>/io shows which regime applied. */
 
     /* bf16 value of every E4M3 code at this call's scale, built with the ABI's converters (so it
-     * matches libref); the decode is a table lookup. */
+     * matches libref); the decode is a table lookup. An IQ4_NL table has no global scale: its
+     * decode context is the sixteen-level codebook, and each row carries its own per-32 f16. */
     uint16_t lut[256];
     for (int b = 0; b < 256; ++b)
         lut[b] = rad_f32_to_bf16(rad_fp8e4m3_to_f32((uint8_t)b) * q.scale);
+    const void* ctx = q.scales ? (const void*)k_iq4_nl_level : (const void*)lut;
 
     /* File-backed tables go through the shared cache; others are read from memory. The caller
      * has already refused ids past the table, which matters once they become file offsets. */
@@ -1175,7 +1206,7 @@ int avx::row_gather(const RowGather& q, RowDecode decode) {
         if (!rc) return RAD_E_NOMEM;
         const long long ws    = q.world_size > 1 ? q.world_size : 1;
         const long long first = q.rank > 0 && q.rank < ws ? q.M * q.rank / ws : 0;
-        const int rs = gather_rows(*tfile, *rc, *rr, q, first, decode, lut);
+        const int rs = gather_rows(*tfile, *rc, *rr, q, first, decode, ctx);
         if (rs != RAD_OK) return rs;
         /* Queue the rows a later call will gather, after this call's own rows. */
         if (q.ahead && q.n_ahead > 0) read_ahead(*tfile, *rc, q);
@@ -1185,6 +1216,7 @@ int avx::row_gather(const RowGather& q, RowDecode decode) {
 
     Gather& g = gather_state();
     g.src.clear();
+    g.scsrc.clear();
     g.dst.clear();
     for (long long m = 0; m < q.M; ++m) {
         const long long id = (long long)q.ids[m] - q.voff;
@@ -1194,9 +1226,12 @@ int avx::row_gather(const RowGather& q, RowDecode decode) {
             continue;
         }
         g.src.push_back(q.tab + id * q.row_bytes);
+        g.scsrc.push_back(q.scales ? (const uint16_t*)(q.scales + id * q.scale_row_bytes)
+                                   : nullptr);
         g.dst.push_back(dst);
     }
-    if (!g.src.empty()) decode(g.src.data(), g.dst.data(), (int64_t)g.src.size(), q.n_embd, lut);
+    if (!g.src.empty())
+        decode(g.src.data(), g.scsrc.data(), g.dst.data(), (int64_t)g.src.size(), q.n_embd, ctx);
     return RAD_OK;
 }
 
@@ -1232,6 +1267,26 @@ extern "C" int avx_layout_ngram(const RadParam* p, int n_p, int operand, const R
         if (operand != EQ_WTE) return RAD_E_DTYPE;
         if (n != 1 || !pl) return RAD_E_SHAPE;
         if (pl[0].rank != 2 || pl[0].shape[0] != rows || pl[0].shape[1] != dim) return RAD_E_SHAPE;
+        return RAD_E_UNSUPPORTED;
+    }
+    /* IQ4_NL: u4 codes and an f16 scale per 32 values, stored as they are (the row cache reads the
+     * codes' `dim / 2`-byte rows; the scale plane is read as memory when a row decodes). The
+     * fixed 16-entry codebook is not an operand. */
+    const RadEncPlane* tb = rad_enc_plane(enc, "table");
+    const RadEncPlane* s4 = rad_enc_plane(enc, "scale");
+    if (rad_enc_is(enc, "affine") && enc->n_planes == 3 && !enc->transform[0] &&
+        enc->plane[0].dtype == RAD_U4 && enc->plane[0].block[0] == 1 &&
+        enc->plane[0].block[1] == 1 && tb && tb->kind == RAD_PLANE_TABLE &&
+        tb->dtype == RAD_I8 && tb->extent[0] == 1 && tb->extent[1] == 16 && s4 &&
+        s4->kind == RAD_PLANE_TILED && s4->dtype == RAD_F16 && s4->block[0] == 1 &&
+        s4->block[1] == 32) {
+        if (dim % 32) return RAD_E_SHAPE;
+        if (n != 1 || !pl || !sel) return RAD_E_SHAPE;
+        if (std::strncmp(enc->plane[sel[0]].role,
+                         operand == EQ_WTE ? "codes" : "scale", RAD_ENC_STR) != 0)
+            return RAD_E_SHAPE;
+        const long long r = rows, c = operand == EQ_WTE ? dim : dim / 32;
+        if (pl[0].rank != 2 || pl[0].shape[0] != r || pl[0].shape[1] != c) return RAD_E_SHAPE;
         return RAD_E_UNSUPPORTED;
     }
     const RadEncPlane* sc = rad_enc_plane(enc, "scale");

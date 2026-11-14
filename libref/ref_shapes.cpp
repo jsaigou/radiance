@@ -2757,7 +2757,18 @@ int ref_embed_lookup_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc
     const int64_t vo = gi(p, n_p, "vocab_offset", 0);
     if (M <= 0 || ne <= 0 || nv <= 0 || vo < 0) return RAD_E_UNSUPPORTED;
     const uint32_t D = act_dt(p, n_p);
+    const char* wf = rad_param_gets(p, n_p, "wform", nullptr);
     Opd o;
+    /* IQ4_NL: u4 codes and an f16 scale per 32 values. */
+    if (wf && std::strcmp(wf, "iq4_nl") == 0) {
+        if (ne % 32) return RAD_E_UNSUPPORTED;
+        o.t_idx({ M }, vo + nv, -1, 0);              /* tokens */
+        o.t((uint32_t)RAD_U4, { nv, ne });           /* wte: codes */
+        o.t((uint32_t)RAD_F16, { nv, ne / 32 });     /* scale */
+        o.t(D, { M, ne });                           /* x */
+        o.skip();                                    /* ahead */
+        return o.finish("embed_lookup_q", operand, out);
+    }
     o.t_idx({ M }, vo + nv, -1, 0);                  /* tokens */
     o.t((uint32_t)RAD_F8E4M3, { nv, ne });           /* wte */
     o.t(D, { 1 });                                   /* scale */

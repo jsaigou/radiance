@@ -571,6 +571,26 @@ extern "C" int halo_rad_layout_embed_q(const RadParam* p, int n_p, int operand,
         if (n != 1 || !pl || !halo_enc::dims(pl[0], rows, dim)) return RAD_E_SHAPE;
         return RAD_E_UNSUPPORTED;
     }
+    /* llama.cpp's IQ4_NL (libquant's `iq4_nl`): u4 codes indexing a 16-entry i8 table, an f16
+     * scale per 32 values. Two operands, as the E4M3 form: the codes and the scale plane. The
+     * codebook is fixed, so the kernel reads kvalues_iq4nl rather than a third operand; the table
+     * plane is still validated so a container of another codebook is refused here. */
+    const RadEncPlane* tb = rad_enc_plane(enc, "table");
+    const RadEncPlane* s4 = rad_enc_plane(enc, "scale");
+    if (rad_enc_is(enc, "affine") && enc->n_planes == 3 && !enc->transform[0] &&
+        enc->plane[0].dtype == RAD_U4 && enc->plane[0].block[0] == 1 &&
+        enc->plane[0].block[1] == 1 && tb && tb->kind == RAD_PLANE_TABLE &&
+        tb->dtype == RAD_I8 && tb->extent[0] == 1 && tb->extent[1] == 16 && s4 &&
+        s4->kind == RAD_PLANE_TILED && s4->dtype == RAD_F16 && s4->block[0] == 1 &&
+        s4->block[1] == 32) {
+        if (dim % 32) return RAD_E_SHAPE;
+        if (n != 1 || !pl || !sel) return RAD_E_SHAPE;
+        if (!halo_enc::selects(enc, sel, n, operand == EQ_WTE ? "codes" : "scale"))
+            return RAD_E_SHAPE;
+        const long long r = rows, c = operand == EQ_WTE ? dim : dim / 32;
+        if (!halo_enc::dims(pl[0], r, c)) return RAD_E_SHAPE;
+        return RAD_E_UNSUPPORTED;
+    }
     const RadEncPlane* sc = rad_enc_plane(enc, "scale");
     if (!rad_enc_is(enc, "affine") || enc->n_planes != 2 || enc->transform[0] ||
         enc->plane[0].dtype != RAD_F8E4M3 || !sc || sc->dtype != RAD_BF16 || sc->block[0] != 0 ||

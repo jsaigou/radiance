@@ -151,6 +151,96 @@ __global__ __launch_bounds__(kThreads) void embed_lookup_q_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------- embed_lookup_iq4
+// The n-gram table in llama.cpp's IQ4_NL form (libquant's `iq4_nl`): u4 codes, each a level of the
+// fixed 16-entry codebook kvalues_iq4nl, times an f16 scale per 32 values. `sc` holds one f16 per
+// 32 values of a row, `codes` (n_embd / 2) bytes per row with element 2k in bits 0-3 and 2k+1 in
+// bits 4-7 (rad_encoding.h's bit stream). One thread an entry; a negative or out-of-range id writes
+// a zero row, as the E4M3 form does.
+//
+// The arithmetic is avx_ngram.cpp's decode_iq4_nl_rows and libref's ref_embed_lookup_q: the code's
+// integer level and the f16 scale widen to f32 exactly, the product rounds once in f32, and
+// f32_to_bf16 rounds to nearest even.
+// f16 to f32 is exact: a widened mantissa, the exponent rebiased, subnormals renormalised.
+__device__ __forceinline__ float iq4_scale_f32(uint16_t h) {
+    const uint32_t s = (uint32_t)(h >> 15) << 31;
+    uint32_t e = (uint32_t)(h >> 10) & 0x1fu, m = (uint32_t)h & 0x3ffu, u;
+    if (e == 0u) {
+        if (m == 0u) {
+            u = s;
+        } else {
+            int sh = 0;
+            while (!(m & 0x400u)) { m <<= 1; ++sh; }
+            u = s | ((uint32_t)(127 - 15 - sh + 1) << 23) | ((m & 0x3ffu) << 13);
+        }
+    } else if (e == 0x1fu) {
+        u = s | 0x7f800000u | (m << 13);
+    } else {
+        u = s | ((e - 15u + 127u) << 23) | (m << 13);
+    }
+    return __builtin_bit_cast(float, u);
+}
+
+// f32 to f16, round to nearest even, as rad_f32_to_f16 (abi/rad_plugin.h) does; the same bit
+// patterns as libavx's decode and libref's reference.
+__device__ __forceinline__ uint16_t iq4_f32_to_f16(float f) {
+    const uint32_t u = __builtin_bit_cast(uint32_t, f);
+    const uint32_t s = (u >> 16) & 0x8000u, a = u & 0x7fffffffu;
+    if (a >= 0x7f800000u)
+        return (uint16_t)(s | 0x7c00u | (a > 0x7f800000u ? ((a >> 13) & 0x3ffu) | 0x200u : 0u));
+    if (a >= 0x47800000u) return (uint16_t)(s | 0x7c00u);
+    if (a < 0x33000000u) return (uint16_t)s;
+    const int e = (int)(a >> 23) - 127;
+    uint32_t m = a & 0x7fffffu;
+    if (e < -14) {
+        const int sh = -14 - e + 13;
+        m |= 0x800000u;
+        const uint32_t lo = m & ((1u << sh) - 1u);
+        uint32_t q = m >> sh;
+        const uint32_t half = 1u << (sh - 1);
+        if (lo > half || (lo == half && (q & 1u))) ++q;
+        return (uint16_t)(s | q);
+    }
+    uint32_t q = m >> 13;
+    const uint32_t lo = m & 0x1fffu;
+    uint32_t he;
+    if (lo > 0x1000u || (lo == 0x1000u && (q & 1u))) ++q;
+    he = (uint32_t)(e + 15);
+    if (q == 0x400u) { q = 0; ++he; }
+    if (he >= 0x1fu) return (uint16_t)(s | 0x7c00u);
+    return (uint16_t)(s | (he << 10) | q);
+}
+
+// kvalues_iq4nl, the codebook of llama.cpp's IQ4_NL and IQ4_XS. The plane holds these values; a
+// switch keeps the sixteen of them in the instruction stream rather than in a per-thread array.
+__device__ __forceinline__ int iq4_level(uint32_t c) {
+    switch (c) {
+        case 0:  return -127; case 1:  return -104; case 2:  return -83;  case 3:  return -65;
+        case 4:  return -49;  case 5:  return -35;  case 6:  return -22;  case 7:  return -10;
+        case 8:  return 1;    case 9:  return 13;   case 10: return 25;   case 11: return 38;
+        case 12: return 53;   case 13: return 69;   case 14: return 89;   default: return 113;
+    }
+}
+
+template <bool OUT_F16>
+__global__ __launch_bounds__(kThreads) void embed_lookup_iq4_kernel(
+    const int32_t* __restrict__ tok, const uint8_t* __restrict__ codes,
+    const uint16_t* __restrict__ sc, uint16_t* __restrict__ x, uint32_t M, uint32_t n_embd,
+    int32_t n_vocab, int32_t vocab_off, uint32_t x_ld) {
+    const uint64_t g = (uint64_t)blockIdx.x * kThreads + threadIdx.x;
+    if (g >= (uint64_t)M * n_embd) return;
+    const uint32_t m = (uint32_t)(g / n_embd), j = (uint32_t)(g % n_embd);
+    const int32_t id = tok[m] - vocab_off;
+    uint16_t* __restrict__ dst = x + (size_t)m * x_ld + j;
+    if (id < 0 || id >= n_vocab) { dst[0] = 0; return; }
+    const uint32_t code_row = (n_embd + 1) >> 1;
+    const uint32_t byte = codes[(size_t)id * code_row + (j >> 1)];
+    const uint32_t code = (byte >> (4 * (j & 1))) & 15;
+    const float d = iq4_scale_f32(sc[(size_t)id * (n_embd >> 5) + (j >> 5)]);
+    const float v = (float)iq4_level(code) * d;
+    dst[0] = OUT_F16 ? iq4_f32_to_f16(v) : f32_to_bf16(v);
+}
+
 // ---------------------------------------------------------------------------- gather_rows
 // ref_gather_rows. Like the embedding gather, with the same negative-index rule, but the source
 // row pitch is the caller's: it gathers from padded activation buffers (one logits row per
@@ -889,6 +979,25 @@ static int embed_lookup_q_emit(const int32_t* tok, const void* wte, bool q, cons
     return rc == RAD_OK ? 0 : -4;
 }
 
+/* The IQ4_NL gather: u4 codes, an f16 scale per 32 values, one thread an entry. `n_embd` must be
+ * whole 32s, since a scale covers a 32-value block and a row's codes pack two a byte. */
+static int embed_lookup_iq4_emit(const int32_t* tok, const uint8_t* codes, const uint16_t* sc,
+                                 uint16_t* x, long long M, long long n_embd, int n_vocab,
+                                 int vocab_off, long long x_ld, bool out_f16, RadStream stream) {
+    if (!tok || !codes || !sc || !x) return -1;
+    if (M <= 0 || n_embd <= 0 || n_vocab <= 0 || vocab_off < 0 || n_embd % 32) return -2;
+    if (!x_ld) x_ld = n_embd;
+    const uint64_t threads = (uint64_t)M * (uint64_t)n_embd;
+    const dim3 grid((uint32_t)((threads + kThreads - 1) / kThreads));
+#define HALO_ELIQ(OUT_F16)                                                                          \
+    HALO_EMIT(stream, (embed_lookup_iq4_kernel<OUT_F16>), grid, dim3(kThreads), 0, tok, codes, sc,  \
+              x, (uint32_t)M, (uint32_t)n_embd, (int32_t)n_vocab, (int32_t)vocab_off,               \
+              (uint32_t)x_ld)
+    const int rc = out_f16 ? HALO_ELIQ(true) : HALO_ELIQ(false);
+#undef HALO_ELIQ
+    return rc == RAD_OK ? 0 : -4;
+}
+
 extern "C" int halo_embed_lookup_bf16_scaled(long tok, long wte, long x, int M, int n_embd,
                                            int n_vocab, int vocab_off, int x_ld, float scale,
                                            long stream) {
@@ -1514,10 +1623,17 @@ extern "C" int halo_rad_embed_lookup_q(const RadArgs* a, RadStream stream) {
     const RadTensor* x   = halo_opt(a, ELQ_X);
     if (!tok || !wte || !x) return HALO_NO(RAD_E_INVAL);
     HALO_NEED(dt_i32(tok));
-    HALO_NEED(dt_bf16(x));
-    const bool q = wte->dtype == RAD_F8E4M3;
-    if (!q && wte->dtype != RAD_BF16) return HALO_NO(RAD_E_DTYPE);
-    if (sc && sc->dtype != RAD_BF16 && sc->dtype != RAD_F32) return HALO_NO(RAD_E_DTYPE);
+    const bool q   = wte->dtype == RAD_F8E4M3;
+    const bool bf  = wte->dtype == RAD_BF16;
+    const bool iq4 = wte->dtype == RAD_U4;
+    if (!q && !bf && !iq4) return HALO_NO(RAD_E_DTYPE);
+    /* The IQ4_NL decode writes either output type; the E4M3 and bf16 forms are bf16 only. */
+    if (x->dtype != RAD_BF16 && !(iq4 && x->dtype == RAD_F16)) return HALO_NO(RAD_E_DTYPE);
+    if (iq4) {
+        if (!sc || sc->dtype != RAD_F16) return HALO_NO(RAD_E_DTYPE);
+    } else if (sc && sc->dtype != RAD_BF16 && sc->dtype != RAD_F32) {
+        return HALO_NO(RAD_E_DTYPE);
+    }
     if (sc && halo_numel(sc) < 1) return HALO_NO(RAD_E_SHAPE);
     if (!halo_contig(tok) || !halo_contig(wte)) return HALO_NO(RAD_E_STRIDE);
 
@@ -1531,6 +1647,18 @@ extern "C" int halo_rad_embed_lookup_q(const RadArgs* a, RadStream stream) {
     const long long x_ld = halo_rows_pitch(x, n_embd, &M);
     if (x_ld < 0) return HALO_NO(RAD_E_STRIDE);
     if (M <= 0 || halo_numel(tok) < M) return HALO_NO(RAD_E_SHAPE);
+
+    if (iq4) {
+        if (n_embd % 32) return HALO_NO(RAD_E_SHAPE);
+        if (!halo_contig(sc)) return HALO_NO(RAD_E_STRIDE);
+        if (halo_numel(sc) < n_vocab * (n_embd / 32)) return HALO_NO(RAD_E_SHAPE);
+        return embed_lookup_iq4_emit((const int32_t*)halo_addr(tok),
+                                     (const uint8_t*)halo_addr(wte),
+                                     (const uint16_t*)halo_addr(sc), (uint16_t*)halo_addr(x), M,
+                                     n_embd, (int)n_vocab, (int)voff, x_ld,
+                                     x->dtype == RAD_F16, stream) == 0
+                   ? RAD_OK : RAD_E_DEVICE;
+    }
 
     return embed_lookup_q_emit((const int32_t*)halo_addr(tok), (const void*)halo_addr(wte), q,
                                sc ? (const void*)halo_addr(sc) : nullptr,

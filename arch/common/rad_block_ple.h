@@ -98,6 +98,9 @@ struct PleLayer {
     rad_weight w_table = 0, w_scale = 0, w_mult = 0, w_vsz = 0, w_off = 0;
     /* The table is plain bf16 as shipped (no scale weight) rather than E4M3. */
     bool       table_bf16 = false;
+    /* The table is llama.cpp's IQ4_NL: u4 codes and an f16 scale per 32 values (the Unsloth UD
+     * release's form), not E4M3 with one scale for all of it. */
+    bool       table_iq4 = false;
     rad_weight w_key = 0, w_value = 0, w_nk = 0, w_nq = 0, w_nc = 0, w_conv = 0;
 
     rad_kvgroup kv_tok = 0, kv_conv = 0;
@@ -187,9 +190,33 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
     /* Or the checkpoint's own bf16 table (102 GB) when the container holds it as shipped: the same
      * op with no scale (an absent scale means 1), still a host gather over the mapping. */
     RadEncoding te{};
-    table_bf16 = weight_enc(b, tn, &te) && rad_enc_is(&te, "plain") && te.n_planes == 1 &&
+    const bool enc_known = weight_enc(b, tn, &te);
+    table_bf16 = enc_known && rad_enc_is(&te, "plain") && te.n_planes == 1 &&
                  te.plane[0].dtype == RAD_BF16;
-    if (table_bf16) {
+    /* llama.cpp's IQ4_NL (libquant `iq4_nl`): u4 codes, a fixed 16-entry i8 codebook and an f16
+     * scale per 32 values. Its gather reads the codes and the per-32 scale as two operands, as the
+     * E4M3 form reads its one scale; the codebook is a constant the kernel knows. */
+    {
+        const RadEncPlane* tb = rad_enc_plane(&te, "table");
+        const RadEncPlane* s4 = rad_enc_plane(&te, "scale");
+        table_iq4 = enc_known && rad_enc_is(&te, "affine") && te.n_planes == 3 &&
+                    !te.transform[0] && te.plane[0].dtype == RAD_U4 &&
+                    te.plane[0].block[0] == 1 && te.plane[0].block[1] == 1 && tb &&
+                    tb->kind == RAD_PLANE_TABLE && tb->dtype == RAD_I8 && tb->extent[0] == 1 &&
+                    tb->extent[1] == 16 && s4 && s4->kind == RAD_PLANE_TILED &&
+                    s4->dtype == RAD_F16 && s4->block[0] == 1 && s4->block[1] == 32;
+    }
+    if (table_iq4 && HD % 32) {
+        fprintf(stderr, "radiance: ple: IQ4_NL table with head_dim %lld, not a whole 32-value "
+                        "scale block\n", (long long)HD);
+        return RAD_E_SHAPE;
+    }
+    if (table_iq4) {
+        w_table = decl_view(b, tn, nullptr, "codes", RAD_U4, {c.rows, HD}, RAD_ACCESS_VOCAB,
+                            RAD_SHARD_NONE, grp_model());
+        w_scale = decl_view(b, nm.f("blk.%d.ple_ngram.scale", layer), tn, "scale", RAD_F16,
+                            {c.rows, HD / 32}, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
+    } else if (table_bf16) {
         w_table = decl_w(b, tn, RAD_BF16, {c.rows, HD}, RAD_ACCESS_VOCAB, RAD_SHARD_NONE,
                          grp_model());
     } else {
@@ -330,10 +357,15 @@ inline int PleLayer::declare(RadBuilder* b, Names& nm, const Geom& geom, const C
      * on that count. */
     {
         const rad_weight wt[2] = { w_table, w_scale };   /* a bf16 table has no scale plane */
-        op_gather = rw(b, RAD_OP(b, "embed_lookup_q",
-                          RAD_PARAMS(RAD_RANGE("M", 1, g.max_tok * c.heads), RAD_INT("n_embd", HD),
-                                     RAD_INT("n_vocab", c.rows), RAD_STR("dtype", g.dtype)),
-                          wt, table_bf16 ? 1 : 2),
+        /* The IQ4_NL form names its stored shape for the row schema; the E4M3 and plain bf16
+         * forms are declared exactly as before, so the official container's graph is unchanged. */
+        RadParam gp[5] = {
+            RAD_RANGE("M", 1, g.max_tok * c.heads), RAD_INT("n_embd", HD),
+            RAD_INT("n_vocab", c.rows), RAD_STR("dtype", g.dtype),
+        };
+        int n_gp = 4;
+        if (table_iq4) gp[n_gp++] = RAD_STR("wform", "iq4_nl");
+        op_gather = rw(b, rad_decl_op(b, "embed_lookup_q", gp, n_gp, wt, table_bf16 ? 1 : 2),
                       {b_ids}, {b_emb});
     }
 

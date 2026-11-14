@@ -1232,8 +1232,9 @@ AVX_KERNEL(embed_lookup)   { return embed_impl<false>(a); }
  * look up one code at a time.
  *
  * Every row is a cache miss, so each row's lines are prefetched kAhead rows before its decode. */
-static void decode_e4m3_rows(const uint8_t* const* src, uint16_t* const* dst, int64_t count,
-                             int64_t n, const uint16_t* lut) {
+static void decode_e4m3_rows(const uint8_t* const* src, const uint16_t* const*,
+                             uint16_t* const* dst, int64_t count, int64_t n, const void* luto) {
+    const uint16_t* lut = (const uint16_t*)luto;
     constexpr int64_t kAhead = 8;
 #if AVX_LEVEL >= 3
     __m512i t[8];
@@ -1276,15 +1277,54 @@ static void decode_e4m3_rows(const uint8_t* const* src, uint16_t* const* dst, in
 }
 
 /* A bf16 table's rows are the output: the decode is a copy. */
-static void decode_bf16_rows(const uint8_t* const* src, uint16_t* const* dst, int64_t count,
-                             int64_t n, const uint16_t*) {
+static void decode_bf16_rows(const uint8_t* const* src, const uint16_t* const*,
+                             uint16_t* const* dst, int64_t count, int64_t n, const void*) {
     for (int64_t r = 0; r < count; ++r) std::memcpy(dst[r], src[r], (size_t)n * sizeof(uint16_t));
 }
 
-/* Fills `g` for avx_ngram.cpp's gather, or returns false: i32 ids, a dense E4M3 table with a
- * scale or a dense bf16 table without, bf16 output rows at one pitch. */
+/* IQ4_NL: a u4 code (element 2k low, 2k+1 high in the byte) names one of the codebook's sixteen
+ * values, and a per-32 f16 scales the block. Every step is exact in f32: the level is an integer
+ * of magnitude under 128 and the scale is an f16, so their product has at most 18 significant bits;
+ * the single rounding is the store. libref's ref_embed_lookup_q and the device
+ * embed_lookup_iq4_kernel compute the same expression in the same order.
+ *
+ * The scale plane is memory, not the row cache: it is a tenth of the codes' bytes, and a row's ten
+ * or twenty bytes are cheaper to fault than to read alongside the code row. */
+static void decode_iq4_nl_rows(const uint8_t* const* src, const uint16_t* const* sc,
+                               uint16_t* const* dst, int64_t count, int64_t n, const void* luto) {
+    const int8_t* tb = (const int8_t*)luto;
+    for (int64_t r = 0; r < count; ++r) {
+        const uint8_t* s = src[r];
+        uint16_t* d = dst[r];
+        for (int64_t i = 0; i < n; ++i) {
+            const uint32_t code = (uint32_t)((s[i >> 1] >> (4 * (i & 1))) & 15);
+            const float v = (float)tb[code] * rad_f16_to_f32(sc[r][i >> 5]);
+            d[i] = rad_f32_to_bf16(v);
+        }
+    }
+}
+
+/* The same decode into f16, for an activation of that dtype. */
+static void decode_iq4_nl_rows_f16(const uint8_t* const* src, const uint16_t* const* sc,
+                                   uint16_t* const* dst, int64_t count, int64_t n,
+                                   const void* luto) {
+    const int8_t* tb = (const int8_t*)luto;
+    for (int64_t r = 0; r < count; ++r) {
+        const uint8_t* s = src[r];
+        uint16_t* d = dst[r];
+        for (int64_t i = 0; i < n; ++i) {
+            const uint32_t code = (uint32_t)((s[i >> 1] >> (4 * (i & 1))) & 15);
+            const float v = (float)tb[code] * rad_f16_to_f32(sc[r][i >> 5]);
+            d[i] = rad_f32_to_f16(v);
+        }
+    }
+}
+
+/* Fills `g` for avx_ngram.cpp's gather, or returns false: i32 ids, a dense E4M3 table with one
+ * scale, a dense bf16 table without, or an IQ4_NL table (u4 codes and an f16 scale per 32 values),
+ * bf16 or f16 output rows at one pitch. */
 static bool rows_form(const RadArgs* a, RowGather* g) {
-    /* The scale (operand 2) is optional. */
+    /* The scale (operand 2) is optional except for IQ4_NL, where it is the per-32 plane. */
     if (!rad_arg_in(a, 0) || !rad_arg_in(a, 1) || !rad_arg_in(a, 3)) return false;
     const RadTensor* tok = &a->t[0];
     const RadTensor* wte = &a->t[1];
@@ -1293,12 +1333,20 @@ static bool rows_form(const RadArgs* a, RowGather* g) {
     if (tok->dtype != RAD_I32 || !rad_tensor_is_contiguous(tok)) return false;
     if (!rad_tensor_is_contiguous(wte)) return false;
     const bool e4m3 = wte->dtype == RAD_F8E4M3;
-    if (!e4m3 && wte->dtype != RAD_BF16) return false;
+    const bool bf16 = wte->dtype == RAD_BF16;
+    const bool iq4  = wte->dtype == RAD_U4;
+    if (!e4m3 && !bf16 && !iq4) return false;
     const bool scaled = sc->data && numel(sc) >= 1;
-    if (x->dtype != RAD_BF16 || scaled != e4m3) return false;
+    if (iq4) {
+        if (!scaled || sc->dtype != RAD_F16 || !rad_tensor_is_contiguous(sc)) return false;
+        if (x->dtype != RAD_BF16 && x->dtype != RAD_F16) return false;
+    } else {
+        if (x->dtype != RAD_BF16 || scaled != e4m3) return false;
+    }
     const int64_t n_embd = p_int(a, "n_embd", wte->rank >= 2 ? wte->shape[wte->rank - 1] : 0);
     const int64_t n_vocab = p_int(a, "n_vocab", wte->rank >= 2 ? wte->shape[wte->rank - 2] : 0);
     if (n_embd <= 0 || n_vocab <= 0) return false;
+    if (iq4 && (n_embd % 32 || numel(sc) < n_vocab * (n_embd / 32))) return false;
     int64_t ld = -1;
     if (rad_tensor_is_contiguous(x))                                        ld = n_embd;
     else if (x->rank == 2 && x->shape[1] == n_embd && x->stride[1] == 1)   ld = x->stride[0];
@@ -1310,7 +1358,10 @@ static bool rows_form(const RadArgs* a, RowGather* g) {
     g->n_embd = n_embd;
     g->voff = p_int(a, "vocab_offset", 0);
     g->scale = e4m3 ? ldt(sc, 0) : 1.0f;
-    g->row_bytes = e4m3 ? n_embd : 2 * n_embd;
+    g->row_bytes = iq4 ? n_embd / 2 : e4m3 ? n_embd : 2 * n_embd;
+    g->scales = iq4 ? (const uint8_t*)sc->data : nullptr;
+    g->scale_row_bytes = iq4
+        ? (sc->rank >= 2 ? sc->stride[sc->rank - 2] : n_embd / 32) * 2 : 0;
     g->out = (uint16_t*)x->data;
     g->x_ld = ld;
     const RadTensor* ahd = rad_arg_in(a, 4);
@@ -1324,7 +1375,11 @@ static bool rows_form(const RadArgs* a, RowGather* g) {
 
 AVX_KERNEL(embed_lookup_q) {
     RowGather g;
-    if (!rows_form(a, &g)) return embed_impl<true>(a);
+    if (!rows_form(a, &g)) {
+        /* A u4 table is IQ4_NL or nothing: the general gather would read codes as values. */
+        if (a->n_t > 1 && a->t[1].dtype == RAD_U4) return RAD_E_UNSUPPORTED;
+        return embed_impl<true>(a);
+    }
     if (g.voff < 0 || g.M <= 0 || numel(&a->t[0]) < g.M || numel(&a->t[1]) < g.n_vocab * g.n_embd)
         return RAD_E_SHAPE;
     /* Checked before the gather so a refusal never leaves the output half written. Same bound
@@ -1332,5 +1387,9 @@ AVX_KERNEL(embed_lookup_q) {
     if (g.voff == 0 && g.world_size <= 1)
         for (int64_t m = 0; m < g.M; ++m)
             if ((int64_t)g.ids[m] >= g.n_vocab) return RAD_E_INVAL;
+    if (g.scales) {
+        const bool f16 = a->t[3].dtype == RAD_F16;
+        return row_gather(g, f16 ? decode_iq4_nl_rows_f16 : decode_iq4_nl_rows);
+    }
     return row_gather(g, g.row_bytes == g.n_embd ? decode_e4m3_rows : decode_bf16_rows);
 }

@@ -585,12 +585,56 @@ int ref_embed_lookup(const RadArgs* a, RadStream) {
  * insensitive to the scale over octaves and a per-row scale gains only a few percent. (INT8 would
  * gain substantially, but that is a different format.)
  */
+/* kvalues_iq4nl: the sixteen levels a u4 code of llama.cpp's IQ4_NL (and IQ4_XS) names. */
+static float iq4_nl_level(int code) {
+    static const int8_t k[16] = { -127, -104, -83, -65, -49, -35, -22, -10,
+                                   1,    13,   25,  38,  53,  69,  89,  113 };
+    return (float)k[code & 15];
+}
+
 int ref_embed_lookup_q(const RadArgs* a, RadStream) {
     /* `scale` (operand 2) is optional; the other three are required. */
     if (a->n_t < 4 || !rad_arg_in(a, 0) || !rad_arg_in(a, 1) || !rad_arg_in(a, 3)) return RAD_E_INVAL;
-    const RadTensor* sc = &a->t[2];
+    const RadTensor* wte = &a->t[1];
+    const RadTensor* sc  = &a->t[2];
+    const RadTensor* x   = &a->t[3];
+
+    /* IQ4_NL: u4 codes indexing the fixed codebook, an f16 scale per 32 values. The scale plane is
+     * required here, unlike the E4M3 form's one global scale. */
+    if (wte->dtype == RAD_U4) {
+        const int64_t n_embd = p_int(a, "n_embd", wte->rank >= 2 ? wte->shape[wte->rank - 1] : 0);
+        const int64_t n_vocab = p_int(a, "n_vocab", wte->rank >= 2 ? wte->shape[wte->rank - 2] : 0);
+        const int64_t voff = p_int(a, "vocab_offset", 0);
+        if (n_embd <= 0 || n_vocab <= 0 || voff < 0 || n_embd % 32) return RAD_E_SHAPE;
+        if (!sc->data || sc->dtype != RAD_F16) return RAD_E_DTYPE;
+        if (numel(sc) < n_vocab * (n_embd / 32)) return RAD_E_SHAPE;
+        const int64_t M = numel(x) / n_embd;
+        if (M <= 0 || numel(&a->t[0]) < M || numel(wte) < n_vocab * n_embd) return RAD_E_SHAPE;
+        if (voff == 0 && a->world_size <= 1)
+            for (int64_t m = 0; m < M; ++m)
+                if (ld_int(a->t[0].dtype, a->t[0].data, offlin(&a->t[0], m)) >= n_vocab)
+                    return RAD_E_INVAL;
+        const int64_t ws = wte->rank >= 2 ? wte->stride[wte->rank - 2] : n_embd;
+        const int64_t ss = sc->rank >= 2 ? sc->stride[sc->rank - 2] : n_embd / 32;
+        if (ws % 2) return RAD_E_SHAPE;
+        for (int64_t m = 0; m < M; ++m) {
+            const int64_t id = ld_int(a->t[0].dtype, a->t[0].data, offlin(&a->t[0], m)) - voff;
+            const int64_t xb = rowoff(x, m, n_embd), xs = laststride(x);
+            const bool have_row = id >= 0 && id < n_vocab;
+            for (int64_t i = 0; i < n_embd; ++i) {
+                const float v = have_row
+                    ? iq4_nl_level((int)rad_load_f32((const uint8_t*)wte->data + id * (ws / 2),
+                                                     RAD_U4, i)) *
+                          ldt(sc, id * ss + i / 32)
+                    : 0.0f;
+                stt(x, xb + i * xs, v);
+            }
+        }
+        return RAD_OK;
+    }
+
     /* An absent scale is 1, so a plain bf16 n-gram embedding read in place from a container takes
      * the same op and host path, keeping a table too large for any device pool on the mapped tier. */
     const float scale = sc->data && numel(sc) >= 1 ? ldt(sc, 0) : 1.0f;
-    return embed_gather(a, &a->t[0], &a->t[1], &a->t[3], scale);
+    return embed_gather(a, &a->t[0], wte, x, scale);
 }
