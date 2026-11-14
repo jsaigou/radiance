@@ -66,12 +66,13 @@ namespace {
 constexpr long long kPrefetchRows = 8;
 
 /* One read of a row's aligned span: row m of the call, its key, its cache slot (-1: decoded
- * straight from the read, not cached), and its scale row for a table that has one. */
+ * straight from the read, not cached), and its scale rows for a table that has them. */
 struct SpanRead {
     long long m;
     uint64_t  key;
     int64_t   slot;
-    const uint16_t* sc = nullptr;
+    const uint16_t* sc  = nullptr;
+    const uint16_t* sc1 = nullptr;
 };
 
 /* Per-thread working state for a call, kept between calls so steady-state calls do not
@@ -86,12 +87,14 @@ struct Gather {
      * and the slot word it was read under. */
     std::vector<const uint8_t*> src;
     std::vector<const uint16_t*> scsrc;   /* row i's scale row, for a table with a per-32 scale */
+    std::vector<const uint16_t*> scsrc1;  /* row i's `d` row, for IQ4_XS (f16 per 256) */
     std::vector<uint16_t*>      dst;
     std::vector<long long>      dm;
     std::vector<uint64_t>       dw;
     /* Sources, scale rows and destinations for rows decoded from a read's bounce buffer. */
     std::vector<const uint8_t*> bsrc;
     std::vector<const uint16_t*> bscsrc;
+    std::vector<const uint16_t*> bscsrc1;
     std::vector<uint16_t*>      bdst;
     uint8_t*              bounce = nullptr;
     size_t                bounce_bytes = 0;
@@ -607,6 +610,7 @@ int read_and_publish(const TableFile& tf, RowCache& rc, ReadRing& rr, Gather& g,
         g_rows_read.fetch_add(cnt, std::memory_order_relaxed);
         g.bsrc.clear();
         g.bscsrc.clear();
+        g.bscsrc1.clear();
         g.bdst.clear();
         for (unsigned i = 0; i < cnt; ++i) {
             const SpanRead& r = reads[b + i];
@@ -614,6 +618,7 @@ int read_and_publish(const TableFile& tf, RowCache& rc, ReadRing& rr, Gather& g,
             if (r.slot < 0) {
                 g.bsrc.push_back(row);
                 g.bscsrc.push_back(r.sc);
+                g.bscsrc1.push_back(r.sc1);
                 g.bdst.push_back(out + r.m * x_ld);
                 continue;
             }
@@ -624,7 +629,8 @@ int read_and_publish(const TableFile& tf, RowCache& rc, ReadRing& rr, Gather& g,
         rc.published.fetch_add(1, std::memory_order_release);
         rc.published.notify_all();
         if (!g.bsrc.empty())
-            decode(g.bsrc.data(), g.bscsrc.data(), g.bdst.data(), (int64_t)g.bsrc.size(), ne, lut);
+            decode(g.bsrc.data(), g.bscsrc.data(), g.bscsrc1.data(), g.bdst.data(),
+                   (int64_t)g.bsrc.size(), ne, lut);
         b += cnt;
     }
     return RAD_OK;
@@ -666,9 +672,13 @@ int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::
     auto sc_of  = [&](long long m) {
         return q.scales ? (const uint16_t*)(q.scales + row_of(m) * q.scale_row_bytes) : nullptr;
     };
+    auto sc1_of = [&](long long m) {
+        return q.scales1 ? (const uint16_t*)(q.scales1 + row_of(m) * q.scale1_row_bytes) : nullptr;
+    };
 
     g.src.clear();
     g.scsrc.clear();
+    g.scsrc1.clear();
     g.dst.clear();
     g.dm.clear();
     g.dw.clear();
@@ -687,6 +697,7 @@ int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::
         if (f == RowCache::HIT) {
             g.src.push_back(rc.data + (size_t)s * (size_t)n);
             g.scsrc.push_back(sc_of(m));
+            g.scsrc1.push_back(sc1_of(m));
             g.dst.push_back(dst);
             g.dm.push_back(m);
             g.dw.push_back(RowCache::ready(key));
@@ -697,7 +708,7 @@ int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::
             g.waits.push_back(m);
         } else {
             /* The reader's THEIRS, MINE (a row twice in one call) and NONE are read directly. */
-            g.reads.push_back({m, key, f == RowCache::CLAIMED ? s : -1, sc_of(m)});
+            g.reads.push_back({m, key, f == RowCache::CLAIMED ? s : -1, sc_of(m), sc1_of(m)});
         }
     }
     const UrgentReads urgent;
@@ -710,6 +721,7 @@ int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::
             if (r.slot < 0) continue;
             g.src.push_back(rc.data + (size_t)r.slot * (size_t)n);
             g.scsrc.push_back(r.sc);
+            g.scsrc1.push_back(r.sc1);
             g.dst.push_back(q.out + r.m * x_ld);
             g.dm.push_back(r.m);
             g.dw.push_back(RowCache::ready(r.key));
@@ -727,6 +739,7 @@ int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::
             if (x == RowCache::ready(key)) {
                 g.src.push_back(rc.data + (size_t)g.slot[m] * (size_t)n);
                 g.scsrc.push_back(sc_of(m));
+                g.scsrc1.push_back(sc1_of(m));
                 g.dst.push_back(q.out + m * x_ld);
                 g.dm.push_back(m);
                 g.dw.push_back(x);
@@ -741,7 +754,8 @@ int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::
     if (!g.src.empty()) {
         /* The seqlock, as gather_rows reads it: a row whose word changed during the decode was
          * taken over, and is read again directly. */
-        decode(g.src.data(), g.scsrc.data(), g.dst.data(), (int64_t)g.src.size(), ne, lut);
+        decode(g.src.data(), g.scsrc.data(), g.scsrc1.data(), g.dst.data(),
+               (int64_t)g.src.size(), ne, lut);
         std::atomic_thread_fence(std::memory_order_acquire);
         for (size_t i = 0; i < g.dm.size(); ++i)
             if (rc.word[g.slot[g.dm[i]]].load(std::memory_order_relaxed) != g.dw[i])
@@ -749,7 +763,7 @@ int gather_ondemand(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::
     }
     if (g.again.empty()) return RAD_OK;
     g.reads.clear();
-    for (long long m : g.again) g.reads.push_back({m, key_of(m), -1, sc_of(m)});
+    for (long long m : g.again) g.reads.push_back({m, key_of(m), -1, sc_of(m), sc1_of(m)});
     return read_and_publish(tf, rc, rr, g, g.reads.data(), g.reads.size(), n, ne, decode, lut,
                             q.out, x_ld);
 }
@@ -774,6 +788,9 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
     auto sc_of  = [&](long long m) {
         return q.scales ? (const uint16_t*)(q.scales + row_of(m) * q.scale_row_bytes) : nullptr;
     };
+    auto sc1_of = [&](long long m) {
+        return q.scales1 ? (const uint16_t*)(q.scales1 + row_of(m) * q.scale1_row_bytes) : nullptr;
+    };
     auto at     = [&](long long j) { return first + j < M ? first + j : first + j - M; };
 
     g.slot.resize((size_t)M);
@@ -795,9 +812,9 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
         g.slot[m] = s;
         g.kind[m] = (uint8_t)f;
         if (f == RowCache::CLAIMED) {
-            g.reads.push_back({m, key, s, sc_of(m)});
+            g.reads.push_back({m, key, s, sc_of(m), sc1_of(m)});
         } else if (f == RowCache::NONE) {
-            g.reads.push_back({m, key, -1, sc_of(m)});
+            g.reads.push_back({m, key, -1, sc_of(m), sc1_of(m)});
             g.kind[m] = Gather::DONE;
         }
         else if (f == RowCache::THEIRS) g.waits.push_back(m);
@@ -829,6 +846,7 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
      * batch (the seqlock), and rows whose word changed are read again. */
     g.src.clear();
     g.scsrc.clear();
+    g.scsrc1.clear();
     g.dst.clear();
     g.dm.clear();
     g.dw.clear();
@@ -842,12 +860,14 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
         if (w1 != RowCache::ready(key_of(m))) { g.again.push_back(m); continue; }
         g.src.push_back(rc.data + (size_t)s * (size_t)n);
         g.scsrc.push_back(sc_of(m));
+        g.scsrc1.push_back(sc1_of(m));
         g.dst.push_back(dst);
         g.dm.push_back(m);
         g.dw.push_back(w1);
     }
     if (!g.src.empty())
-        decode(g.src.data(), g.scsrc.data(), g.dst.data(), (int64_t)g.src.size(), ne, lut);
+        decode(g.src.data(), g.scsrc.data(), g.scsrc1.data(), g.dst.data(),
+               (int64_t)g.src.size(), ne, lut);
     std::atomic_thread_fence(std::memory_order_acquire);
     for (size_t i = 0; i < g.dm.size(); ++i)
         if (rc.word[g.slot[g.dm[i]]].load(std::memory_order_relaxed) != g.dw[i])
@@ -855,7 +875,7 @@ int gather_rows(const TableFile& tf, RowCache& rc, ReadRing& rr, const avx::RowG
 
     if (g.again.empty()) return RAD_OK;
     g.reads.clear();
-    for (long long m : g.again) g.reads.push_back({m, key_of(m), -1, sc_of(m)});
+    for (long long m : g.again) g.reads.push_back({m, key_of(m), -1, sc_of(m), sc1_of(m)});
     return read_and_publish(tf, rc, rr, g, g.reads.data(), g.reads.size(), n, ne, decode, lut,
                             q.out, x_ld);
 }
@@ -1217,6 +1237,7 @@ int avx::row_gather(const RowGather& q, RowDecode decode) {
     Gather& g = gather_state();
     g.src.clear();
     g.scsrc.clear();
+    g.scsrc1.clear();
     g.dst.clear();
     for (long long m = 0; m < q.M; ++m) {
         const long long id = (long long)q.ids[m] - q.voff;
@@ -1228,10 +1249,13 @@ int avx::row_gather(const RowGather& q, RowDecode decode) {
         g.src.push_back(q.tab + id * q.row_bytes);
         g.scsrc.push_back(q.scales ? (const uint16_t*)(q.scales + id * q.scale_row_bytes)
                                    : nullptr);
+        g.scsrc1.push_back(q.scales1 ? (const uint16_t*)(q.scales1 + id * q.scale1_row_bytes)
+                                     : nullptr);
         g.dst.push_back(dst);
     }
     if (!g.src.empty())
-        decode(g.src.data(), g.scsrc.data(), g.dst.data(), (int64_t)g.src.size(), q.n_embd, ctx);
+        decode(g.src.data(), g.scsrc.data(), g.scsrc1.data(), g.dst.data(),
+               (int64_t)g.src.size(), q.n_embd, ctx);
     return RAD_OK;
 }
 
@@ -1299,6 +1323,41 @@ extern "C" int avx_layout_ngram(const RadParam* p, int n_p, int operand, const R
     if (std::strncmp(enc->plane[sel[0]].role, want, RAD_ENC_STR) != 0) return RAD_E_SHAPE;
     const long long r = operand == EQ_WTE ? rows : 1, c = operand == EQ_WTE ? dim : 1;
     if (pl[0].rank != 2 || pl[0].shape[0] != r || pl[0].shape[1] != c) return RAD_E_SHAPE;
+    return RAD_E_UNSUPPORTED;
+}
+
+/* IQ4_XS, stored as it is: u4 codes, the fixed 16-entry codebook as a TABLE plane, a signed 6-bit
+ * scale per 32 values, and the f16 `d` per 256 values. The three stored planes are the gather's
+ * three weight operands, read where they lie (the codes through the row cache, the scales as
+ * memory). libhalo's hook validates the same four planes, so neither refuses at declare a table
+ * the other reads. */
+extern "C" int avx_layout_embed_xs(const RadParam* p, int n_p, int operand,
+                                    const RadEncoding* enc, const int* sel, const RadTensor* pl,
+                                    int n, RadLayout*) {
+    enum { EX_TOKENS = 0, EX_CODES, EX_SCALE, EX_SCALE1, EX_X };
+    if (operand != EX_CODES && operand != EX_SCALE && operand != EX_SCALE1)
+        return RAD_E_UNSUPPORTED;
+    const long long rows = rad_param_geti(p, n_p, "n_vocab", 0);
+    const long long dim  = rad_param_geti(p, n_p, "n_embd", 0);
+    if (rows <= 0 || dim <= 0) return RAD_E_SHAPE;
+    if (dim % 256) return RAD_E_SHAPE;
+    const RadEncPlane* tb  = rad_enc_plane(enc, "table");
+    const RadEncPlane* s6  = rad_enc_plane(enc, "scale");
+    const RadEncPlane* s16 = rad_enc_plane(enc, "scale.1");
+    if (!(rad_enc_is(enc, "affine") && enc->n_planes == 4 && !enc->transform[0] &&
+          enc->plane[0].dtype == RAD_U4 && enc->plane[0].block[0] == 1 &&
+          enc->plane[0].block[1] == 1 && tb && tb->kind == RAD_PLANE_TABLE &&
+          tb->dtype == RAD_I8 && tb->extent[0] == 1 && tb->extent[1] == 16 && s6 &&
+          s6->kind == RAD_PLANE_TILED && s6->dtype == RAD_I6 && s6->block[0] == 1 &&
+          s6->block[1] == 32 && s16 && s16->kind == RAD_PLANE_TILED && s16->dtype == RAD_F16 &&
+          s16->block[0] == 1 && s16->block[1] == 256))
+        return RAD_E_DTYPE;
+    if (n != 1 || !pl || !sel) return RAD_E_SHAPE;
+    const char* want = operand == EX_CODES ? "codes"
+                     : operand == EX_SCALE ? "scale" : "scale.1";
+    if (std::strncmp(enc->plane[sel[0]].role, want, RAD_ENC_STR) != 0) return RAD_E_SHAPE;
+    const long long c = operand == EX_CODES ? dim : operand == EX_SCALE ? dim / 32 : dim / 256;
+    if (pl[0].rank != 2 || pl[0].shape[0] != rows || pl[0].shape[1] != c) return RAD_E_SHAPE;
     return RAD_E_UNSUPPORTED;
 }
 

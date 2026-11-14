@@ -159,6 +159,7 @@ int ref_lora_expand        (const RadArgs*, RadStream);
 int ref_lora_expand_mm     (const RadArgs*, RadStream);
 int ref_embed_lookup       (const RadArgs*, RadStream);
 int ref_embed_lookup_q     (const RadArgs*, RadStream);
+int ref_embed_lookup_iq4xs (const RadArgs*, RadStream);
 int ref_logits_gemm        (const RadArgs*, RadStream);
 
 /* ---- attention */
@@ -451,6 +452,7 @@ REF_SHAPE_FN(ref_lora_expand);
 REF_SHAPE_FN(ref_lora_expand_mm);
 REF_SHAPE_FN(ref_embed_lookup);
 REF_SHAPE_FN(ref_embed_lookup_q);
+REF_SHAPE_FN(ref_embed_lookup_iq4xs);
 REF_SHAPE_FN(ref_logits_gemm);
 
 REF_SHAPE_FN(ref_attn_paged);

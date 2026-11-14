@@ -272,6 +272,34 @@ static inline void h_narrow(const float* src, uint32_t dt, int64_t n, void* dst)
         }
         return;
     }
+    if (dt == RAD_U4) {
+        /* A u4 code plane (IQ4_NL/IQ4_XS codes, an asymmetric weight's codes): four bits a value,
+         * low nibble first. */
+        uint8_t* b = (uint8_t*)dst;
+        std::memset(b, 0, dt_bytes(dt, n));
+        for (int64_t i = 0; i < n; ++i) {
+            int c = (int)std::lrintf(src[i] * 3.0f + 8.0f);
+            c = c < 0 ? 0 : (c > 15 ? 15 : c);
+            b[i >> 1] |= (uint8_t)(((uint8_t)c & 0xf) << (4 * (i & 1)));
+        }
+        return;
+    }
+    if (dt == RAD_I6) {
+        /* A signed six-bit stream along the row, lowest bits first (the K-quants' scales and
+         * IQ4_XS's `ls - 32`). */
+        uint8_t* b = (uint8_t*)dst;
+        std::memset(b, 0, dt_bytes(dt, n));
+        for (int64_t i = 0; i < n; ++i) {
+            int c = (int)std::lrintf(src[i] * 3.0f);
+            c = c < -32 ? -32 : (c > 31 ? 31 : c);
+            const uint32_t code = (uint32_t)c & 63u;
+            const int64_t o = i * 6, byte = o >> 3;
+            const int sh = (int)(o & 7);
+            b[byte] |= (uint8_t)(code << sh);
+            if (sh + 6 > 8) b[byte + 1] |= (uint8_t)(code >> (8 - sh));
+        }
+        return;
+    }
     if (dt == RAD_I2) {
         uint8_t* b = (uint8_t*)dst;
         std::memset(b, 0, dt_bytes(dt, n));
@@ -311,7 +339,7 @@ static inline void h_draw(std::vector<Opd>& o, size_t k, int64_t M, uint64_t see
      * instead: int8 at sigma 40, the 4- and 2-bit codes at unit sigma (h_narrow scales a 4-bit
      * draw by 3). */
     const bool codes = d.d.dtype == RAD_I8 || d.d.dtype == RAD_I4 || d.d.dtype == RAD_I2 ||
-                       d.d.dtype == RAD_FP4E2M1;
+                       d.d.dtype == RAD_U4 || d.d.dtype == RAD_I6 || d.d.dtype == RAD_FP4E2M1;
     if (codes && !is_index) {
         fill_normal(tmp.data(), n, seed, d.d.dtype == RAD_I8 ? 40.0f : 1.0f);
     } else if (weight && !is_index) {

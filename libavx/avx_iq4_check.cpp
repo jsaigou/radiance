@@ -1,19 +1,23 @@
-/* avx_iq4_check.cpp -- embed_lookup_q over a real IQ4_NL table on the host, against a reference
+/* avx_iq4_check.cpp -- the host IQ4_NL / IQ4_XS gather over a real table, against a reference
  * decoded by tools/ud_repack, and a throughput measurement of random-row gathers.
  *
- * The n-gram table in the Unsloth UD release is IQ4_NL: u4 codes and an f16 scale per 32 values,
- * 26.8 GiB. This tool loads libavx and libref by path (nothing is linked), maps the codes and scale
- * planes of a real slice, and launches embed_lookup_q with `wform=iq4_nl` on a list of ids. With
- * `--expected` it compares the output to the bytes a Python decode of the same rows wrote, bit for
- * bit, and it compares libavx against libref. With `--bench N` it times N random-row gathers
- * through libavx's row cache and prints rows and bytes a second.
+ * The n-gram table in the Unsloth UD release is IQ4_NL (u4 codes, an f16 scale per 32 values,
+ * 26.8 GiB); the main token embedding is IQ4_XS (the same codes, a signed 6-bit scale per 32 and
+ * an f16 `d` per 256). This tool loads libavx and libref by path (nothing is linked), maps the
+ * planes of a real slice, and launches the matching op on a list of ids. With `--expected` it
+ * compares the output to the bytes a Python decode of the same rows wrote, bit for bit, and it
+ * compares libavx against libref. With `--bench N` it times N random-row gathers through libavx's
+ * row cache and prints rows and bytes a second.
  *
  * The planes are the ones the container stores (rad_encoding.h): codes [rows, n_embd] packed two
- * nibbles a byte, and scale [rows, n_embd / 32] f16. tools/ple_iq4/extract.py writes both from a
+ * nibbles a byte, scale [rows, n_embd / 32] (f16 for IQ4_NL, signed 6-bit i6 for IQ4_XS), and for
+ * IQ4_XS also `--scale1` [rows, n_embd / 256] f16. tools/ple_iq4/extract.py writes them from a
  * GGUF, and expected.bf16 from tools/ud_repack's decode.
  *
  *   rad-avx-iq4 --avx libavx.so --ref libref.so --codes codes.bin --scales scales.bin \
  *               --rows 320001536 --n_embd 160 --ids ids.bin --expected expected.bf16
+ *   rad-avx-iq4 ... --codes codes.bin --scales scales.bin --scale1 scale1.bin \
+ *               --rows 248320 --n_embd 2560 --ids ids.bin --expected expected.bf16
  *   rad-avx-iq4 ... --bench 200000
  */
 #include "avx_harness.h"
@@ -84,6 +88,7 @@ struct Opts {
     const char* ref = nullptr;
     const char* codes = nullptr;
     const char* scales = nullptr;
+    const char* scale1 = nullptr;
     const char* ids = nullptr;
     const char* expected = nullptr;
     int64_t rows = 0;
@@ -106,6 +111,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--ref")) o.ref = val();
         else if (!std::strcmp(argv[i], "--codes")) o.codes = val();
         else if (!std::strcmp(argv[i], "--scales")) o.scales = val();
+        else if (!std::strcmp(argv[i], "--scale1")) o.scale1 = val();
         else if (!std::strcmp(argv[i], "--ids")) o.ids = val();
         else if (!std::strcmp(argv[i], "--expected")) o.expected = val();
         else if (!std::strcmp(argv[i], "--rows")) o.rows = std::atoll(val());
@@ -125,11 +131,16 @@ int main(int argc, char** argv) {
     if (!avx.open(o.avx)) return 2;
     if (o.ref && !ref.open(o.ref)) return 2;
 
+    const bool xs = o.scale1 != nullptr;
     const size_t code_bytes = (size_t)(o.rows * (o.n_embd / 2));
-    const size_t scale_bytes = (size_t)(o.rows * (o.n_embd / 32) * 2);
-    Mapped codes, scales;
+    const size_t scale_bytes = xs ? (size_t)(o.rows * (o.n_embd / 32) * 6 / 8)
+                                  : (size_t)(o.rows * (o.n_embd / 32) * 2);
+    const size_t scale1_bytes = (size_t)(o.rows * (o.n_embd / 256) * 2);
+    Mapped codes, scales, scale1;
     if (!codes.map(o.codes, code_bytes)) return 2;
     if (!scales.map(o.scales, scale_bytes)) return 2;
+    if (xs && !scale1.map(o.scale1, scale1_bytes)) return 2;
+    if (xs && o.n_embd % 256) { std::fprintf(stderr, "IQ4_XS needs whole 256s of n_embd\n"); return 2; }
     if (codes.n < code_bytes || scales.n < scale_bytes) {
         std::fprintf(stderr, "planes are shorter than %lld rows of %lld: codes %zu/%zu, scales "
                              "%zu/%zu\n", (long long)o.rows, (long long)o.n_embd, codes.n,
@@ -159,13 +170,19 @@ int main(int argc, char** argv) {
     if ((int64_t)ids.size() < M) { std::fprintf(stderr, "ids file has %zu, %lld wanted\n", ids.size(), (long long)M); return 2; }
 
     std::vector<uint16_t> out((size_t)(M * o.n_embd), 0);
-    std::vector<RadTensor> ts = {
-        tensor(ids.data(), RAD_I32, { M }),
-        tensor(codes.p, RAD_U4, { o.rows, o.n_embd }),
-        tensor(scales.p, RAD_F16, { o.rows, o.n_embd / 32 }),
-        tensor(out.data(), RAD_BF16, { M, o.n_embd }),
-        tensor(nullptr, RAD_I32, { 0 }),
-    };
+    const char* opname = xs ? "embed_lookup_iq4xs" : "embed_lookup_q";
+    std::vector<RadTensor> ts = xs
+        ? std::vector<RadTensor>{ tensor(ids.data(), RAD_I32, { M }),
+                                  tensor(codes.p, RAD_U4, { o.rows, o.n_embd }),
+                                  tensor(scales.p, RAD_I6, { o.rows, o.n_embd / 32 }),
+                                  tensor(scale1.p, RAD_F16, { o.rows, o.n_embd / 256 }),
+                                  tensor(out.data(), RAD_BF16, { M, o.n_embd }),
+                                  tensor(nullptr, RAD_I32, { 0 }) }
+        : std::vector<RadTensor>{ tensor(ids.data(), RAD_I32, { M }),
+                                  tensor(codes.p, RAD_U4, { o.rows, o.n_embd }),
+                                  tensor(scales.p, RAD_F16, { o.rows, o.n_embd / 32 }),
+                                  tensor(out.data(), RAD_BF16, { M, o.n_embd }),
+                                  tensor(nullptr, RAD_I32, { 0 }) };
     RadParam ps[6] = {};
     ps[0].key = "M";       ps[0].kind = RAD_P_INT; ps[0].ival = M;
     ps[1].key = "n_embd";  ps[1].kind = RAD_P_INT; ps[1].ival = o.n_embd;
@@ -174,10 +191,10 @@ int main(int argc, char** argv) {
     ps[4].key = "wform";   ps[4].kind = RAD_P_STR; ps[4].sval = "iq4_nl";
     RadArgs a{};
     a.t = ts.data(); a.n_t = (int)ts.size();
-    a.p = ps; a.n_p = 5;               /* wform is optional; libavx dispatches on wte's dtype */
+    a.p = ps; a.n_p = xs ? 4 : 5;      /* wform is optional; a launch dispatches on the dtypes */
     a.rank = 0; a.world_size = 1;
 
-    const RadKernelInfo* ka = avx.select("embed_lookup_q", ps, 5);
+    const RadKernelInfo* ka = avx.select(opname, ps, a.n_p);
     if (!ka || !ka->launch) { std::fprintf(stderr, "libavx has no host embed_lookup_q row\n"); return 2; }
 
     std::vector<uint16_t> want;
@@ -200,10 +217,10 @@ int main(int argc, char** argv) {
     }
 
     if (o.ref) {
-        const RadKernelInfo* kr = ref.select("embed_lookup_q", ps, 5);
+        const RadKernelInfo* kr = ref.select(opname, ps, a.n_p);
         std::vector<uint16_t> r((size_t)(M * o.n_embd), 0);
         std::vector<RadTensor> rt = ts;
-        rt[3] = tensor(r.data(), RAD_BF16, { M, o.n_embd });
+        rt[xs ? 4 : 3] = tensor(r.data(), RAD_BF16, { M, o.n_embd });
         RadArgs ra = a;
         ra.t = rt.data();
         if (!kr || !kr->launch) {
@@ -227,7 +244,9 @@ int main(int argc, char** argv) {
         const double t1 = now_s();
         if (rc != RAD_OK) { std::fprintf(stderr, "bench launch returned %d\n", rc); return 1; }
         const double dt = t1 - t0;
-        const double row_bytes = (double)o.n_embd / 2.0 + (double)o.n_embd / 32.0 * 2.0;
+        const double row_bytes = (double)o.n_embd / 2.0 +
+                                 (xs ? (double)o.n_embd / 32.0 * 0.75 + (double)o.n_embd / 256.0 * 2.0
+                                     : (double)o.n_embd / 32.0 * 2.0);
         std::printf("bench: %lld random rows in %.3f s = %.0f rows/s, %.2f GiB/s of table "
                     "(%.0f bytes a row)\n", (long long)M, dt, (double)M / dt,
                     (double)M * row_bytes / dt / (1024.0 * 1024.0 * 1024.0), row_bytes);
