@@ -396,14 +396,18 @@ def compute_plan(args):
 
     # declared weights the map does not cover: the MTP head and the vision tower (the UD text GGUF
     # leaves them out), plus i64 metadata. They are kept from the bf16 source.
-    kept = []
+    kept, derived = [], []
     if ws is not None:
         targets = [r["target"] for r in rows if r["target"]]
         for w in ws:
             if _covered(w["name"], targets):
                 continue
-            kept.append(dict(name=w["name"], encoding=w["encoding"], bytes=w["bytes"],
-                             shape=w["shape"]))
+            rec = dict(name=w["name"], encoding=w["encoding"], bytes=w["bytes"],
+                       shape=w["shape"])
+            if w["name"] == "mtp.draft_head.weight":
+                derived.append(rec)          # made from output.weight by the recipe
+            else:
+                kept.append(rec)
     unmapped = [r["name"] for r in rows if r["kind"] == "unknown"]
 
     map_bytes = sum(r["bytes"] for r in rows)
@@ -412,7 +416,8 @@ def compute_plan(args):
                     (r["shape"][1] if len(r["shape"]) > 1 else 1) *
                     (r["shape"][2] if len(r["shape"]) > 2 else 1) for r in rows)
     kept_bytes = sum(k["bytes"] for k in kept)
-    total = map_bytes + kept_bytes
+    derived_bytes = sum(k["bytes"] for k in derived)
+    total = map_bytes + kept_bytes + derived_bytes
 
     mtp_opts = [x.strip() for x in getattr(args, "mtp", "keep").split(",") if x.strip()]
     vis_opts = [x.strip() for x in getattr(args, "vision", "keep").split(",") if x.strip()]
@@ -424,8 +429,10 @@ def compute_plan(args):
             other = sum(k["bytes"] for k in kept if _kept_group(k["name"]) == "other")
             mb = sum(_kept_bytes(k, m) for k in kept if _kept_group(k["name"]) == "mtp")
             vb = sum(_kept_bytes(k, v) for k in kept if _kept_group(k["name"]) == "vision")
-            variations.append(dict(mtp=m, vision=v, total_bytes=map_bytes + other + mb + vb,
-                                   mtp_bytes=mb, vision_bytes=vb, other_bytes=other))
+            variations.append(dict(mtp=m, vision=v,
+                                   total_bytes=map_bytes + other + mb + vb + derived_bytes,
+                                   mtp_bytes=mb, vision_bytes=vb, other_bytes=other,
+                                   derived_bytes=derived_bytes))
 
     # The MTP layer is the last expert-bearing block. Its sizes are the lever the variations report
     # is about; on Qwen3.6 it is blk.40 (the Unsloth GGUF carries it, the fp8 container serves it).
@@ -476,11 +483,13 @@ def compute_plan(args):
     return dict(tool="ud_map 0.2", arch=arch, policy=policy, map=list(args.gguf),
                 declared_plan=getattr(args, "declared", None),
                 source=getattr(args, "source", None),
-                totals=dict(map_bytes=map_bytes, kept_bytes=kept_bytes, total_bytes=total,
+                totals=dict(map_bytes=map_bytes, kept_bytes=kept_bytes,
+                            derived_bytes=derived_bytes, total_bytes=total,
                             map_bpw=(map_bits / map_elems if map_elems else 0),
                             servable_bytes=ok_bytes),
                 variations=variations, mtp_variations=mtp_variations,
-                mtp_layer=mtp_layer, tensors=rows, kept=kept, unmapped=unmapped,
+                mtp_layer=mtp_layer, tensors=rows, kept=kept, derived=derived,
+                unmapped=unmapped,
                 fusion_problems=problems, coverage=dict(declared=len(cov),
                                                         missing=missing),
                 recipe=recipe), by, missing, tsum
@@ -524,6 +533,12 @@ def plan(args):
         for x in mtp_variations:
             print(f'  {x["mtp"]:8s}{x["mtp_bytes"]/2**30:11.3f}'
                   f'{x["total_bytes"]/2**30:11.3f}{x["delta_bytes"]/2**30:11.3f}')
+    if data.get("derived"):
+        db = sum(k["bytes"] for k in data["derived"])
+        print(f'\nderived from the map (not read from bf16): {db/2**30:.3f} GiB in '
+              f'{len(data["derived"])} weight(s)')
+        for k in data["derived"]:
+            print(f'  {k["name"]:40s} {k["encoding"]:24s} {k["bytes"]/2**30:7.3f} GiB')
     if kept:
         print(f'\nkept from bf16 (no map entry): {kept_bytes/2**30:.3f} GiB in {len(kept)} weights')
         def pre(name):
