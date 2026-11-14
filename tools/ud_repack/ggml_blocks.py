@@ -15,6 +15,7 @@ KVALUES_IQ4NL = np.array([-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 3
 BLOCK = {
     'Q8_0': (32, 34), 'Q4_K': (256, 144), 'Q5_K': (256, 176), 'Q6_K': (256, 210),
     'Q5_0': (32, 22), 'IQ4_NL': (32, 18), 'IQ4_XS': (256, 136),
+    'Q2_0': (64, 18),
 }
 
 
@@ -110,6 +111,15 @@ def split_iq4_nl(b):
                 d=np.ascontiguousarray(b[:, 0:2]).view('<f2').reshape(-1))
 
 
+def split_q2_0(b):
+    # d f16 @0; qs[16] @2, 2 bits a value (byte j/4, bits (j%4)*2), value q -> (q-1)*d
+    qs = b[:, 2:18]
+    codes = np.empty((b.shape[0], 64), np.uint8)
+    for j in range(64):
+        codes[:, j] = (qs[:, j // 4] >> ((j % 4) * 2)) & 3
+    return dict(codes=codes, d=np.ascontiguousarray(b[:, 0:2]).view('<f2').reshape(-1))
+
+
 def split_iq4_xs(b):
     n = b.shape[0]
     sh = np.ascontiguousarray(b[:, 2:4]).view('<u2').reshape(-1)
@@ -123,7 +133,7 @@ def split_iq4_xs(b):
 
 
 SPLIT = {'Q8_0': split_q8_0, 'Q4_K': split_q4_K, 'Q5_K': split_q5_K, 'Q6_K': split_q6_K,
-         'Q5_0': split_q5_0, 'IQ4_NL': split_iq4_nl, 'IQ4_XS': split_iq4_xs}
+         'Q5_0': split_q5_0, 'IQ4_NL': split_iq4_nl, 'IQ4_XS': split_iq4_xs, 'Q2_0': split_q2_0}
 
 
 # ------------------------------------------------------------------ plane decoders (the kernel's arithmetic)
@@ -159,6 +169,10 @@ def decode_q5_0(p):
     return p['d'].astype(f32)[:, None] * (p['codes'].astype(f32) - f32(16))
 
 
+def decode_q2_0(p):
+    return p['d'].astype(f32)[:, None] * (p['codes'].astype(f32) - f32(1))
+
+
 def decode_iq4_nl(p):
     return p['d'].astype(f32)[:, None] * KVALUES_IQ4NL[p['codes']].astype(f32)
 
@@ -170,7 +184,7 @@ def decode_iq4_xs(p):
 
 
 DECODE = {'Q8_0': decode_q8_0, 'Q4_K': decode_q4_K, 'Q5_K': decode_q5_K, 'Q6_K': decode_q6_K,
-          'Q5_0': decode_q5_0, 'IQ4_NL': decode_iq4_nl, 'IQ4_XS': decode_iq4_xs}
+          'Q5_0': decode_q5_0, 'IQ4_NL': decode_iq4_nl, 'IQ4_XS': decode_iq4_xs, 'Q2_0': decode_q2_0}
 
 
 # ------------------------------------------------------------------ reference dequantisers (llama.cpp order, from bytes)
@@ -241,6 +255,13 @@ def dequant_ref(tname, b):
             y[:, 32 * ib:32 * ib + 16] = dl[:, None] * KVALUES_IQ4NL[q & 15].astype(f32)
             y[:, 32 * ib + 16:32 * ib + 32] = dl[:, None] * KVALUES_IQ4NL[q >> 4].astype(f32)
         return y
+    if tname == 'Q2_0':
+        d = _f16(b, 0); qs = b[:, 2:18]
+        y = np.empty((n, 64), f32)
+        for j in range(64):
+            q = ((qs[:, j // 4] >> ((j % 4) * 2)) & 3).astype(np.int32) - 1
+            y[:, j] = d * q.astype(f32)
+        return y
     raise KeyError(tname)
 
 
@@ -293,6 +314,14 @@ def merge_q5_0(p):
     return np.concatenate([_h(p['d']), qh.view(np.uint8).reshape(-1, 4), qs], axis=1)
 
 
+def merge_q2_0(p):
+    c = p['codes'].astype(np.uint32)
+    qs = np.zeros((c.shape[0], 16), np.uint8)
+    for j in range(64):
+        qs[:, j // 4] |= ((c[:, j] & 3) << ((j % 4) * 2)).astype(np.uint8)
+    return np.concatenate([_h(p['d']), qs], axis=1)
+
+
 def merge_iq4_nl(p):
     c = p['codes'].astype(np.uint8)
     return np.concatenate([_h(p['d']), (c[:, :16] & 15) | ((c[:, 16:] & 15) << 4)], axis=1)
@@ -311,4 +340,4 @@ def merge_iq4_xs(p):
 
 
 MERGE = {'Q8_0': merge_q8_0, 'Q4_K': merge_q4_K, 'Q5_K': merge_q5_K, 'Q6_K': merge_q6_K,
-         'Q5_0': merge_q5_0, 'IQ4_NL': merge_iq4_nl, 'IQ4_XS': merge_iq4_xs}
+         'Q5_0': merge_q5_0, 'IQ4_NL': merge_iq4_nl, 'IQ4_XS': merge_iq4_xs, 'Q2_0': merge_q2_0}

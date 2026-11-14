@@ -155,6 +155,18 @@ inline void split_q5_K(const uint8_t* blocks, int64_t nb, size_t bb, uint8_t* co
     m.flush();
 }
 
+/* block_q2_0: d f16 @0, qs[16] @2; 2 bits a value (byte j/4, bits (j%4)*2), code q -> (q-1)*d. */
+inline void split_q2_0(const uint8_t* blocks, int64_t nb, size_t bb, uint8_t* const* row) {
+    Bits c(row[0]);
+    for (int64_t i = 0; i < nb; ++i) {
+        const uint8_t* b = blocks + bb * i;
+        for (int j = 0; j < 64; ++j)
+            c.put((uint32_t)((b[2 + j / 4] >> ((j % 4) * 2)) & 3u), 2);
+        copy16(row[1], i, b);
+    }
+    c.flush();
+}
+
 /* A plane as lq_ggml's encoding_of lists it: one row high, `block` values wide. */
 struct Plane {
     const char* role;
@@ -182,6 +194,7 @@ inline constexpr Type kTypes[] = {
       split_q5_K },
     { 14, { { "codes", RAD_I6, 1 }, { "scale", RAD_I8, 16 }, { "scale.1", RAD_F16, 256 } },
       split_q6_K },
+    { 42, { { "codes", RAD_U2, 1 }, { "scale", RAD_F16, 64 } }, split_q2_0 },
 };
 
 inline const Type* type_of(uint32_t ggml_type) {

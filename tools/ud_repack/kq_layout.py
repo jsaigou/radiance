@@ -28,6 +28,7 @@ SPEC = {
     'Q5_0':   [('lo4', 4, 4, 32, 'codes', 'lo4'), ('hi1', 1, 1, 32, 'codes', 'hi'), ('d', 16, 16, 1, 'd', None)],
     'IQ4_NL': [('codes', 4, 4, 32, 'codes', None), ('d', 16, 16, 1, 'd', None)],
     'IQ4_XS': [('codes', 4, 4, 256, 'codes', None), ('ls', 6, 8, 8, 'ls', None), ('d', 16, 16, 1, 'd', None)],
+    'Q2_0':   [('codes', 2, 2, 64, 'codes', None), ('d', 16, 16, 1, 'd', None)],
 }
 
 

@@ -107,6 +107,12 @@ def qwen4exp(name):
 
 ARCHES = {"qwen4exp": qwen4exp}
 
+# Formats a *kept* (not-in-the-map) weight can be quantised to, in bits/weight. `keep` leaves it as
+# the checkpoint holds it. Used only for the MTP layer and the vision tower, whose formats the UD
+# text GGUF does not decide.
+KEPT_FORMATS = {"keep": None, "bf16": 16.0, "fp8": 8.0, "q8_0": 8.5,
+                "w4nl64": 4.125, "w5nl64": 5.125}
+
 
 def _declared_index(path):
     ws = json.load(open(path))["weights"]
@@ -124,6 +130,27 @@ def _covered(name, targets):
         elif t == name:
             return True
     return False
+
+
+def _kept_group(name):
+    if name.startswith("blk.48.") or name.startswith("mtp."):
+        return "mtp"
+    if name.startswith("v."):
+        return "vision"
+    return "other"
+
+
+def _kept_bytes(w, fmt):
+    """Bytes of a kept weight under a target format. 1-D weights (norms, biases), integer data and
+    small tensors stay as stored: the arch does not quantise them."""
+    bpw = KEPT_FORMATS.get(fmt)
+    shp = w.get("shape") or []
+    quantisable = (bpw is not None and w["encoding"] == "bf16" and len(shp) >= 2 and
+                   min(shp) >= 16)
+    if not quantisable:
+        return w["bytes"]
+    elems = w["bytes"] / 2          # bf16 source
+    return int(elems * bpw / 8)
 
 
 def plan(args):
@@ -187,6 +214,19 @@ def plan(args):
     kept_bytes = sum(k["bytes"] for k in kept)
     total = map_bytes + kept_bytes
 
+    mtp_opts = [x.strip() for x in args.mtp.split(",") if x.strip()]
+    vis_opts = [x.strip() for x in args.vision.split(",") if x.strip()]
+    variations = []
+    for m in mtp_opts:
+        for v in vis_opts:
+            if m not in KEPT_FORMATS or v not in KEPT_FORMATS:
+                sys.exit(f"ud_map: unknown kept format (have: {', '.join(KEPT_FORMATS)})")
+            other = sum(k["bytes"] for k in kept if _kept_group(k["name"]) == "other")
+            mb = sum(_kept_bytes(k, m) for k in kept if _kept_group(k["name"]) == "mtp")
+            vb = sum(_kept_bytes(k, v) for k in kept if _kept_group(k["name"]) == "vision")
+            variations.append(dict(mtp=m, vision=v, total_bytes=map_bytes + other + mb + vb,
+                                   mtp_bytes=mb, vision_bytes=vb, other_bytes=other))
+
     def norm(t):
         return re.sub(r"blk\.\d+\.", "blk.*.", t) if t else t
 
@@ -220,6 +260,13 @@ def plan(args):
     tsum = sorted(((ty, sum(r["bytes"] for r in rows if r["type"] == ty))
                    for ty in {r["type"] for r in rows}), key=lambda x: -x[1])
     print('  by type (GiB): ' + ', '.join(f'{ty} {b/2**30:.2f}' for ty, b in tsum))
+    if variations:
+        base = next((x for x in variations if x["mtp"] == "keep" and x["vision"] == "keep"), None)
+        print('\nkept-weight variations (MTP layer blk.48 + mtp.*, vision v.*): total container')
+        print(f'  {"MTP":8s}{"vision":8s}{"total GiB":>11s}{"delta GiB":>11s}')
+        for x in variations:
+            delta = (x["total_bytes"] - base["total_bytes"]) / 2**30 if base else 0.0
+            print(f'  {x["mtp"]:8s}{x["vision"]:8s}{x["total_bytes"]/2**30:11.3f}{delta:11.3f}')
     if kept:
         print(f'\nkept from bf16 (no map entry): {kept_bytes/2**30:.3f} GiB in {len(kept)} weights')
         def pre(name):
@@ -272,6 +319,7 @@ def plan(args):
                        declared_plan=args.declared, source=args.source,
                        totals=dict(map_bytes=map_bytes, kept_bytes=kept_bytes, total_bytes=total,
                                    map_bpw=(map_bits / map_elems if map_elems else 0)),
+                       variations=variations,
                        tensors=rows, kept=kept, unmapped=unmapped, fusion_problems=problems),
                   open(args.json, "w"), indent=1)
     return 0
@@ -286,6 +334,8 @@ def main():
     p.add_argument("--source", help="the bf16 source directory (recorded in the plan)")
     p.add_argument("--recipe-out")
     p.add_argument("--json")
+    p.add_argument("--mtp", default="keep", help="comma list of keep,bf16,fp8,q8_0,w4nl64,w5nl64")
+    p.add_argument("--vision", default="keep", help="comma list of keep,bf16,fp8,q8_0,w4nl64,w5nl64")
     p.set_defaults(fn=plan)
     a = ap.parse_args()
     sys.exit(a.fn(a))
