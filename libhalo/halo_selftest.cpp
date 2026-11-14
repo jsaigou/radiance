@@ -30793,6 +30793,166 @@ static void lora_perf(const Plugin& pl, int64_t M, int64_t K, int64_t N, int64_t
     }
 }
 
+/* IQ4_NL: the device gather against a host decode of the same u4 codes and per-32 f16 scales,
+ * bit for bit. Widths 160 (the model's) and 64; codes in VRAM and in pinned host memory over the
+ * link; and, when RAD_PLE_IQ4_DIR names a sample written by tools/ple_iq4/extract.py, the real
+ * Unsloth UD table's rows against that sample's `expected.bf16` from tools/ud_repack's decode. */
+static void embed_lookup_iq4_case(const Plugin& pl) {
+    if (!sel("embed_lookup_q_bf16")) return;
+    const char* what = "embed_lookup_q IQ4_NL vs a host decode, to the bit";
+    const RadKernelInfo* r = find(pl, "embed_lookup_q_bf16");
+    if (!r) { ok(what, false, "row absent"); return; }
+    static const int8_t kv[16] = { -127, -104, -83, -65, -49, -35, -22, -10,
+                                    1,    13,   25,  38,  53,  69,  89,  113 };
+    const int64_t NV = 1031, M = 37;
+    struct Shape { int64_t ne; bool host_codes; };
+    const Shape shapes[] = { { 160, false }, { 160, true }, { 64, false } };
+    std::vector<void*> pinned;
+    std::string bad;
+    for (const Shape& sh : shapes) {
+        const size_t rowb = (size_t)(sh.ne / 2);
+        const size_t tbytes = (size_t)NV * rowb;
+        const size_t sbytes = (size_t)NV * (size_t)(sh.ne / 32) * 2;
+        std::vector<uint8_t> tab(tbytes);
+        std::vector<uint16_t> sc((size_t)NV * (size_t)(sh.ne / 32));
+        uint32_t rs = 0x9e3779b9u;
+        for (size_t i = 0; i < tbytes; ++i) {
+            rs = rs * 1664525u + 1013904223u;
+            tab[i] = (uint8_t)(((rs >> 9) & 15) | (((rs >> 21) & 15) << 4));   /* both nibbles 0..15 */
+        }
+        for (size_t i = 0; i < sc.size(); ++i) {
+            rs = rs * 1664525u + 1013904223u;
+            sc[i] = rad_f32_to_f16(((float)((int32_t)(rs >> 8) - (1 << 23))) * 1e-9f);
+        }
+        std::vector<int32_t> ids((size_t)M);
+        for (int64_t m = 0; m < M; ++m) ids[(size_t)m] = (int32_t)((m * 131 + 7) % NV);
+        ids[3] = -1;
+        ids[7] = (int32_t)NV;
+        ids[11] = (int32_t)(NV - 1);
+
+        void* d_tab = nullptr;
+        if (sh.host_codes) {
+            void* h = nullptr;
+            if (hipHostMalloc(&h, tbytes, hipHostMallocMapped) != hipSuccess) {
+                ok(what, false, "pinned codes allocation failed");
+                return;
+            }
+            pinned.push_back(h);
+            std::memcpy(h, tab.data(), tbytes);
+            if (hipHostGetDevicePointer(&d_tab, h, 0) != hipSuccess || !d_tab) {
+                ok(what, false, "no device address for the pinned codes");
+                return;
+            }
+        } else {
+            d_tab = dalloc(tbytes);
+            st_memcpy(d_tab, tab.data(), tbytes, hipMemcpyHostToDevice);
+        }
+        void* d_sc = dalloc(sbytes);
+        st_memcpy(d_sc, sc.data(), sbytes, hipMemcpyHostToDevice);
+        void* d_tok = dalloc((size_t)M * 4);
+        st_memcpy(d_tok, ids.data(), (size_t)M * 4, hipMemcpyHostToDevice);
+        void* d_x = dalloc((size_t)(M * sh.ne * 2));
+        st_memset(d_x, 0xFF, (size_t)(M * sh.ne * 2));
+
+        std::vector<RadTensor> ts = { T(d_tok, RAD_I32, { M }),
+                                      T(d_tab, RAD_U4, { NV, sh.ne }),
+                                      T(d_sc, RAD_F16, { NV, sh.ne / 32 }),
+                                      T(d_x, RAD_BF16, { M, sh.ne }) };
+        std::vector<RadParam> ps = { PI("M", M), PI("n_embd", sh.ne), PI("n_vocab", NV),
+                                     PS("dtype", "bf16"), PS("wform", "iq4_nl") };
+        RadArgs a;
+        std::memset(&a, 0, sizeof(a));
+        a.t = ts.data(); a.n_t = (int)ts.size();
+        a.p = ps.data(); a.n_p = (int)ps.size();
+        const int rc = r->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        std::vector<uint16_t> got((size_t)(M * sh.ne), 0);
+        st_memcpy(got.data(), d_x, got.size() * 2, hipMemcpyDeviceToHost);
+
+        int64_t wrong = 0;
+        for (int64_t m = 0; m < M; ++m) {
+            const int32_t id = ids[(size_t)m];
+            for (int64_t i = 0; i < sh.ne; ++i) {
+                uint16_t want = 0;
+                if (id >= 0 && id < NV) {
+                    const uint8_t byte = tab[(size_t)id * rowb + (size_t)(i >> 1)];
+                    const int code = (byte >> (4 * (i & 1))) & 15;
+                    want = rad_f32_to_bf16((float)kv[code] *
+                                           rad_f16_to_f32(sc[(size_t)id * (size_t)(sh.ne / 32) +
+                                                             (size_t)(i >> 5)]));
+                }
+                if (got[(size_t)(m * sh.ne + i)] != want) ++wrong;
+            }
+        }
+        if (rc != RAD_OK || wrong)
+            bad += fmt("n_embd=%lld %s: rc=%d, %lld of %lld entries differ; ", (long long)sh.ne,
+                       sh.host_codes ? "pinned codes" : "vram codes", rc, (long long)wrong,
+                       (long long)(M * sh.ne));
+    }
+    for (void* h : pinned) hip_ck(hipHostFree(h), "hipHostFree", __LINE__);
+    ok(what, bad.empty(), bad);
+
+    /* The real table: a sample of Unsloth's IQ4_NL rows and the Python reference's bf16 values. */
+    const char* dir = std::getenv("RAD_PLE_IQ4_DIR");
+    if (!dir || !*dir) {
+        skip("embed_lookup_q IQ4_NL on the real table", "RAD_PLE_IQ4_DIR is not set");
+        return;
+    }
+    const std::string base(dir);
+    auto slurp = [&](const char* nm, std::vector<uint8_t>* out) {
+        std::FILE* f = std::fopen((base + "/" + nm).c_str(), "rb");
+        if (!f) return false;
+        std::fseek(f, 0, SEEK_END);
+        const long sz = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        out->resize((size_t)sz);
+        const bool okr = std::fread(out->data(), 1, out->size(), f) == out->size();
+        std::fclose(f);
+        return okr;
+    };
+    std::vector<uint8_t> codes, scales, idsb, expb;
+    if (!slurp("codes.bin", &codes) || !slurp("scales.bin", &scales) ||
+        !slurp("ids.bin", &idsb) || !slurp("expected.bf16", &expb)) {
+        ok("embed_lookup_q IQ4_NL on the real table", false, "a sample file is missing");
+        return;
+    }
+    const int64_t ne = 160, rows = (int64_t)(codes.size() / (size_t)(ne / 2));
+    const int64_t m = (int64_t)(idsb.size() / 4);
+    if (rows <= 0 || m <= 0 || (int64_t)(scales.size() / ((size_t)(ne / 32) * 2)) != rows ||
+        (int64_t)(expb.size() / (size_t)(ne * 2)) != m) {
+        ok("embed_lookup_q IQ4_NL on the real table", false, "the sample's planes disagree");
+        return;
+    }
+    void* d_codes = dalloc(codes.size());
+    void* d_scales = dalloc(scales.size());
+    void* d_ids = dalloc(idsb.size());
+    void* d_out = dalloc(expb.size());
+    st_memcpy(d_codes, codes.data(), codes.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_scales, scales.data(), scales.size(), hipMemcpyHostToDevice);
+    st_memcpy(d_ids, idsb.data(), idsb.size(), hipMemcpyHostToDevice);
+    std::vector<RadTensor> ts = { T(d_ids, RAD_I32, { m }),
+                                  T(d_codes, RAD_U4, { rows, ne }),
+                                  T(d_scales, RAD_F16, { rows, ne / 32 }),
+                                  T(d_out, RAD_BF16, { m, ne }) };
+    std::vector<RadParam> ps = { PI("M", m), PI("n_embd", ne), PI("n_vocab", rows),
+                                 PS("dtype", "bf16"), PS("wform", "iq4_nl") };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    const int rc = r->launch(&a, nullptr);
+    st_stream_sync(nullptr);
+    std::vector<uint16_t> got((size_t)(m * ne), 0);
+    st_memcpy(got.data(), d_out, got.size() * 2, hipMemcpyDeviceToHost);
+    int64_t wrong = 0;
+    const uint16_t* want = (const uint16_t*)expb.data();
+    for (size_t i = 0; i < got.size(); ++i) wrong += got[i] != want[i];
+    ok("embed_lookup_q IQ4_NL on the real table vs tools/ud_repack's decode",
+       rc == RAD_OK && wrong == 0,
+       fmt("%lld of %lld values differ (rc=%d)", (long long)wrong, (long long)got.size(), rc));
+    /* dalloc's pointers are freed together by dfree_all; freeing them here would leave it stale. */
+}
+
 static void device_phase(const Plugin& pl) {
     int n = 0;
     if (hipGetDeviceCount(&n) != hipSuccess || n < 1) {
@@ -30816,6 +30976,7 @@ static void device_phase(const Plugin& pl) {
 
     ngram_ahead_case(pl);
     embed_lookup_q_case(pl);
+    embed_lookup_iq4_case(pl);
     lora_case(pl);
 
     /* --- a weight read into the cache (prefetch): it runs, and takes any stored form --- */

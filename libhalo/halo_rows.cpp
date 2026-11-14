@@ -2143,6 +2143,10 @@ static const RadParamSpec pEmbed[] = {
     /* The scale embed_lookup_q's layout quantises with; embed_lookup_q shares this list, which
      * libref fixes. */
     { "wscale",  RAD_P_F64, RAD_OPTIONAL },
+    /* The table's stored form when it is not the E4M3-with-one-scale default: "iq4_nl" is u4 codes
+     * and an f16 scale per 32 values, as llama.cpp's IQ4_NL ships. It names the operand dtypes for
+     * the shape hook; a launch dispatches on `wte`'s own dtype. */
+    { "wform",   RAD_P_STR, RAD_OPTIONAL },
 };
 /* embed_lookup's own: pEmbed and `mult`, the factor every gathered row is multiplied by (Gemma's
  * sqrt(hidden)); libref's list, which embed_lookup_q does not share. */
