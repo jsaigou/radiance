@@ -653,7 +653,35 @@ int  halo_gemm_fp8a16_nt_mt(long a, long wq, long ws, long c, int M, int K, int 
 int  halo_logits_gemm_fp8(long a, long wq, long c, int M, int K, int N,
                          int a_ld, int c_ld, int w_ld, long stream);
 int  halo_gemm_fp8a16_nt_m1_block(void);
+
+// ---- ggml Q8_0 dense weights (halo_q80.h, halo_gemm_q80a16.hip) ---------------------------------
+// C[M,N] = X[M,K] @ dequant(W)[N,K]^T with W ggml Q8_0 (int8 codes, f16 scale per 32 K, the GGUF's
+// own numbers) in libhalo's 16x32 tile order, `wq` = the codes plane ("halo.q80.w.tile16x32", N*K
+// bytes) and `ws` = the scale plane ("halo.q80.s.tile16x32", N*K/16 bytes). X is bf16 (act 0) or f16
+// (act 1, matvec only), C bf16 or, with f32out, the f32 accumulator. K a multiple of 32, N of 16.
+// `a_ld`/`c_ld` elements (0 = tight). All return 0 or a negative code (-1 null, -2 extent, -3 M past
+// the band, -4 K, -5 N, -6 launch, -7 bad option). `wk`/`tt` pin the launch form (0 = the rule).
+int  halo_gemm_q80a16_nt_mv(long a, long wq, long ws, long c, int M, int K, int N, int a_ld,
+                            int c_ld, int wk, int act, int f32out, long stream);   // M <= 8
+int  halo_gemm_q80a16_nt_wmma(long a, long wq, long ws, long c, int M, int K, int N, int a_ld,
+                              int c_ld, int tt, int f32out, long stream);          // any M, bf16 X
+int  halo_gemm_q80a16_nt_mv_max_m(void);
 int  halo_gemm_fp8a16_nt_m1_max_m(void);
+
+// ---- ggml Q6_K dense weights (halo_q6k.h, halo_gemm_q6ka16.hip) ---------------------------------
+// C[M,N] = X[M,K] @ dequant(W)[N,K]^T with W ggml Q6_K (six-bit codes, int8 scale per 16 K, f16
+// scale per 256 K, the GGUF's own numbers) in libhalo's 16x64 tile order. `wq` = the codes plane
+// ("halo.q6k.w.tile16x64", N*K*6/8 bytes), `ws` = the scale plane ("halo.q6k.s.tile16x16", N*K/16
+// bytes) and `wd` = the super-scale plane ("halo.q6k.d.tile16x256", N*K/128 bytes). X is bf16 (act
+// 0) or f16 (act 1, matvec only), C bf16 or, with f32out, the f32 accumulator. K a multiple of 256,
+// N of 16. `a_ld`/`c_ld` elements (0 = tight). All return 0 or a negative code (-1 null, -2 extent,
+// -3 M past the band, -4 K, -5 N, -6 launch, -7 bad option). `wk`/`tt` pin the launch form (0 =
+// the rule).
+int  halo_gemm_q6ka16_nt_mv(long a, long wq, long ws, long wd, long c, int M, int K, int N, int a_ld,
+                            int c_ld, int wk, int act, int f32out, long stream);   // M <= 8
+int  halo_gemm_q6ka16_nt_wmma(long a, long wq, long ws, long wd, long c, int M, int K, int N,
+                              int a_ld, int c_ld, int tt, int f32out, long stream); // any M, bf16 X
+int  halo_gemm_q6ka16_nt_mv_max_m(void);
 
 // `a` is E4M3 [M][K] with `ascale` f32 [M][ceil(K/128)], halo_quant_act_fp8's output. `scratch` is
 // the split-K partial plane; 0 runs the launch unsplit (correct, slower). Size it with the query,
