@@ -246,9 +246,14 @@ struct MoeFP8 {
         int     expert_rot   = 0;
         /* Codebook: the rotated codes index a sixteen-entry `table` plane (libquant's
          * `table=w4nl`, non-uniform levels) instead of -8..7 (dtype `w4nla8h`). Only with
-         * `expert_rot`. The codes view selects the table beside the codes so the kernel's relayout
-         * can check it. */
+         * `expert_rot` (or `expert_iq4`, whose table is unrotated). The codes view selects the
+         * table beside the codes so the kernel's relayout can check it. */
         int     expert_nl    = 0;
+        /* IQ4_NL (dtype `iq4nl32a16`): u4 codes into llama.cpp's sixteen-level kvalues_iq4nl, an
+         * f16 scale per (row, 32 of K), and bf16 activations. The one codebook form that is not
+         * rotated: the stored plane is the GGUF IQ4_NL block, so the routed GEMMs read `w.h.x` /
+         * `w.eff.x` and nothing declares `op_hq` or the `hr` pair. */
+        int     expert_iq4   = 0;
         /* Scales per 64 of K: one E4M3 byte under a fixed 2^-13 (dtype `w4nl64a8h`, libr4d's
          * kW4G64Scale), the same bytes as one bf16 per 128. Only with `expert_nl`. The scale views
          * select the fixed second level, which the relayout checks against the kernel's constant.
@@ -469,11 +474,13 @@ struct MoeFP8 {
     static int probe(RadBuilder* b, Names& nm, int l, const Src& src, Config* cfg);
     /* The format `e` names: 0 block fp8, 1 four-bit, 2 four-bit rotated, 3 plain bf16, 4 the
      * rotated w4nl codebook, 5 and 6 that codebook at E4M3 scales per 64 and 32 of K, 7 its
-     * five-bit form per 64, 8 OCP MXFP4, 9 block fp8 at f32 scales; RAD_E_DTYPE otherwise. */
+     * five-bit form per 64, 8 OCP MXFP4, 9 block fp8 at f32 scales, 10 unrotated IQ4_NL at f16
+     * scales per 32 with bf16 activations; RAD_E_DTYPE otherwise. */
     static int format_of(const RadEncoding& e);
     /* format_of's numbers as the grouped GEMMs' dtype strings. */
-    static constexpr const char* kServed[10] = { "fp8a8", "w4a8", "w4a8h", "bf16", "w4nla8h",
-                                                "w4nl64a8h", "w4nl32a8h", "w5nl64a8h", "mxfp4a8", "fp8a8f32" };
+    static constexpr const char* kServed[11] = { "fp8a8", "w4a8", "w4a8h", "bf16", "w4nla8h",
+                                                "w4nl64a8h", "w4nl32a8h", "w5nl64a8h", "mxfp4a8", "fp8a8f32",
+                                                "iq4nl32a16" };
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                  const Wire& wire, const Src& src, bool fold = false, bool add_out = true,
@@ -507,6 +514,16 @@ inline int MoeFP8::format_of(const RadEncoding& e) {
     if (rad_enc_is(&e, "plain") && e.n_planes == 1 && e.plane[0].dtype == RAD_BF16) return 3;
     if (!rad_enc_is(&e, "affine")) return RAD_E_DTYPE;
     const RadEncPlane* sc = rad_enc_plane(&e, "scale");
+    /* IQ4_NL as GGUF stores it: u4 codes into a sixteen-entry i8 table, an f16 scale per 32 of K,
+     * no transform. The codes view joins the table; the scale view is the stored plane. */
+    if (e.n_planes == 3 && sc && sc->dtype == RAD_F16 && sc->block[0] == 1 &&
+        sc->block[1] == 32 && e.plane[0].dtype == RAD_U4 && !e.transform[0]) {
+        const RadEncPlane* t = rad_enc_plane(&e, "table");
+        if (t && t->kind == RAD_PLANE_TABLE && t->dtype == RAD_I8 && t->extent[0] == 1 &&
+            t->extent[1] == 16)
+            return 10;
+        return RAD_E_DTYPE;
+    }
     /* The codebook at E4M3 scales per 64 or 32 of K under one fixed f32 (w4nl64a8h, w4nl32a8h),
      * and its five-bit form per 64 (w5nl64a8h). */
     if (e.n_planes == 4 && sc && sc->dtype == RAD_F8E4M3) {
@@ -630,14 +647,15 @@ inline int MoeFP8::probe(RadBuilder* b, Names& nm, int l, const Src& src, Config
         }
         if (f != 3) break;
     }
-    cfg->expert_w4   = (f == 1 || f == 2 || f == 4 || f == 5 || f == 6 || f == 7) ? 1 : 0;
+    cfg->expert_w4   = (f == 1 || f == 2 || f == 4 || f == 5 || f == 6 || f == 7 || f == 10) ? 1 : 0;
     cfg->expert_rot  = (f == 2 || f == 4 || f == 5 || f == 6 || f == 7) ? 1 : 0;
-    cfg->expert_nl   = (f == 4 || f == 5 || f == 6 || f == 7) ? 1 : 0;
+    cfg->expert_nl   = (f == 4 || f == 5 || f == 6 || f == 7 || f == 10) ? 1 : 0;
     cfg->expert_g64  = (f == 5 || f == 7) ? 2 : f == 6 ? 4 : 0;
     cfg->expert_w5   = f == 7 ? 1 : 0;
     cfg->expert_bf16 = f == 3 ? 1 : 0;
     cfg->expert_mx   = f == 8 ? 1 : 0;
     cfg->expert_f32_scale = f == 9 ? 1 : 0;
+    cfg->expert_iq4  = f == 10 ? 1 : 0;
     return RAD_OK;
 }
 
@@ -716,7 +734,8 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     }
     prot.clear();
     {
-        const int want = c.expert_f32_scale ? 9 : c.expert_mx ? 8 : c.expert_bf16 ? 3 : c.expert_w5 ? 7 : c.expert_g64 == 4 ? 6
+        const int want = c.expert_f32_scale ? 9 : c.expert_mx ? 8 : c.expert_bf16 ? 3 : c.expert_iq4 ? 10
+                       : c.expert_w5 ? 7 : c.expert_g64 == 4 ? 6
                        : c.expert_g64 ? 5 : c.expert_nl ? 4
                        : c.expert_w4 ? (c.expert_rot ? 2 : 1) : 0;
         auto fmt_of = [&](int64_t e, RadEncoding (&enc)[2], int (&fe)[2], const char* (&nmv)[2]) {
@@ -970,12 +989,15 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * which the check above requires; row shards are whole rows. The 128-wide rotation lies within
      * a group, so neither cuts it.
      *
-     * Rotation exists only for the 4-bit plane (the fp8 layout hook has no rotated form), and the
-     * codebook only with rotation; other combinations are refused. */
-    if ((c.expert_rot && !c.expert_w4) || (c.expert_nl && !c.expert_rot)) {
+     * Rotation exists only for the 4-bit plane (the fp8 layout hook has no rotated form). A
+     * codebook is rotated, except IQ4_NL (expert_iq4), which is served unrotated at f16 scales
+     * per 32 with bf16 activations; other combinations are refused. */
+    if ((c.expert_rot && !c.expert_w4) ||
+        (c.expert_nl && !c.expert_rot && !c.expert_iq4) ||
+        (c.expert_iq4 && (!c.expert_nl || c.expert_rot || !c.expert_w4))) {
         fprintf(stderr, "radiance: rotated experts (expert_rot) require the 4-bit expert format, "
-                        "and a codebook (expert_nl) the rotated one; there is no rotated E4M3 "
-                        "expert plane and no unrotated codebook\n");
+                        "a codebook (expert_nl) the rotated one, and IQ4_NL (expert_iq4) the "
+                        "unrotated 4-bit plane; there is no rotated E4M3 expert plane\n");
         return RAD_E_INVAL;
     }
     const int  sh_row = ep ? RAD_SHARD_NONE : RAD_SHARD_ROW;
@@ -996,8 +1018,10 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
      * hook. `sgk` is the K one declared scale column covers. */
     const uint32_t sdt    = c.expert_f32_scale ? (uint32_t)RAD_F32
                           : c.expert_mx        ? (uint32_t)RAD_E8M0
-                          : c.expert_g64       ? (uint32_t)RAD_F8E4M3 : (uint32_t)RAD_BF16;
-    const int64_t  sgk    = c.expert_mx ? RAD_MX_GROUP : c.expert_g64 ? 1 : RAD_FP8_BLOCK;
+                          : c.expert_g64       ? (uint32_t)RAD_F8E4M3
+                          : c.expert_iq4       ? (uint32_t)RAD_F16 : (uint32_t)RAD_BF16;
+    const int64_t  sgk    = c.expert_mx ? RAD_MX_GROUP
+                          : c.expert_g64 ? 1 : c.expert_iq4 ? 32 : RAD_FP8_BLOCK;
     const char*    escale = c.expert_g64 ? "scale,scale.1" : "scale";
     /* This class's slice of each expert: gate and up rows [lo, hi), down columns [lo, hi), scale
      * planes the same in their own units. */
@@ -1173,14 +1197,20 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                   RAD_INT("N_odd", gu * wq[1]), RAD_INT("K_odd", g.n_embd),
                                   RAD_INT("parts", gu)),
                        tab.data(), (int)tab.size());
-        op_gu = rw(b, h, {rot ? w.hr.q : w.h.q, rot ? w.hr.s : w.h.s, w.sorted, w.eoff}, {w.egu});
+        if (c.expert_iq4)
+            op_gu = rw(b, h, {w.h.x, 0, w.sorted, w.eoff}, {w.egu});
+        else
+            op_gu = rw(b, h, {rot ? w.hr.q : w.h.q, rot ? w.hr.s : w.h.s, w.sorted, w.eoff},
+                       {w.egu});
     }
     /* The down projection's input can be rotated in place: `w.eff` is read only by the down GEMM,
      * which takes the codes alone (no bf16 product is written), so the gated quantiser resolves to
      * the rotated op at no extra launch. */
     gq_exp.fuse_clamped = c.swiglu_quant != 0;
-    RAD_ARCH_TRY(gq_exp.declare(b, g, w.egu, w.eff, c.n_ff_exp, gact, c.rows * c.top_k,
-                                false, rot, c.swiglu_limit, c.swiglu_step != 0));
+    Geom gx = g;
+    gx.w_bf16 = g.w_bf16 || c.expert_iq4 != 0;   /* IQ4_NL's down GEMM reads the bf16 product */
+    RAD_ARCH_TRY(gq_exp.declare(b, gx, w.egu, w.eff, c.n_ff_exp, gact, c.rows * c.top_k,
+                                c.expert_iq4 != 0, rot, c.swiglu_limit, c.swiglu_step != 0));
     {
         const std::vector<rad_weight> tab = tables(w_dn, w_dns);
         rad_op h = ncls == 4
@@ -1202,7 +1232,9 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                                   RAD_INT("N_odd", g.n_embd), RAD_INT("K_odd", wq[1]),
                                   RAD_INT("parts", 1)),
                        tab.data(), (int)tab.size());
-        op_dn = rw(b, h, {w.eff.q, w.eff.s, w.sorted, w.eoff}, {w.edn});
+        op_dn = c.expert_iq4
+                    ? rw(b, h, {w.eff.x, 0, w.sorted, w.eoff}, {w.edn})
+                    : rw(b, h, {w.eff.q, w.eff.s, w.sorted, w.eoff}, {w.edn});
     }
     /* ---- The protected experts' own GEMM pair. Their weights belong to the layer group, not to
      * expert slots: each container expert unit has a fixed size and these are four times larger, so

@@ -2630,6 +2630,53 @@ TEST(the_encodings_the_model_holds_choose_the_flash_next_kernels) {
     CHECK(!p.layers[0].hc_mix.mix_e4m3);
 }
 
+/* IQ4_NL is the one codebook form served unrotated: u4 codes into a sixteen-entry i8 table, an
+ * f16 scale per 32 of K, and bf16 activations. The arch must not declare the rotated activation
+ * (`op_hq`) or the `hr` pair, and the down projection's gated quantiser must write bf16 (the GEMM
+ * reads `w.eff.x`). */
+TEST(iq4_nl_expert_declarations_choose_the_unrotated_bf16_activation_path) {
+    using namespace rad::arch;
+    RadModelMeta meta = qwen4exp_meta();
+    RadEncoding iq = rad_enc_affine(RAD_U4, RAD_F16, 1, 32);
+    rad_enc_add_table(&iq, "table", RAD_I8, 1, 16);
+    REQUIRE(rad_enc_valid(&iq));
+    CHECK_EQ(MoeFP8::format_of(iq), 10);
+    const RadEncoding row8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 1, 128);
+    RadEncoding u2 = rad_enc_affine(RAD_U2, RAD_F16, 1, 128);
+    rad_enc_add_plane(&u2, "zero", RAD_U8, 1, 128);
+
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok = 2048; c.max_seqs = 8; c.max_spec = 3; c.max_ctx = 200000;
+    RadBuilder b;
+    b.encs = { { "ffn_gate_up_exps", iq }, { "ffn_down_exps", iq },
+               { "_hc_down.weight", row8 }, { "_hc_up.weight", row8 },
+               { "fc_hidden", row8 }, { "fc_embedding", row8 }, { "draft_head", u2 } };
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+    const qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[0];
+    CHECK_EQ(m.moecfg.expert_w4, 1);
+    CHECK_EQ(m.moecfg.expert_rot, 0);
+    CHECK_EQ(m.moecfg.expert_nl, 1);
+    CHECK_EQ(m.moecfg.expert_iq4, 1);
+    CHECK_EQ(m.moecfg.expert_g64, 0);
+    int iq_ops = 0, rotated_ops = 0, hq_ops = 0;
+    for (const RecOp& o : b.ops) {
+        if (o.op.rfind("moe_gemm", 0) == 0)
+            for (const auto& p : o.p)
+                if (p.key == "dtype" && p.sval == "iq4nl32a16") ++iq_ops;
+        if (o.op == "had_quant_act_fp8") ++hq_ops;
+        if (o.op == "gated_had_quant_fp8") ++rotated_ops;
+    }
+    CHECK(iq_ops > 0);
+    CHECK_EQ(hq_ops, 0);
+    CHECK_EQ(rotated_ops, 0);
+    for (const RecWeight& w : b.weights)
+        if (w.name.find("_exps.") != std::string::npos && w.name.size() > 6 &&
+            w.name.compare(w.name.size() - 6, 6, ".scale") == 0) {
+            CHECK(w.d.source != nullptr && w.d.planes && std::string(w.d.planes) == "scale");
+            CHECK_EQ(w.d.dtype, (uint32_t)RAD_F16);
+        }
+}
+
 TEST(mxfp4_expert_declarations_preserve_tp4_and_tp8_scale_geometry_and_movement_groups) {
     using namespace rad::arch;
     const RadEncoding mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);

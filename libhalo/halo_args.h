@@ -281,6 +281,13 @@ static constexpr float kW4nlTable[16] = { 1.125f, 3.25f, 5.5f, 8.0f, 11.0f, 14.0
                                           -1.125f, -3.25f, -5.5f, -8.0f, -11.0f, -14.0f, -18.0f,
                                           -22.0f };
 
+/* IQ4_NL's codebook (llama.cpp's kvalues_iq4nl), in code order. Unlike kW4nlTable it is not
+ * magnitudes ascending then their negatives: codes 0..7 are negative and 8..15 positive, and the
+ * two halves are different magnitude sequences. The kernel stages it as f16 and the layout hook
+ * compares a container's table with it before serving. */
+static constexpr int8_t kIq4NlTable[16] = { -127, -104, -83, -65, -49, -35, -22, -10,
+                                             1,    13,   25,  38,  53,  69,  89, 113 };
+
 /* `w5nl64a8h` decodes libquant's `table=w5nl`: thirty-two levels, sixteen magnitudes ascending
  * then their negatives, so a code's high bit is its sign and its low four bits index the
  * magnitudes. The kernel expands the magnitude from kW5nlMagPerm (their E4M3 bytes in w4_e4m3's
