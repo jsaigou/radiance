@@ -177,7 +177,7 @@ endforeach()
 # descriptions and fusion claims, plus the generated stubs for units not yet ported. They are pure
 # host C++ that includes neither halo.h nor hip_runtime.h, so these tables compile and can be
 # inspected without ROCm.
-set(HALO_DECLARATION halo_rows.cpp halo_layout.cpp halo_fp8_layout.cpp halo_q80_layout.cpp halo_shapes.cpp halo_fuse.cpp
+set(HALO_DECLARATION halo_rows.cpp halo_layout.cpp halo_fp8_layout.cpp halo_q80_layout.cpp halo_q6k_layout.cpp halo_shapes.cpp halo_fuse.cpp
                      halo_stubs.cpp)
 
 rad_add_plugin(libhalo kernels
