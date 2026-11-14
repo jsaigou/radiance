@@ -2220,8 +2220,7 @@ static bool ref_readable(uint32_t dt) {
     switch (dt) {
         case RAD_F32: case RAD_F16: case RAD_BF16: case RAD_F8E4M3: case RAD_F8E5M2:
         case RAD_I8: case RAD_U8: case RAD_BOOL: case RAD_I16: case RAD_U16: case RAD_I32:
-        case RAD_U32: case RAD_I64: case RAD_I4: case RAD_U4: case RAD_I2: case RAD_FP4E2M1:
-        case RAD_E8M0:
+        case RAD_U32: case RAD_I64: case RAD_I4: case RAD_I2: case RAD_FP4E2M1: case RAD_E8M0:
             return true;
         default:
             return false;
@@ -2231,7 +2230,7 @@ static bool ref_storable(uint32_t dt) {
     switch (dt) {
         case RAD_F32: case RAD_F16: case RAD_BF16: case RAD_F8E4M3: case RAD_F8E5M2:
         case RAD_I8: case RAD_U8: case RAD_BOOL: case RAD_I16: case RAD_U16: case RAD_I32:
-        case RAD_U32: case RAD_I64: case RAD_I4: case RAD_U4: case RAD_I2: case RAD_FP4E2M1:
+        case RAD_U32: case RAD_I64: case RAD_I4: case RAD_I2: case RAD_FP4E2M1:
             return true;
         default:
             return false;
@@ -2263,7 +2262,12 @@ static int ref_check_dtypes(const char* op, const RadArgs* a) {
         const RadTensor& t = a->t[i];
         if (!t.data) continue;
         const int role = sc->operands[i].role;
-        if (role != RAD_OPD_OUT && !ref_readable(t.dtype) && !ref_joined_weight(t, role))
+        /* IQ4_NL's codes: a u4 weight operand libref reads in ref_embed_lookup_q itself (through
+         * rad_load_f32), not through ld_dt, which deliberately has no u4 case (cast refuses it). */
+        const bool iq4_codes = t.dtype == RAD_U4 && role == RAD_OPD_WEIGHT &&
+                               std::strcmp(op, "embed_lookup_q") == 0;
+        if (role != RAD_OPD_OUT && !ref_readable(t.dtype) && !ref_joined_weight(t, role) &&
+            !iq4_codes)
             return RAD_E_DTYPE;
         if ((role == RAD_OPD_OUT || role == RAD_OPD_INOUT) && !ref_storable(t.dtype))
             return RAD_E_DTYPE;
