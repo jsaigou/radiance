@@ -71,8 +71,9 @@ so a Flash-Next container keeps the UD map's Q6_K/Q8_0 trunk planes:
   `attn_qg`/`attn_k`/`attn_v`/`attn_output`, the shared expert's 47 `ffn_gate_up_shexp`, and
   `output.weight` (mapped, below).
 - **Q8_0** (`i8*f16[1x32]`): `gemm_nt_q`, `dtype=q80a16`, `group=32`, the two planes as `b` and
-  `b_scale`. Covers the 36 `ssm_out`, the 48 `ffn_down_shexp` and the PLE layer's
-  `ple_key`/`ple_value` projections. `PleLayer` also declares those projections at Q6_K (or bf16)
+  `b_scale`. Covers the 36 `ssm_out`, the 48 `ffn_down_shexp`, the PLE layer's
+  `ple_key`/`ple_value` projections, and layer 2's whole block (the map's only Q8_0
+  `ssm_inz` + `ffn_gate_up_shexp`). `PleLayer` also declares those projections at Q6_K (or bf16)
   when the container holds those planes. The 96 + 1 connection `*_hc_down/up` matrices stay on
   `hc_read`, which does not read Q8_0 (mapped, below).
 - The grouped MoE declarations are unchanged: `format_of`/`kServed` still name only the grouped
