@@ -2618,7 +2618,7 @@ whole form elsewhere (the host mailbox included), which keeps every promise `sp`
 | op | params | operands |
 |---|---|---|
 | `embed_lookup` | `M`(range) `n_embd` `n_vocab` `dtype` `vocab_offset`/opt `wscale`:f64/opt `mult`:f64/opt | `tokens`, `wte`w → `x` |
-| `embed_lookup_q` | `M`(range) `n_embd` `n_vocab` `dtype` `vocab_offset`/opt `wscale`:f64/opt | `tokens`, `wte`w, `scale`w? → `x`, `ahead`? |
+| `embed_lookup_q` | `M`(range) `n_embd` `n_vocab` `dtype` `vocab_offset`/opt `wscale`:f64/opt `wform`/opt | `tokens`, `wte`w, `scale`w? → `x`, `ahead`? |
 | `logits_gemm` | `M`(range) `n_vocab` `n_embd` `dtype` | `x`, `lm_head`w → `logits` |
 | `ngram_ids` | `M`(range) `heads` `ngram` `eos` | `tok`, `state`:inout, `cu`, `mult`w, `vocab_sizes`w, `offsets`w, `cache_idx`?, `has_init`?, `num_accepted`? → `ids`, `ahead_ids`? |
 | `ple_gate` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `gate_eps`:f64/opt | `k`, `q`, `v`, `w_key`w, `w_query`w, `w_conv`w → `gv`, `gvn` |
@@ -2710,6 +2710,15 @@ ids before it runs.
 One scale suffices because E4M3 carries its own exponent: on Qwen3.8-Flash-Next's table a row's
 dynamic range is 2.3x and a per-row scale would improve the error by only 2.9%. The FP8 checkpoint
 ships it this way, E4M3 rows with a single bf16 `weight_scale`.
+
+`wform=iq4_nl` declares the other served form, llama.cpp's IQ4_NL: `wte` is u4 codes (element 2k in
+bits 0-3 of byte k, 2k+1 in bits 4-7), `scale` is an f16 per 32 values (a [n_vocab, n_embd/32]
+plane, not one element), and the u4 code indexes the fixed 16-level codebook `kvalues_iq4nl`. A row
+decodes as `x = bf16(kvalues[code] * scale[block])`, the single rounding in f32 before the store;
+the codebook is a constant, as it is in the GGUF dequantiser, so it is not an operand. `wform` is
+absent for the E4M3-with-one-scale form the official container ships and for a plain bf16 table;
+the shape hook is its reader, while a launch dispatches on `wte`'s dtype. The IQ4_NL row gather is
+device and host (libavx reads the codes through its row cache and the scale plane from memory).
 
 It is a separate op, not a `dtype` on `embed_lookup`, because the operand list differs and
 operands are positional; an optional scale operand on `embed_lookup` would also move `x` from slot

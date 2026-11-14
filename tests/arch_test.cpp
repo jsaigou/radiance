@@ -1825,6 +1825,55 @@ TEST(the_ple_windows_are_issued_once_per_half_of_a_step) {
     }
 }
 
+/* The PLE table is declared from its container encoding: an IQ4_NL source (u4 codes, a 16-entry
+ * i8 codebook, an f16 scale per 32 values) declares the codes as a u4 view and the scale as an
+ * f16 [rows, head_dim/32] view, and the gather names wform=iq4_nl. The E4M3-with-one-scale form
+ * the official container ships is the test above (no encoding: the fp8 path). */
+TEST(the_ple_table_declares_iq4_nl_when_the_container_holds_it) {
+    using namespace rad::arch;
+    RadBuilder b;
+    Names nm("");
+    Geom g{};
+    g.n_layer = 1; g.n_embd = 64; g.max_tok = 16; g.max_seqs = 2; g.max_spec = 1;
+    RadBufDecl hd{};
+    hd.dtype = RAD_BF16; hd.rank = 2; hd.shape[0] = g.max_tok; hd.shape[1] = 4 * g.n_embd;
+    PleLayer::Wire w{};
+    w.h = rad_decl_buffer(&b, "h", &hd);
+    PleLayer::Config pc{};
+    pc.hc = 4; pc.embed_dim = 256; pc.heads = 8; pc.ngram = 3; pc.eos = 7; pc.rows = 1000;
+    pc.shards = 2; pc.conv_width = 4; pc.dilation = 3;          /* head_dim 32, one scale a row */
+    PleLayer::Src src{};
+    src.shard_prefix = "ple.shard_"; src.shard_suffix = ".weight"; src.mult = "ple.mult";
+    src.vocab_sizes = "ple.vsz"; src.offsets = "ple.off"; src.key_proj = "ple.k";
+    src.value_proj = "ple.v"; src.norm_key = "ple.nk"; src.norm_query = "ple.nq";
+    src.norm_conv = "ple.nc"; src.conv1d = "ple.conv";
+
+    RadEncoding iq4 = rad_enc_affine(RAD_U4, RAD_F16, 1, 32);
+    rad_enc_add_table(&iq4, "table", RAD_I8, 1, 16);
+    b.encs = { { "blk.0.ple_ngram.weight", iq4 } };
+
+    PleLayer ple;
+    const int rc = ple.declare(&b, nm, g, pc, 0, w, src);
+    CHECK_EQ(rc, RAD_OK);
+    if (rc < 0) return;
+    CHECK(ple.table_iq4);
+    const RecWeight* codes = find_w(b, "blk.0.ple_ngram.weight");
+    const RecWeight* scale = find_w(b, "blk.0.ple_ngram.scale");
+    REQUIRE(codes && scale);
+    CHECK_EQ(codes->d.dtype, (uint32_t)RAD_U4);
+    CHECK_EQ(codes->d.rank, 2u);
+    CHECK_EQ(codes->d.shape[0], pc.rows);
+    CHECK_EQ(codes->d.shape[1], pc.embed_dim / pc.heads);
+    CHECK_EQ(scale->d.dtype, (uint32_t)RAD_F16);
+    CHECK_EQ(scale->d.shape[0], pc.rows);
+    CHECK_EQ(scale->d.shape[1], 1);                              /* 32 / 32 */
+    const RecOp* gth = find_op(b, "embed_lookup_q");
+    REQUIRE(gth);
+    CHECK_EQ(gth->w.size(), 2u);
+    CHECK_EQ(pstr(gth, "wform"), std::string("iq4_nl"));
+    CHECK_EQ(pint(gth, "n_embd"), pc.embed_dim / pc.heads);
+}
+
 /* ==================================================================== the sizing declare
  *
  * The activation arena is lent out by level, and a level is the plugin declaring again at a
