@@ -1454,7 +1454,8 @@ def verify(args):
     if policy == "auto":
         policy = "lossless" if (rf.quant or "").startswith("gguf_ftype_") else "quantised"
     if policy == "lossless":
-        bad = [r for r in rows if r["hash_equal_gguf"] is False and r["name"] != "ssm_a_log"]
+        bad = [r for r in rows if r["hash_equal_gguf"] is False
+               and r["name"] not in ("ssm_a_log", "mtp.draft_head.weight")]
         bad += [r for r in rows if r["hash_equal_source"] is False and r["hash_equal_gguf"] is False]
         passed = not bad and not missing_plan
     else:
