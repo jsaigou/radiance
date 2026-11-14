@@ -4,8 +4,11 @@ the declared plan are given: UD_MAP_GGUF (all shards, colon-separated) and UD_MA
 import argparse
 import json
 import os
+import sys
 import tempfile
 import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import ud_map
 
@@ -119,6 +122,45 @@ def _rows():
     ]
 
 
+def _rows_4exp():
+    """The Flash-Next map's shape: one short layer per UD type, at toy sizes."""
+    sh = [256, 256, 2]
+    return [
+        dict(name="per_layer_token_embd.weight", type="IQ4_NL", shape=[1024, 160],
+             role="ple-table", target="blk.1.ple_ngram.weight"),
+        dict(name="blk.0.ffn_gate_exps.weight", type="IQ3_XXS", shape=sh,
+             target="blk.0.ffn_gate_up_exps.*.weight"),
+        dict(name="blk.0.ffn_up_exps.weight", type="IQ3_XXS", shape=sh,
+             target="blk.0.ffn_gate_up_exps.*.weight"),
+        dict(name="blk.0.ffn_down_exps.weight", type="IQ4_NL", shape=sh,
+             target="blk.0.ffn_down_exps.*.weight"),
+        dict(name="blk.1.ffn_gate_exps.weight", type="IQ4_XS", shape=sh,
+             target="blk.1.ffn_gate_up_exps.*.weight"),
+        dict(name="blk.1.ffn_up_exps.weight", type="IQ4_XS", shape=sh,
+             target="blk.1.ffn_gate_up_exps.*.weight"),
+        dict(name="blk.1.ffn_down_exps.weight", type="Q5_0", shape=sh,
+             target="blk.1.ffn_down_exps.*.weight"),
+        dict(name="blk.2.ffn_gate_exps.weight", type="IQ2_S", shape=sh,
+             target="blk.2.ffn_gate_up_exps.*.weight"),
+        dict(name="blk.2.ffn_up_exps.weight", type="IQ2_S", shape=sh,
+             target="blk.2.ffn_gate_up_exps.*.weight"),
+        dict(name="blk.2.ffn_down_exps.weight", type="TYPE42", shape=sh,
+             target="blk.2.ffn_down_exps.*.weight"),
+        dict(name="token_embd.weight", type="IQ4_XS", shape=[2048, 256],
+             role="embedding", target="token_embd.weight"),
+        dict(name="output.weight", type="Q6_K", shape=[2048, 256],
+             role="output", target="output.weight"),
+        dict(name="blk.0.ssm_out.weight", type="Q8_0", shape=[256, 256],
+             role="ssm_out", target="blk.0.ssm_out.weight"),
+        dict(name="blk.0.ffn_gate_up_shexp.weight", type="Q6_K", shape=[512, 256],
+             role="ffn_gate_shexp", target="blk.0.ffn_gate_up_shexp.weight"),
+        dict(name="blk.0.qsa_qk.weight", type="BF16", shape=[256, 256],
+             role="indexer", target="blk.0.qsa_qk.weight"),
+        dict(name="blk.0.ffn_gate_inp.weight", type="F32", shape=[16, 256],
+             role="ffn_gate_inp", target="blk.0.ffn_gate_inp.weight"),
+    ]
+
+
 class FastRecipe(unittest.TestCase):
     def test_expert_formats_follow_the_map_and_fuse_by_the_wider_half(self):
         text = ud_map._fast_recipe(_rows(), "m.gguf")
@@ -147,6 +189,79 @@ class FastRecipe(unittest.TestCase):
         text = ud_map._fast_recipe(rows, "m.gguf", mtp="w4nl64")
         self.assertRegex(text, r"blk\.40\.ffn_gate_up_exps\.\*\.weight.*table=w4nl")
         self.assertRegex(text, r"blk\.40\.ffn_down_exps\.\*\.weight.*table=w4nl")
+
+
+class FastFlashNext(unittest.TestCase):
+    def test_recipe_maps_every_ud_format_to_a_served_form(self):
+        text = ud_map._fast_recipe(_rows_4exp(), "m.gguf", arch="qwen4exp")
+        self.assertRegex(text, r"blk\.0\.ffn_gate_up_exps\.\*\.weight.*table=w3nl.*"
+                               r"# IQ3_XXS -> w3nl64")
+        self.assertRegex(text, r"blk\.0\.ffn_down_exps\.\*\.weight.*table=w4nl.*"
+                               r"# IQ4_NL -> w4nl64")
+        self.assertRegex(text, r"blk\.1\.ffn_gate_up_exps\.\*\.weight.*table=w4nl.*"
+                               r"# IQ4_XS -> w4nl64")
+        self.assertRegex(text, r"blk\.1\.ffn_down_exps\.\*\.weight.*table=w5nl.*"
+                               r"# Q5_0 -> w5nl64")
+        self.assertRegex(text, r"blk\.2\.ffn_gate_up_exps\.\*\.weight.*table=w3nl.*"
+                               r"# IQ2_S -> w3nl64")
+        # Q2_0's native q20a16 is smaller but unrotated; its layers' gate/up are IQ2_S, and the
+        # arch keeps one encoding family per layer, so it takes the rotated w3nl form.
+        self.assertRegex(text, r"blk\.2\.ffn_down_exps\.\*\.weight.*table=w3nl.*"
+                               r"# TYPE42 -> w3nl64")
+        self.assertNotIn("ggml type=q2_0", text)
+        self.assertIn("blk.1.ple_ngram.weight", text)
+        self.assertIn("ggml type=iq4_nl", text)
+        self.assertRegex(text, r"output\.weight.*ggml type=q6_k")
+        self.assertRegex(text, r"blk\.0\.ssm_out\.weight.*ggml type=q8_0")
+        self.assertNotIn("has no fast format", text)
+
+    def test_embedding_is_kept_and_no_draft_head_is_invented(self):
+        text = ud_map._fast_recipe(_rows_4exp(), "m.gguf", arch="qwen4exp")
+        rules = [line for line in text.splitlines()
+                 if line.startswith("token_embd.weight") and "ggml" in line]
+        self.assertEqual(rules, [])
+        self.assertNotIn("mtp.draft_head.weight", text)
+        self.assertIn("token_embd.weight (IQ4_XS) is kept bf16", text)
+
+    def test_fast_dtypes_and_dependencies(self):
+        by = {r["name"]: ud_map._fast_dtype("qwen4exp", r) for r in _rows_4exp()}
+        self.assertEqual(by["per_layer_token_embd.weight"][0], "iq4_nl")
+        self.assertTrue(by["per_layer_token_embd.weight"][2])
+        self.assertEqual(by["blk.0.ffn_gate_exps.weight"][0], "w3nl64")
+        self.assertFalse(by["blk.0.ffn_gate_exps.weight"][2])
+        self.assertIn("w3nl64a8h", by["blk.0.ffn_gate_exps.weight"][3])
+        self.assertEqual(by["blk.0.ffn_down_exps.weight"][0], "w4nl64")
+        self.assertTrue(by["blk.0.ffn_down_exps.weight"][2])
+        self.assertEqual(by["blk.1.ffn_down_exps.weight"][0], "w5nl64")
+        self.assertEqual(by["blk.2.ffn_down_exps.weight"][0], "w3nl64")
+        self.assertFalse(by["blk.2.ffn_down_exps.weight"][2])
+        self.assertEqual(by["token_embd.weight"][0], "bf16")
+        self.assertEqual(by["output.weight"][0], "q6_k")
+        self.assertFalse(by["output.weight"][2])
+        self.assertIn("L3", by["output.weight"][3])
+        self.assertEqual(by["blk.0.ssm_out.weight"][0], "q8_0")
+        self.assertEqual(by["blk.0.qsa_qk.weight"][0], "bf16")
+        self.assertEqual(by["blk.0.ffn_gate_inp.weight"][0], "f32")
+
+    def test_fast_bytes_scale_with_the_codebook(self):
+        row = dict(type="Q5_0", shape=[256, 256, 2], bytes=256 * 256 * 2 * 2)
+        self.assertEqual(ud_map._fast_bytes(row, "w5nl64", ud_map.FAST_BPW["w5nl64"]),
+                         int(256 * 256 * 2 * 5.125 / 8))
+        row = dict(type="Q8_0", shape=[256, 256], bytes=256 * 256)
+        self.assertEqual(ud_map._fast_bytes(row, "q8_0", ud_map.FAST_BPW["q8_0"]),
+                         256 * 256)
+
+    def test_mtp_variant_targets_the_kept_layer(self):
+        text = ud_map._fast_recipe(_rows_4exp(), "m.gguf", arch="qwen4exp",
+                                   mtp="w4nl64", mtp_layer=48)
+        self.assertRegex(text, r"blk\.48\.ffn_gate_up_exps\.\*\.weight.*table=w4nl")
+        self.assertRegex(text, r"blk\.48\.ffn_down_exps\.\*\.weight.*table=w4nl")
+
+    def test_kept_mtp_layer_defaults_to_w4(self):
+        # A whole bf16 expert layer is refused by the arch, so the fast recipe writes blk.48.
+        text = ud_map._fast_recipe(_rows_4exp(), "m.gguf", arch="qwen4exp", mtp_layer=48)
+        self.assertRegex(text, r"blk\.48\.ffn_gate_up_exps\.\*\.weight.*table=w4nl")
+        self.assertRegex(text, r"blk\.48\.ffn_down_exps\.\*\.weight.*table=w4nl")
 
 
 class Build(unittest.TestCase):
@@ -192,12 +307,25 @@ class Types(unittest.TestCase):
         for ty in ("Q8_0", "Q6_K", "Q5_0", "IQ4_NL", "IQ4_XS", "IQ3_XXS", "IQ2_S", "F32", "BF16"):
             self.assertIn(ty, ud_map.TYPES)
 
-    def test_q2_0_is_resolved_but_not_servable(self):
-        # type 42 is Q2_0: libquant has the encoder and the plane split, but no kernel reads it.
+    def test_q2_0_is_resolved_and_served(self):
+        # type 42 is Q2_0: libquant's q2_0 kind and the q20a16 expert GEMM now serve it.
         self.assertEqual(ud_map.TYPES["TYPE42"][0], 2.25)
-        self.assertIsNone(ud_map.TYPES["TYPE42"][1])
-        self.assertFalse(ud_map.TYPES["TYPE42"][2])
+        self.assertEqual(ud_map.TYPES["TYPE42"][1], "q2_0")
+        self.assertTrue(ud_map.TYPES["TYPE42"][2])
         self.assertFalse(ud_map.UNKNOWN_TYPE[2])
+
+    def test_served_flags_match_the_moe_merge(self):
+        # IQ4_NL (iq4nl32a16 + PLE gather), Q5_0 (q50a16), Q2_0 (q20a16) are served by base
+        # 2a3200f; Q6_K/Q8_0 wait on the dense wiring (L3) and IQ4_XS/IQ3_XXS/IQ2_S on kernels.
+        for ty in ("IQ4_NL", "Q5_0", "Q2_0"):
+            self.assertTrue(ud_map.TYPES[ty][2], ty)
+        for ty in ("Q6_K", "Q8_0", "IQ4_XS", "IQ3_XXS", "IQ2_S"):
+            self.assertFalse(ud_map.TYPES[ty][2], ty)
+
+    def test_fast_experts_cover_the_ud_types(self):
+        for ty in ("Q4_K", "Q5_K", "Q6_K", "Q8_0", "IQ4_NL", "IQ4_XS", "Q5_0",
+                   "IQ3_XXS", "IQ2_S", "Q2_0", "TYPE42"):
+            self.assertIn(ty, ud_map.FAST_EXPERTS, ty)
 
 
 class Grade(unittest.TestCase):
@@ -238,6 +366,35 @@ class Integration(unittest.TestCase):
         # the PLE n-gram table is the single biggest mapped tensor and maps to one declared weight
         big = max(p["tensors"], key=lambda r: r["bytes"])
         self.assertEqual(big["target"], "blk.1.ple_ngram.weight")
+
+    def test_flash_next_fast_plan(self):
+        import argparse
+        shards = os.environ["UD_MAP_GGUF"].split(":")
+        declared = os.environ["UD_MAP_DECLARED"]
+        out = "/tmp/ud_map_test_fast.json"
+        a = argparse.Namespace(gguf=shards, declared=declared, source=None, recipe_out=None,
+                               json=out, policy="fast")
+        self.assertEqual(ud_map.plan(a), 0)
+        p = json.load(open(out))
+        self.assertEqual(p["policy"], "fast")
+        fast = p["fast"]
+        self.assertEqual(fast["coverage"]["covered"], 1044)
+        self.assertEqual(fast["coverage"]["targets"], 1044)
+        self.assertEqual(fast["coverage"]["missing"], [])
+        # The fast remap is close to the UD size: the codebook swaps roughly cancel, and the
+        # kept-bf16 token embedding (IQ4_XS has no gather yet) is the one net addition.
+        self.assertLess(abs(fast["total_bytes"] - p["totals"]["total_bytes"]), 1 * 2**30)
+        self.assertTrue(all(r["fast_dtype"] for r in p["tensors"]))
+        self.assertIn("table=w3nl", p["recipe"])
+        self.assertIn("table=w4nl", p["recipe"])
+        self.assertIn("table=w5nl", p["recipe"])
+        self.assertNotIn("ggml type=q2_0", p["recipe"])
+        self.assertIn("ggml type=iq4_nl", p["recipe"])
+        self.assertIn("blk.48.ffn_gate_up_exps.*.weight", p["recipe"])
+        self.assertLess(fast["build_bytes"], fast["total_bytes"])
+        ple = [r for r in p["tensors"] if r["target"] == "blk.1.ple_ngram.weight"][0]
+        self.assertEqual(ple["fast_dtype"], "iq4_nl")
+        self.assertTrue(any("L3" in (r["fast_dep"] or "") for r in p["tensors"]))
 
 
 if __name__ == "__main__":
