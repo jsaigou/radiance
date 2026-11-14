@@ -4725,6 +4725,13 @@ static const RadConstraint cGemmNtFp8A16[] = {
 /* K DIV 128, not 256: the entry serves a K that is a multiple of 128 by staging a 128-byte tile
  * instead of a 256-byte one (narrow_fk). The resolver offers shapes by declared constraints, so the
  * row must claim the band it can serve. */
+/* ggml Q8_0 dense (halo_q80.h): K a whole 32-block, N a whole 16-row tile, group 32. */
+static const RadConstraint cGemmNtQ80M8[] = {
+    C_LE("M", 8), C_DIV("K", 32), C_DIV("N", 16), C_EQ("group", 32), C_IN("dtype", "q80a16"),
+};
+static const RadConstraint cGemmNtQ80Wmma[] = {
+    C_DIV("K", 32), C_DIV("N", 16), C_EQ("group", 32), C_IN("dtype", "q80a16"),
+};
 static const RadConstraint cGemmNtFp8A8M16[] = {
     C_LE("M", 64), C_DIV("K", 128), C_DIV("N", 16), C_EQ("group", HALO_FP8_BLOCK),
     C_IN("dtype", "fp8a8"),
@@ -7710,6 +7717,38 @@ HALO_WIN_PAIR(512, 1) HALO_WIN_PAIR(512, 2) HALO_WIN_PAIR(512, 4) HALO_WIN_PAIR(
   nullptr, nullptr, halo_rad_gemm_fp8a16_m1, nullptr,
   halo_rad_layout_fp8_rowmajor, nullptr,
   halo_shape_gemm_nt_q },
+
+/* ------------------------------------------------------------------------ ggml Q8_0 dense
+ *
+ * Q8_0 as the GGUF stores it (int8 codes, f16 scale per 32 K), lossless: the planes are byte copies
+ * of the block fields. See halo_q80.h for the stored form and the arithmetic. */
+{ "gemm_q80a16_nt_m8", "gemm_nt_q", "gemm",
+  "ggml Q8_0 matvec: one wave reads a 16-row x 32-K tile (512 contiguous bytes) a pass, up to 4 "
+  "tiles in flight, the 16-bit activation read directly; WK waves split K for narrow N and close "
+  "in LDS",
+  "M <= 8 (one weight read serves all M rows); K a multiple of 32; N a multiple of 16",
+  "bf16 X read directly, ggml Q8_0 W (int8 codes, f16 scale per 32 K) dequantised exactly, bf16 C; "
+  "f32 accumulate: fma chain over each lane's 16 k, fma(d, S) over blocks, xor then LDS-ordered "
+  "closes. No activation quantisation (differs from llama.cpp's Q8_0 x Q8_0 dot)",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_GEMM_FP8_M16,
+  ROW(cGemmNtQ80M8), NOTUNE,
+  nullptr, nullptr, halo_rad_gemm_q80a16_mv, nullptr,
+  halo_rad_layout_q80, halo_rad_relayout_q80,
+  halo_shape_gemm_nt_q, halo_rad_unrelayout_q80 },
+
+{ "gemm_q80a16_nt_wmma", "gemm_nt_q", "gemm",
+  "ggml Q8_0 GEMM on the matrix unit: the weight is the B operand, read from global straight into "
+  "bf16 fragments (int8 -> bf16 is exact), the activation staged through LDS; per 32-K block two "
+  "16x16x16 bf16 WMMAs then one fma with the block's f16 scale",
+  "any M; K a multiple of 32; N a multiple of 16; the activation row pitch a multiple of 8 "
+  "elements and 16-byte aligned",
+  "bf16 X, ggml Q8_0 W dequantised exactly (q is exact in bf16), bf16 C; f32 accumulate, the "
+  "per-block sum in the matrix unit's order, acc = fma(d, block sum, acc)",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_GEMM_FP8_TILED,
+  ROW(cGemmNtQ80Wmma), NOTUNE,
+  nullptr, nullptr, halo_rad_gemm_q80a16_wmma, nullptr,
+  halo_rad_layout_q80, halo_rad_relayout_q80,
+  halo_shape_gemm_nt_q, halo_rad_unrelayout_q80 },
 
 { "gemm_fp8a8_nt_m16", "gemm_nt_q", "gemm",
   "block-scaled FP8 W8A8 GEMM at the speculative-verify width: 16-wide token tiles, NT up to 4 of "
