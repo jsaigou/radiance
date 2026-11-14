@@ -2155,6 +2155,33 @@ static Planes nl_planes(const std::vector<float>& w, int64_t N, int64_t K, int64
     return p;
 }
 
+/* Q5_0 as GGUF stores it: signed i5 codes (-16..15) and an f16 scale per 32 of K. The scale is
+ * amax / 16 (the largest magnitude), nearest signed level. */
+static Planes q50_planes(const std::vector<float>& w, int64_t N, int64_t K) {
+    Planes p;
+    rad_enc_clear(&p.enc);
+    rad_enc_copy_str(p.enc.scheme, "affine");
+    rad_enc_add_plane(&p.enc, "codes", RAD_I5, 1, 1);
+    rad_enc_add_plane(&p.enc, "scale", RAD_F16, 1, 32);
+    p.size(N, K);
+    const int64_t ng = K / 32, crow = p.row_bytes(0);
+    for (int64_t n = 0; n < N; ++n)
+        for (int64_t g = 0; g < ng; ++g) {
+            float amax = 0.0f;
+            for (int64_t j = 0; j < 32; ++j)
+                amax = std::max(amax, std::fabs(w[(size_t)(n * K + g * 32 + j)]));
+            float s = amax > 0 ? amax / 16.0f : 1.0f;
+            rad_store_f32(p.data[1].data(), RAD_F16, n * ng + g, s);
+            s = rad_load_f32(p.data[1].data(), RAD_F16, n * ng + g);
+            for (int64_t j = 0; j < 32; ++j) {
+                const float q = std::nearbyint(w[(size_t)(n * K + g * 32 + j)] / s);
+                const int code = (int)std::max(-16.0f, std::min(15.0f, q));
+                rad_store_code(p.data[0].data() + n * crow, RAD_I5, g * 32 + j, code);
+            }
+        }
+    return p;
+}
+
 /* The same codebook at w4nl64a8h's scales (`gs` 64) or w4nl32a8h's (32): the weight rotated by 128,
  * each `gs`-column part of a rotated group scaled on its own (amax / largest entry, residual 1/128
  * folded in, stored as E4M3 under halo_args.h's fixed kW4G64Scale), nearest entry chosen against
@@ -23114,10 +23141,10 @@ static void moe_w4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int 
 /* IQ4_NL (unrotated, an f16 scale per 32, bf16 activations) against a host decode of the same
  * planes, over every launcher form. Unlike the rotated codebook forms the scale view is stored as
  * it is (the hook returns UNSUPPORTED) and there is no activation scale. */
-static void moe_iq4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh) {
+static void moe_iq4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, bool q50 = false) {
     const RadKernelInfo* r = find(pl, "moe_gemm_w4a8");
-    const std::string what = std::string("moe_gemm_w4a8 iq4nl32a16 vs a host decode (T=") +
-                             std::to_string(Tr) + ", " + sh.name + ")";
+    const std::string what = std::string("moe_gemm_w4a8 ") + (q50 ? "q50a16" : "iq4nl32a16") +
+                             " vs a host decode (T=" + std::to_string(Tr) + ", " + sh.name + ")";
     if (!r || !r->layout || !r->relayout) { ok(what.c_str(), false, "row or hooks absent"); return; }
 
     const int64_t ne = sh.ne, group = 128, top_k = 2;
@@ -23127,7 +23154,7 @@ static void moe_iq4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh) {
     const int64_t M = sh.sorted_a ? Tr : Tr / top_k;
     const char* aord = sh.sorted_a ? "sorted" : "token";
     const int64_t fy = N / sh.parts;
-    const char* dt = "iq4nl32a16";
+    const char* dt = q50 ? "q50a16" : "iq4nl32a16";
     std::vector<RadParam> lp = { PI("N", sh.N0), PI("K", sh.K0), PI("N_odd", sh.N1),
                                  PI("K_odd", sh.K1), PI("group", group), PS("dtype", dt) };
 
@@ -23136,7 +23163,7 @@ static void moe_iq4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh) {
     std::vector<Planes>   cp[2];
     for (int c = 0; c < 2; ++c) {
         const int ow = c ? 6 : 2, os = c ? 7 : 3;
-        const int64_t wbytes = Nc[c] * Kc[c] / 2;
+        const int64_t wbytes = q50 ? Nc[c] * Kc[c] / 8 * 5 : Nc[c] * Kc[c] / 2;
         const int64_t sbytes = Nc[c] * (Kc[c] / 32) * 2;
         wq[c].assign((size_t)(nec[c] * wbytes), 0);
         ws[c].assign((size_t)(nec[c] * Nc[c] * (Kc[c] / 32)), 0);
@@ -23147,9 +23174,11 @@ static void moe_iq4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh) {
                 for (int64_t k = 0; k < Kc[c]; ++k)
                     wsrc[(size_t)(n * Kc[c] + k)] =
                         (float)(((e * 7 + n * 31 + k * 17) % 61) - 30) / 37.0f;
-            cp[c].push_back(iq4nl_planes(wsrc, Nc[c], Kc[c]));
+            cp[c].push_back(q50 ? q50_planes(wsrc, Nc[c], Kc[c])
+                               : iq4nl_planes(wsrc, Nc[c], Kc[c]));
             std::vector<uint8_t> w, sc;
-            const int rw = stored(r, lp, ow, cp[c].back(), { "codes", "table" }, &w);
+            const int rw = q50 ? stored(r, lp, ow, cp[c].back(), { "codes" }, &w)
+                              : stored(r, lp, ow, cp[c].back(), { "codes", "table" }, &w);
             const int rs = stored(r, lp, os, cp[c].back(), { "scale" }, &sc);
             if (rw != RAD_OK || rs != RAD_E_UNSUPPORTED) {
                 ok(what.c_str(), false,
@@ -23157,7 +23186,8 @@ static void moe_iq4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh) {
                 return;
             }
             if ((int64_t)w.size() != wbytes || (int64_t)sc.size() != sbytes) {
-                ok(what.c_str(), false, "stored byte counts are not N*K/2 and N*(K/32)*2");
+                ok(what.c_str(), false, q50 ? "stored byte counts are not N*K/8*5 and N*(K/32)*2"
+                                            : "stored byte counts are not N*K/2 and N*(K/32)*2");
                 return;
             }
             std::memcpy(wq[c].data() + (size_t)(x * wbytes), w.data(), w.size());
@@ -23199,11 +23229,11 @@ static void moe_iq4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh) {
     std::vector<RadTensor> ts = {
         T(d_a,     RAD_BF16,     { M, K }),
         T(nullptr, RAD_F32,      { 1, 1 }),
-        T(d_w[0],  HALO_DT_MOEW4, { nec[0], sh.N0, sh.K0 }),
+        T(d_w[0],  q50 ? HALO_DT_MOEW5 : HALO_DT_MOEW4, { nec[0], sh.N0, sh.K0 }),
         T(d_ws[0], RAD_F16,      { nec[0], sh.N0, sh.K0 / 32 }),
         T(d_s,     RAD_I32,      { Tr }),
         T(d_o,     RAD_I32,      { ne + 1 }),
-        T(d_w[1],  HALO_DT_MOEW4, { nec[1], sh.N1, sh.K1 }),
+        T(d_w[1],  q50 ? HALO_DT_MOEW5 : HALO_DT_MOEW4, { nec[1], sh.N1, sh.K1 }),
         T(d_ws[1], RAD_F16,      { nec[1], sh.N1, sh.K1 / 32 }),
         T(d_y,     RAD_BF16,     { Tr, N }),
     };
@@ -23235,10 +23265,12 @@ static void moe_iq4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh) {
                 const Planes& q = cp[c][(size_t)x];
                 for (int64_t g = 0; g < ng; ++g) {
                     double part = 0.0;
-                    for (int64_t k = g * 32; k < (g + 1) * 32; ++k)
-                        part += (double)((int)kIq4NlTable[(int)code_at(q, wr, k)]) *
-                                (double)h_bf16(aq[(size_t)(tok * K + k)]);
-                    want += part * (double)rad_load_f32(q.data[2].data(), RAD_F16, wr * ng + g);
+                    for (int64_t k = g * 32; k < (g + 1) * 32; ++k) {
+                        const double lv = q50 ? (double)code_at(q, wr, k)
+                                              : (double)kIq4NlTable[(int)code_at(q, wr, k)];
+                        part += lv * (double)h_bf16(aq[(size_t)(tok * K + k)]);
+                    }
+                    want += part * (double)rad_load_f32(q.data[q50 ? 1 : 2].data(), RAD_F16, wr * ng + g);
                 }
             }
             ref[(size_t)(i * N + n)] = want;
@@ -33376,9 +33408,12 @@ static void device_phase(const Plugin& pl) {
             { "iq4 gate/up 2:1", 256, 256, 128, 256, 2, 8 },
             { "iq4 down sorted", 256, 256, 256, 256, 1, 8, true },
         };
-        for (const MoeW4Shape& sh : kIq4Shapes)
-            for (const int64_t t : { (int64_t)24, (int64_t)200, (int64_t)600 })
+        for (const MoeW4Shape& sh : kIq4Shapes) {
+            for (const int64_t t : { (int64_t)24, (int64_t)200, (int64_t)600 }) {
                 moe_iq4_gemm(pl, t, sh);
+                moe_iq4_gemm(pl, t, sh, true);
+            }
+        }
     }
 
     if (sel("glm_index_layout")) glm_index_layout_check(pl);

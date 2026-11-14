@@ -203,6 +203,12 @@ static bool moe_iq4(const RadParam* p, int n_p) {
     const char* d = halo_pgets(p, n_p, "dtype");
     return d && std::strcmp(d, "iq4nl32a16") == 0;
 }
+/* `q50a16` is GGUF Q5_0 as stored: signed i5 codes (-16..15) with an f16 scale per (row, 32 of K),
+ * unrotated, bf16 activations. No table. */
+static bool moe_q50(const RadParam* p, int n_p) {
+    const char* d = halo_pgets(p, n_p, "dtype");
+    return d && std::strcmp(d, "q50a16") == 0;
+}
 /* `w5nl64a8h` is w4nl64a8h at five bits: `u5*fp8_e4m3[1x64]*f32[*x*]/fwht128`, codes indexing
  * libquant's 32-entry `table=w5nl`. Its codes view relays each row into HALO_DT_MOEW5 (the low four
  * bits of every code as w4nla8h's nibble plane, then each code's high bit, the sign, one dword per
@@ -1018,13 +1024,15 @@ int moew4_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding*
     const bool w5 = moe_w5(p, n_p);
     const bool w3 = moe_w3(p, n_p);
     const bool iq4 = moe_iq4(p, n_p);
+    const bool q50 = moe_q50(p, n_p);
     const int  g64 = moe_w4_g64(p, n_p);             /* scale groups a 128 of K, or 0 */
-    if (iq4 && g.K % 32) return RAD_E_SHAPE;          /* an f16 scale per 32 of K */
+    if ((iq4 || q50) && g.K % 32) return RAD_E_SHAPE; /* an f16 scale per 32 of K */
     if ((w5 || w3) && g.K % 32) return RAD_E_SHAPE;   /* a sign word is 32 elements */
     /* The 3-bit rows hold 48 bytes per 128 of K (interleaved) and the GEMM refuses any other K, so a
      * K that is not whole 128s would have moew3_row write past the K/8*3-byte row. */
     if (w3 && g.K % 128) return RAD_E_SHAPE;
-    if (iq4 ? !halo_enc::affine_table(enc, RAD_U4, RAD_F16, 1, 32, RAD_I8, 16, "")
+    if (q50 ? !halo_enc::affine(enc, RAD_I5, RAD_F16, 1, 32)
+       : iq4 ? !halo_enc::affine_table(enc, RAD_U4, RAD_F16, 1, 32, RAD_I8, 16, "")
        : g64 ? !halo_enc::affine_table2(enc, w3 ? RAD_U3 : w5 ? RAD_U5 : RAD_U4, RAD_F8E4M3, 1,
                                       g.group / g64, RAD_F32, RAD_F32, w3 ? 8 : w5 ? 32 : 16, fw)
             : nl ? !halo_enc::affine_table(enc, RAD_U4, RAD_BF16, 1, g.group, RAD_F32, 16, fw)
@@ -1032,7 +1040,7 @@ int moew4_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding*
         return RAD_E_DTYPE;
     if (gout) *gout = g;
     if (operand == Q_BSCALE) {
-        if (iq4) {
+        if (iq4 || q50) {
             if (!selects(enc, sel, n, "scale") || !dims(pl[0], g.N, g.K / 32))
                 return RAD_E_SHAPE;
             return RAD_E_UNSUPPORTED;                /* f16 per (row, 32 of K), as it is */
@@ -1054,6 +1062,11 @@ int moew4_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding*
             return RAD_E_SHAPE;
         if (!dims(pl[0], g.N, g.K)) return RAD_E_SHAPE;
         fill(out, "halo.moeiq4nl.w.g32", HALO_DT_MOEW4, g.N, g.K, g.N * g.K / 2);
+        return RAD_OK;
+    }
+    if (q50) {
+        if (!selects(enc, sel, n, "codes") || !dims(pl[0], g.N, g.K)) return RAD_E_SHAPE;
+        fill(out, "halo.moeq50.w.g32", HALO_DT_MOEW5, g.N, g.K, g.N * (g.K / 8) * 5);
         return RAD_OK;
     }
     if (nl ? !selects(enc, sel, n, "codes", "table") || !dims(pl[1], 1, w3 ? 8 : w5 ? 32 : 16)
@@ -1273,7 +1286,7 @@ int moew4_relayout_by(MoeViewFn view, const RadParam* p, int n_p, int operand,
     if (rc != RAD_OK) return rc;
     if (dst_bytes != L.bytes) return RAD_E_SHAPE;
     if (v.operand == Q_BSCALE) {                     /* g64 forms: the second level is fixed */
-        if (moe_iq4(v.p, v.n)) return RAD_E_UNSUPPORTED;   /* f16 per 32, stored as it is */
+        if (moe_iq4(v.p, v.n) || moe_q50(v.p, v.n)) return RAD_E_UNSUPPORTED;   /* f16 per 32 */
         float s2 = 0.0f;
         std::memcpy(&s2, pdata(pl[1]), sizeof s2);
         if (s2 != kW4G64Scale) return RAD_E_DTYPE;
@@ -1296,6 +1309,13 @@ int moew4_relayout_by(MoeViewFn view, const RadParam* p, int n_p, int operand,
             moew3_row(pdata(pl[0]) + nn * rb, (uint8_t*)dst + nn * rb, g.K, il, true);
         return RAD_OK;
     }
+    if (moe_q50(v.p, v.n)) {
+        const int64_t rb = g.K / 8 * 5;
+        std::vector<uint8_t> nib((size_t)(g.K / 2));
+        for (long long nn = 0; nn < g.N; ++nn)
+            moew5_row(pdata(pl[0]) + nn * rb, (uint8_t*)dst + nn * rb, g.K, nib.data(), true);
+        return RAD_OK;
+    }
     if (moe_iq4(v.p, v.n) && !moeiq4_table_is_kernels(pl[1])) return RAD_E_DTYPE;
     if (moe_w4_nl(v.p, v.n) && !moew4_table_is_kernels(pl[1])) return RAD_E_DTYPE;
     moew4_permute(pdata(pl[0]), (uint8_t*)dst, g.N * (g.K / 2), true);
@@ -1313,7 +1333,7 @@ int moew4_unrelayout_by(MoeViewFn view, const RadParam* p, int n_p, int operand,
     if (rc != RAD_OK) return rc;
     if (src_bytes != L.bytes) return RAD_E_SHAPE;
     if (v.operand == Q_BSCALE) {
-        if (moe_iq4(v.p, v.n)) return RAD_E_UNSUPPORTED;
+        if (moe_iq4(v.p, v.n) || moe_q50(v.p, v.n)) return RAD_E_UNSUPPORTED;
         std::memcpy(pl[0].data, src, (size_t)L.bytes);
         std::memcpy(pl[1].data, &kW4G64Scale, sizeof kW4G64Scale);
         return RAD_OK;
@@ -1333,6 +1353,14 @@ int moew4_unrelayout_by(MoeViewFn view, const RadParam* p, int n_p, int operand,
         for (long long nn = 0; nn < g.N; ++nn)
             moew3_row((const uint8_t*)src + nn * rb, (uint8_t*)pl[0].data + nn * rb, g.K, il, false);
         std::memcpy(pl[1].data, kW3nlTable, sizeof kW3nlTable);
+        return RAD_OK;
+    }
+    if (moe_q50(v.p, v.n)) {
+        const int64_t rb = g.K / 8 * 5;
+        std::vector<uint8_t> nib((size_t)(g.K / 2));
+        for (long long nn = 0; nn < g.N; ++nn)
+            moew5_row((const uint8_t*)src + nn * rb, (uint8_t*)pl[0].data + nn * rb, g.K,
+                      nib.data(), false);
         return RAD_OK;
     }
     moew4_permute((const uint8_t*)src, (uint8_t*)pl[0].data, g.N * (g.K / 2), false);
