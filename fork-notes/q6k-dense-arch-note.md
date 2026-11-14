@@ -67,12 +67,14 @@ so a Flash-Next container keeps the UD map's Q6_K/Q8_0 trunk planes:
 - **Q6_K** (`i6*i8[1x16]*f16[1x256]`): `gemm_nt_q`, `dtype=q6k`, `group=256`, over the input's
   bf16 plane. Views are `codes` -> `b`, `scale` -> `b_scale`, `scale.1` -> `b_ref` (operand 6);
   no activation quantiser. Row parts stay whole 16-row tiles; a column shard must be whole
-  256-value blocks. Covers the 70 fused `ssm_inz`, the 12 `attn_qg`/`attn_k`/`attn_v`/
-  `attn_output` and the shared expert's 47 `ffn_gate_up_shexp`.
+  256-value blocks. Covers the 70 source tensors fused into 35 `ssm_inz`, 12 each of
+  `attn_qg`/`attn_k`/`attn_v`/`attn_output`, the shared expert's 47 `ffn_gate_up_shexp`, and
+  `output.weight` (mapped, below).
 - **Q8_0** (`i8*f16[1x32]`): `gemm_nt_q`, `dtype=q80a16`, `group=32`, the two planes as `b` and
-  `b_scale`. Covers the 36 `ssm_out`, the 48 `ffn_down_shexp` and layer 2's Q8_0 `ssm_inz`/
-  `ffn_gate_up_shexp`. `PleLayer` also declares its key/value projections at Q8_0 (or Q6_K) when
-  the container holds those planes instead of bf16.
+  `b_scale`. Covers the 36 `ssm_out`, the 48 `ffn_down_shexp` and the PLE layer's
+  `ple_key`/`ple_value` projections. `PleLayer` also declares those projections at Q6_K (or bf16)
+  when the container holds those planes. The 96 + 1 connection `*_hc_down/up` matrices stay on
+  `hc_read`, which does not read Q8_0 (mapped, below).
 - The grouped MoE declarations are unchanged: `format_of`/`kServed` still name only the grouped
   kernels. Q6_K/Q8_0 *expert* planes remain unserved.
 
