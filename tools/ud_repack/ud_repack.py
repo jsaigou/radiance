@@ -190,6 +190,48 @@ def fingerprint(args):
     return 1 if bad else 0
 
 
+def dump(args):
+    """Write one real expert's IQ3_XXS / IQ2_S planes and the reference's f32 dequantisation.
+
+    The sample is what halo_selftest's real-block cases read: canonical plane bytes per row
+    (codes, signs, the u5 sub-scales, the f16 super-scale), the per-tensor second level, and
+    expected.bin, dequant_ref's f32 words in row-major [N, K] order. Nothing is requantised."""
+    kv, ts = load_all(args.gguf)
+    sel = re.compile(args.tensors)
+    os.makedirs(args.out, exist_ok=True)
+    for t in ts:
+        ty = t['type']
+        if ty not in ('IQ3_XXS', 'IQ2_S') or not sel.search(t['name']):
+            continue
+        K = t['shape'][0]; N = t['shape'][1]; E = t['shape'][2] if len(t['shape']) > 2 else 1
+        nb = K // 256
+        e = args.expert
+        if e >= E:
+            continue
+        raw = tensor_bytes(t).reshape(E, N, K // 256, BLOCK[ty][1])
+        blocks = np.ascontiguousarray(raw[e]).reshape(N * nb, -1)
+        pl = SPLIT[ty](blocks)
+        ref = dequant_ref(ty, blocks).reshape(N, K)
+        gname = 'iq3xxs' if ty == 'IQ3_XXS' else 'iq2s'
+        out = os.path.join(args.out, gname)
+        os.makedirs(out, exist_ok=True)
+        codes = pl['codes'].reshape(N, -1)
+        signs = pl['signs'].reshape(N, -1)
+        scales = pl['scale'].reshape(N, -1)
+        d = pl['d'].reshape(N, nb)
+        codes.tofile(os.path.join(out, 'codes.bin'))
+        signs.tofile(os.path.join(out, 'signs.bin'))
+        kq.pack_bits(scales, 5).tofile(os.path.join(out, 'scale.bin'))
+        np.ascontiguousarray(d.astype('<f2')).tofile(os.path.join(out, 'scale1.bin'))
+        np.array([0.25 if ty == 'IQ3_XXS' else 0.125], '<f4').tofile(os.path.join(out, 'scale2.bin'))
+        np.ascontiguousarray(ref, '<f4').tofile(os.path.join(out, 'expected.bin'))
+        with open(os.path.join(out, 'meta.json'), 'w') as f:
+            json.dump(dict(tensor=t['name'], type=ty, expert=e, N=int(N), K=int(K),
+                           groups=int(scales.shape[1]), codes_row=int(codes.shape[1]),
+                           signs_row=int(signs.shape[1])), f)
+        print(ty, t['name'], 'expert', e, 'N', N, 'K', K, '->', out, flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sp = ap.add_subparsers(dest='cmd', required=True)
@@ -197,8 +239,11 @@ def main():
     c = sp.add_parser('check'); c.add_argument('gguf', nargs='+'); c.add_argument('--layers'); c.add_argument('--experts', default='0')
     c.add_argument('--tensors')
     f = sp.add_parser('fingerprint'); f.add_argument('gguf', nargs='+'); f.add_argument('--tensors', required=True); f.add_argument('--variant', default='P', choices='PA')
+    d = sp.add_parser('dump'); d.add_argument('gguf', nargs='+'); d.add_argument('--tensors', default=r'ffn_(gate|up|down)_exps')
+    d.add_argument('--expert', type=int, default=0); d.add_argument('--out', required=True)
     a = ap.parse_args()
     if a.cmd == 'fingerprint': return fingerprint(a)
+    if a.cmd == 'dump': dump(a); return 0
     if a.cmd == 'plan': plan(a); return 0
     return check(a)
 

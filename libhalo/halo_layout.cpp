@@ -36,6 +36,7 @@
 
 #include "halo_plugin.h"
 #include "halo_enc.h"
+#include "halo_moe_grids.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -214,6 +215,23 @@ static bool moe_q50(const RadParam* p, int n_p) {
 static bool moe_q20(const RadParam* p, int n_p) {
     const char* d = halo_pgets(p, n_p, "dtype");
     return d && std::strcmp(d, "q20a16") == 0;
+}
+/* `iq3xxs32a16` is GGUF IQ3_XXS as stored: one u8 code a four values into llama.cpp's 256-row
+ * grid of four bytes, a sign byte an eight values, a u5 sub-scale (2ls+1) a 32 of K and an f16 d
+ * a 256 under the per-tensor 1/4; unrotated, bf16 activations. The kernel's row is the libquant
+ * codes plane then its signs plane, and the grid is the kernel's constant (halo_moe_grids.h),
+ * which the relayout checks the container's plane against. */
+static bool moe_iq3(const RadParam* p, int n_p) {
+    const char* d = halo_pgets(p, n_p, "dtype");
+    return d && std::strcmp(d, "iq3xxs32a16") == 0;
+}
+/* `iq2s32a16` is GGUF IQ2_S as stored: one u10 code an eight values into llama.cpp's 1024-row
+ * grid, sign bytes as IQ3_XXS, a u5 sub-scale (2ls+1) a 16 of K and an f16 d a 256 under the
+ * per-tensor 1/8. A row is the 10-bit codes plane then the signs plane. The name keeps the
+ * kernel's three launcher forms consistent (`iq2s32a16`); its sub-scale group is 16. */
+static bool moe_iq2(const RadParam* p, int n_p) {
+    const char* d = halo_pgets(p, n_p, "dtype");
+    return d && std::strcmp(d, "iq2s32a16") == 0;
 }
 /* `w5nl64a8h` is w4nl64a8h at five bits: `u5*fp8_e4m3[1x64]*f32[*x*]/fwht128`, codes indexing
  * libquant's 32-entry `table=w5nl`. Its codes view relays each row into HALO_DT_MOEW5 (the low four
@@ -1017,6 +1035,64 @@ extern "C" int halo_rad_relayout_mxfp4_gated(const RadParam* p, int n_p, int ope
  * low and element b+4 high), and the fp8 plane is the canonical one unchanged. `w4a8h` is the same
  * plane with the weight Hadamard-rotated per group, accepted only from an encoding that says so. */
 namespace {
+
+/* IQ3_XXS's and IQ2_S's canonical encodings, plane for plane as libquant writes them. The grid
+ * table is fixed by the format; the relayout compares the container's copy with the kernel's
+ * (halo_moe_grids.h) before serving it, as IQ4_NL's table is. */
+bool moe_iq_grid_plane(const RadEncoding* e, int rows) {
+    const int g = rad_enc_find(e, "grid");
+    return g >= 0 && e->plane[g].kind == RAD_PLANE_TABLE && e->plane[g].dtype == RAD_U8 &&
+           e->plane[g].extent[0] == rows && e->plane[g].extent[1] == (rows == 256 ? 4 : 8);
+}
+bool moe_iq_scale_planes(const RadEncoding* e, int64_t group) {
+    const int s  = rad_enc_find(e, "scale");
+    const int s1 = rad_enc_find(e, "scale.1");
+    const int s2 = rad_enc_find(e, "scale.2");
+    return s >= 0 && e->plane[s].kind == RAD_PLANE_TILED && e->plane[s].dtype == RAD_U5 &&
+           e->plane[s].block[0] == 1 && e->plane[s].block[1] == group &&
+           s1 >= 0 && e->plane[s1].kind == RAD_PLANE_TILED && e->plane[s1].dtype == RAD_F16 &&
+           e->plane[s1].block[0] == 1 && e->plane[s1].block[1] == 256 &&
+           s2 >= 0 && e->plane[s2].kind == RAD_PLANE_TILED && e->plane[s2].dtype == RAD_F32 &&
+           e->plane[s2].block[0] == 0 && e->plane[s2].block[1] == 0;
+}
+bool moe_iq3_enc(const RadEncoding* e) {
+    if (!e || !rad_enc_is(e, "affine") || e->transform[0] || e->n_planes != 6) return false;
+    if (e->plane[0].dtype != RAD_U8 || e->plane[0].block[0] != 1 || e->plane[0].block[1] != 4)
+        return false;
+    const int sg = rad_enc_find(e, "signs");
+    return sg >= 0 && e->plane[sg].kind == RAD_PLANE_TILED && e->plane[sg].dtype == RAD_U1 &&
+           e->plane[sg].block[0] == 1 && e->plane[sg].block[1] == 1 &&
+           moe_iq_grid_plane(e, 256) && moe_iq_scale_planes(e, 32);
+}
+bool moe_iq2_enc(const RadEncoding* e) {
+    if (!e || !rad_enc_is(e, "affine") || e->transform[0] || e->n_planes != 6) return false;
+    if (e->plane[0].dtype != RAD_U10 || e->plane[0].block[0] != 1 || e->plane[0].block[1] != 8)
+        return false;
+    const int sg = rad_enc_find(e, "signs");
+    return sg >= 0 && e->plane[sg].kind == RAD_PLANE_TILED && e->plane[sg].dtype == RAD_U1 &&
+           e->plane[sg].block[0] == 1 && e->plane[sg].block[1] == 1 &&
+           moe_iq_grid_plane(e, 1024) && moe_iq_scale_planes(e, 16);
+}
+
+/* The three selected planes, in the order the arch declares them. */
+bool moe_iq3_sel(const RadEncoding* e, const int* sel, int n, const char* a, const char* b,
+                 const char* c) {
+    return n == 3 && halo_enc::role(e, sel, 0) && halo_enc::role(e, sel, 1) &&
+           halo_enc::role(e, sel, 2) && !std::strcmp(halo_enc::role(e, sel, 0), a) &&
+           !std::strcmp(halo_enc::role(e, sel, 1), b) &&
+           !std::strcmp(halo_enc::role(e, sel, 2), c);
+}
+bool moe_iq_grid_is_kernels(const RadTensor& t, bool iq3) {
+    return t.data && std::memcmp(t.data, iq3 ? (const void*)kIq3XxsGrid : (const void*)kIq2SGrid,
+                                 iq3 ? sizeof kIq3XxsGrid : sizeof kIq2SGrid) == 0;
+}
+bool moe_iq_s2_is_kernels(const RadTensor& t, bool iq3) {
+    if (!t.data) return false;
+    float v = 0.0f;
+    std::memcpy(&v, t.data, sizeof v);
+    return v == (iq3 ? 0.25f : 0.125f);
+}
+
 int moew4_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
                      const int* sel, const RadTensor* pl, int n, RadLayout* out, WGeom* gout) {
     if (!out || !pl) return RAD_E_INVAL;
@@ -1030,16 +1106,21 @@ int moew4_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding*
     const bool w5 = moe_w5(p, n_p);
     const bool w3 = moe_w3(p, n_p);
     const bool iq4 = moe_iq4(p, n_p);
+    const bool iq3 = moe_iq3(p, n_p);
+    const bool iq2 = moe_iq2(p, n_p);
     const bool q50 = moe_q50(p, n_p);
     const bool q20 = moe_q20(p, n_p);
     const int  g64 = moe_w4_g64(p, n_p);             /* scale groups a 128 of K, or 0 */
+    if ((iq3 || iq2) && g.K % 256) return RAD_E_SHAPE; /* a super-block is 256 values */
     if ((iq4 || q50) && g.K % 32) return RAD_E_SHAPE; /* an f16 scale per 32 of K */
     if (q20 && g.K % 64) return RAD_E_SHAPE;          /* an f16 scale per 64 of K */
     if ((w5 || w3) && g.K % 32) return RAD_E_SHAPE;   /* a sign word is 32 elements */
     /* The 3-bit rows hold 48 bytes per 128 of K (interleaved) and the GEMM refuses any other K, so a
      * K that is not whole 128s would have moew3_row write past the K/8*3-byte row. */
     if (w3 && g.K % 128) return RAD_E_SHAPE;
-    if (q20 ? !halo_enc::affine(enc, RAD_U2, RAD_F16, 1, 64)
+    if (iq3 ? !moe_iq3_enc(enc)
+       : iq2 ? !moe_iq2_enc(enc)
+       : q20 ? !halo_enc::affine(enc, RAD_U2, RAD_F16, 1, 64)
        : q50 ? !halo_enc::affine(enc, RAD_I5, RAD_F16, 1, 32)
        : iq4 ? !halo_enc::affine_table(enc, RAD_U4, RAD_F16, 1, 32, RAD_I8, 16, "")
        : g64 ? !halo_enc::affine_table2(enc, w3 ? RAD_U3 : w5 ? RAD_U5 : RAD_U4, RAD_F8E4M3, 1,
@@ -1049,6 +1130,19 @@ int moew4_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding*
         return RAD_E_DTYPE;
     if (gout) *gout = g;
     if (operand == Q_BSCALE) {
+        if (iq3 || iq2) {
+            const int64_t grp = iq3 ? 32 : 16;
+            if (!moe_iq3_sel(enc, sel, n, "scale", "scale.1", "scale.2") ||
+                !dims(pl[0], g.N, g.K / grp) || !dims(pl[1], g.N, g.K / 256) ||
+                !dims(pl[2], 1, 1))
+                return RAD_E_SHAPE;
+            /* The relayout's row: 8 bytes an 128 block (f16 d and four or eight four-bit
+             * log2 sub-scales). The view's element count is the caller's; the bytes are the
+             * kernel's. */
+            fill(out, iq3 ? "halo.moeiq3xxs.s.g128" : "halo.moeiq2s.s.g128", RAD_F16, g.N,
+                 g.K / 32, g.N * (g.K / 16));
+            return RAD_OK;
+        }
         if (iq4 || q50 || q20) {
             if (!selects(enc, sel, n, "scale") ||
                 !dims(pl[0], g.N, g.K / (q20 ? 64 : 32)))
@@ -1067,6 +1161,17 @@ int moew4_enc_layout(const RadParam* p, int n_p, int operand, const RadEncoding*
         return RAD_E_UNSUPPORTED;                    /* bf16 a row a group, as it is */
     }
     if (operand != Q_B) return RAD_E_UNSUPPORTED;
+    if (iq3 || iq2) {
+        if (!moe_iq3_sel(enc, sel, n, "codes", "signs", "grid") ||
+            !dims(pl[0], g.N, g.K / (iq3 ? 4 : 8)) || !dims(pl[1], g.N, g.K) ||
+            pl[2].rank != 2 || pl[2].shape[0] != (iq3 ? 256 : 1024) ||
+            pl[2].shape[1] != (iq3 ? 4 : 8))
+            return RAD_E_SHAPE;
+        const int64_t rb = iq3 ? g.K * 3 / 8 : g.K * 9 / 32;
+        fill(out, iq3 ? "halo.moeiq3xxs.w.g256" : "halo.moeiq2s.w.g256",
+             iq3 ? HALO_DT_MOEIQ3 : HALO_DT_MOEIQ2, g.N, g.K, g.N * rb);
+        return RAD_OK;
+    }
     if (iq4) {
         if (!selects(enc, sel, n, "codes", "table") || !dims(pl[1], 1, 16))
             return RAD_E_SHAPE;
@@ -1299,6 +1404,30 @@ int moew4_relayout_by(MoeViewFn view, const RadParam* p, int n_p, int operand,
     if (rc == RAD_OK) rc = moew4_enc_layout(v.p, v.n, v.operand, enc, sel, pl, n, &L, &g);
     if (rc != RAD_OK) return rc;
     if (dst_bytes != L.bytes) return RAD_E_SHAPE;
+    if (v.operand == Q_BSCALE && (moe_iq3(v.p, v.n) || moe_iq2(v.p, v.n))) {
+        const bool iq3 = moe_iq3(v.p, v.n);
+        const int64_t ksub = iq3 ? 4 : 8, nb = g.K / 128;
+        const int64_t srow = rad_enc_row_bytes(pl[0].dtype, pl[0].shape[1]);
+        const int64_t drow = rad_enc_row_bytes(pl[1].dtype, pl[1].shape[1]);
+        for (long long nn = 0; nn < g.N; ++nn) {
+            const uint8_t* sp = pdata(pl[0]) + nn * srow;
+            const uint8_t* dp = pdata(pl[1]) + nn * drow;
+            uint8_t* orow = (uint8_t*)dst + nn * (nb * 8);
+            for (int64_t b = 0; b < nb; ++b) {
+                uint16_t dbits = 0;
+                std::memcpy(&dbits, dp + 2 * (b / 2), sizeof dbits);
+                uint64_t w = dbits;
+                for (int64_t q = 0; q < ksub; ++q) {
+                    const float v = rad_load_f32(sp, RAD_U5, b * ksub + q);
+                    const int lv = (int)v;
+                    if (lv < 1 || lv > 31 || !(lv & 1)) return RAD_E_DTYPE;
+                    w |= (uint64_t)((lv - 1) >> 1) << (16 + 4 * q);
+                }
+                std::memcpy(orow + b * 8, &w, sizeof w);
+            }
+        }
+        return RAD_OK;
+    }
     if (v.operand == Q_BSCALE) {                     /* g64 forms: the second level is fixed */
         if (moe_iq4(v.p, v.n) || moe_q50(v.p, v.n) || moe_q20(v.p, v.n))
             return RAD_E_UNSUPPORTED;                /* f16 per 32 or 64, stored as it is */
@@ -1306,6 +1435,19 @@ int moew4_relayout_by(MoeViewFn view, const RadParam* p, int n_p, int operand,
         std::memcpy(&s2, pdata(pl[1]), sizeof s2);
         if (s2 != kW4G64Scale) return RAD_E_DTYPE;
         std::memcpy(dst, pdata(pl[0]), (size_t)L.bytes);
+        return RAD_OK;
+    }
+    if (moe_iq3(v.p, v.n) || moe_iq2(v.p, v.n)) {
+        const bool iq3 = moe_iq3(v.p, v.n);
+        if (!moe_iq_grid_is_kernels(pl[2], iq3)) return RAD_E_DTYPE;
+        const int64_t cb = rad_enc_row_bytes(pl[0].dtype, pl[0].shape[1]);
+        const int64_t sb = rad_enc_row_bytes(pl[1].dtype, pl[1].shape[1]);
+        if (cb + sb != L.bytes / g.N) return RAD_E_SHAPE;
+        for (long long nn = 0; nn < g.N; ++nn) {
+            uint8_t* orow = (uint8_t*)dst + nn * (cb + sb);
+            std::memcpy(orow, pdata(pl[0]) + nn * cb, (size_t)cb);
+            std::memcpy(orow + cb, pdata(pl[1]) + nn * sb, (size_t)sb);
+        }
         return RAD_OK;
     }
     if (moe_w5(v.p, v.n)) {
@@ -1347,10 +1489,49 @@ int moew4_unrelayout_by(MoeViewFn view, const RadParam* p, int n_p, int operand,
     if (rc == RAD_OK) rc = moew4_enc_layout(v.p, v.n, v.operand, enc, sel, pl, n, &L, &g);
     if (rc != RAD_OK) return rc;
     if (src_bytes != L.bytes) return RAD_E_SHAPE;
+    if (v.operand == Q_BSCALE && (moe_iq3(v.p, v.n) || moe_iq2(v.p, v.n))) {
+        const bool iq3 = moe_iq3(v.p, v.n);
+        const int64_t ksub = iq3 ? 4 : 8, nb = g.K / 128;
+        const int64_t srow = rad_enc_row_bytes(pl[0].dtype, pl[0].shape[1]);
+        const int64_t drow = rad_enc_row_bytes(pl[1].dtype, pl[1].shape[1]);
+        for (long long nn = 0; nn < g.N; ++nn) {
+            uint8_t* sp = (uint8_t*)pl[0].data + nn * srow;
+            uint8_t* dp = (uint8_t*)pl[1].data + nn * drow;
+            const uint8_t* irow = (const uint8_t*)src + nn * (nb * 8);
+            for (int64_t b = 0; b < nb; ++b) {
+                uint64_t w = 0;
+                std::memcpy(&w, irow + b * 8, sizeof w);
+                if ((b & 1) && (uint16_t)(w & 0xFFFFu) != ((const uint16_t*)dp)[b / 2])
+                    return RAD_E_DTYPE;
+                ((uint16_t*)dp)[b / 2] = (uint16_t)(w & 0xFFFFu);
+                for (int64_t q = 0; q < ksub; ++q) {
+                    const int lv = 2 * (int)((w >> (16 + 4 * q)) & 0xFu) + 1;
+                    rad_store_code(sp, RAD_U5, b * ksub + q, lv);
+                }
+            }
+        }
+        const float fac = iq3 ? 0.25f : 0.125f;
+        std::memcpy(pl[2].data, &fac, sizeof fac);
+        return RAD_OK;
+    }
     if (v.operand == Q_BSCALE) {
         if (moe_iq4(v.p, v.n) || moe_q50(v.p, v.n)) return RAD_E_UNSUPPORTED;
         std::memcpy(pl[0].data, src, (size_t)L.bytes);
         std::memcpy(pl[1].data, &kW4G64Scale, sizeof kW4G64Scale);
+        return RAD_OK;
+    }
+    if (moe_iq3(v.p, v.n) || moe_iq2(v.p, v.n)) {
+        const bool iq3 = moe_iq3(v.p, v.n);
+        const int64_t cb = rad_enc_row_bytes(pl[0].dtype, pl[0].shape[1]);
+        const int64_t sb = rad_enc_row_bytes(pl[1].dtype, pl[1].shape[1]);
+        if (cb + sb != L.bytes / g.N) return RAD_E_SHAPE;
+        for (long long nn = 0; nn < g.N; ++nn) {
+            const uint8_t* irow = (const uint8_t*)src + nn * (cb + sb);
+            std::memcpy((uint8_t*)pl[0].data + nn * cb, irow, (size_t)cb);
+            std::memcpy((uint8_t*)pl[1].data + nn * sb, irow + cb, (size_t)sb);
+        }
+        std::memcpy(pl[2].data, iq3 ? (const void*)kIq3XxsGrid : (const void*)kIq2SGrid,
+                    iq3 ? sizeof kIq3XxsGrid : sizeof kIq2SGrid);
         return RAD_OK;
     }
     if (moe_w5(v.p, v.n)) {

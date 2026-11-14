@@ -4645,7 +4645,8 @@ static const RadConstraint cMoeMx[] = {
 static const RadConstraint cMoeGemmW4[] = {
     C_GE("M", 1), C_DIV("N", 64), C_DIV("K", 128), C_GE("n_expert", 1), C_LE("n_expert", 65536),
     C_GE("top_k", 1), C_EQ("group", 128),
-    C_IN("dtype", "w4a8 w4a8h w4nla8h w4nl64a8h w4nl32a8h w5nl64a8h w3nl64a8h iq4nl32a16 q50a16 q20a16"),
+    C_IN("dtype", "w4a8 w4a8h w4nla8h w4nl64a8h w4nl32a8h w5nl64a8h w3nl64a8h iq4nl32a16 "
+                  "iq3xxs32a16 iq2s32a16 q50a16 q20a16"),
 };
 /* The bf16 expert GEMM: 64-wide column tiles and 64-deep K passes, one table, no group. */
 static const RadConstraint cMoeGemmBf16[] = {
@@ -8161,7 +8162,11 @@ HALO_WIN_PAIR(512, 1) HALO_WIN_PAIR(512, 2) HALO_WIN_PAIR(512, 4) HALO_WIN_PAIR(
   "w4a8h with the codes indexing libquant's w4nl levels, and w4nl64a8h / w4nl32a8h are w4nla8h "
   "with an E4M3 scale per row per 64 / 32 of K under a fixed 2^-13; w5nl64a8h is w4nl64a8h with "
   "five-bit codes into libquant's w5nl levels, a sign bit plane after each row's nibbles; w3nl64a8h "
-  "is the same at three bits (libquant's w3nl levels, a two-bit magnitude plane and the sign plane)",
+  "is the same at three bits (libquant's w3nl levels, a two-bit magnitude plane and the sign plane); "
+  "iq3xxs32a16 is GGUF IQ3_XXS as stored (u8 grid codes, sign bytes, a u5 sub-scale a 32 of K and "
+  "an f16 d a 256 under the per-tensor 1/4) and iq2s32a16 GGUF IQ2_S (u10 grid codes into the "
+  "1024-row grid, the same signs, a u5 sub-scale a 16 of K under 1/8), both unrotated with bf16 "
+  "activations",
   RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
   ROW(cMoeGemmW4), NOTUNE,
   /* No shape function: the weight is a plugin-private packed plane whose byte count

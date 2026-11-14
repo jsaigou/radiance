@@ -39,6 +39,7 @@
 #include "rad_abi.h"
 #include "rad_plugin.h"
 #include "halo_args.h"
+#include "halo_moe_grids.h"
 #include "halo_ar_shards.h"
 #include "halo_ar_links.h"
 #include "halo_hc_fp8.h"
@@ -2286,6 +2287,93 @@ static Planes iq4nl_planes(const std::vector<float>& w, int64_t N, int64_t K) {
                 rad_store_code(p.data[0].data() + n * crow, RAD_U4, g * 32 + j, best);
             }
         }
+    return p;
+}
+
+/* IQ3_XXS as libquant stores it: u8 grid codes (four values a code), the grid table, u1 signs,
+ * a u5 sub-scale of 2ls+1 a 32 of K, an f16 d a 256 and the per-tensor 1/4. The codes and signs
+ * are arbitrary (the decode is what is under test); d and the sub-scales are f16/u5 exact. */
+static Planes iq3xxs_planes(const std::vector<float>& w, int64_t N, int64_t K) {
+    (void)w;
+    Planes p;
+    rad_enc_clear(&p.enc);
+    rad_enc_copy_str(p.enc.scheme, "affine");
+    rad_enc_add_plane(&p.enc, "codes", RAD_U8, 1, 4);
+    rad_enc_add_table(&p.enc, "grid", RAD_U8, 256, 4);
+    rad_enc_add_plane(&p.enc, "signs", RAD_U1, 1, 1);
+    rad_enc_add_plane(&p.enc, "scale", RAD_U5, 1, 32);
+    rad_enc_add_plane(&p.enc, "scale.1", RAD_F16, 1, 256);
+    rad_enc_add_plane(&p.enc, "scale.2", RAD_F32, 0, 0);
+    p.size(N, K);
+    std::memcpy(p.data[1].data(), kIq3XxsGrid, sizeof kIq3XxsGrid);
+    const float fac = 0.25f;
+    std::memcpy(p.data[5].data(), &fac, sizeof fac);
+    const int64_t crow = p.row_bytes(0), srow = p.row_bytes(2), qrow = p.row_bytes(3),
+                  drow = p.row_bytes(4);
+    for (int64_t n = 0; n < N; ++n) {
+        uint8_t* cr = p.data[0].data() + n * crow;
+        uint8_t* sr = p.data[2].data() + n * srow;
+        uint8_t* qr = p.data[3].data() + n * qrow;
+        uint8_t* dr = p.data[4].data() + n * drow;
+        for (int64_t b = 0; b < K / 256; ++b) {
+            const float d = 0.0625f * (float)(1 + (int)((n + b) % 7));
+            rad_store_f32(dr, RAD_F16, b, d);
+        }
+        for (int64_t g = 0; g < K / 32; ++g) {
+            rad_store_code(qr, RAD_U5, g, 2 * (int)((n * 7 + g * 3) & 15) + 1);
+            for (int64_t c = 0; c < 8; ++c)
+                rad_store_code(cr, RAD_U8, g * 8 + c, (int)((n * 13 + g * 29 + c * 7) & 255));
+            for (int64_t l = 0; l < 4; ++l) {
+                const uint32_t sb = (uint32_t)((n * 5 + g * 11 + l * 37) & 255);
+                for (int64_t j = 0; j < 8; ++j)
+                    rad_store_code(sr, RAD_U1, g * 32 + l * 8 + j, (int)((sb >> j) & 1u));
+            }
+        }
+    }
+    return p;
+}
+
+/* IQ2_S as libquant stores it: u10 grid codes (eight values a code), the 1024-row grid, u1
+ * signs, two u5 sub-scales of 2ls+1 a 16 of K, an f16 d a 256 and the per-tensor 1/8. */
+static Planes iq2s_planes(const std::vector<float>& w, int64_t N, int64_t K) {
+    (void)w;
+    Planes p;
+    rad_enc_clear(&p.enc);
+    rad_enc_copy_str(p.enc.scheme, "affine");
+    rad_enc_add_plane(&p.enc, "codes", RAD_U10, 1, 8);
+    rad_enc_add_table(&p.enc, "grid", RAD_U8, 1024, 8);
+    rad_enc_add_plane(&p.enc, "signs", RAD_U1, 1, 1);
+    rad_enc_add_plane(&p.enc, "scale", RAD_U5, 1, 16);
+    rad_enc_add_plane(&p.enc, "scale.1", RAD_F16, 1, 256);
+    rad_enc_add_plane(&p.enc, "scale.2", RAD_F32, 0, 0);
+    p.size(N, K);
+    std::memcpy(p.data[1].data(), kIq2SGrid, sizeof kIq2SGrid);
+    const float fac = 0.125f;
+    std::memcpy(p.data[5].data(), &fac, sizeof fac);
+    const int64_t crow = p.row_bytes(0), srow = p.row_bytes(2), qrow = p.row_bytes(3),
+                  drow = p.row_bytes(4);
+    for (int64_t n = 0; n < N; ++n) {
+        uint8_t* cr = p.data[0].data() + n * crow;
+        uint8_t* sr = p.data[2].data() + n * srow;
+        uint8_t* qr = p.data[3].data() + n * qrow;
+        uint8_t* dr = p.data[4].data() + n * drow;
+        for (int64_t b = 0; b < K / 256; ++b) {
+            const float d = 0.03125f * (float)(1 + (int)((n + b) % 5));
+            rad_store_f32(dr, RAD_F16, b, d);
+        }
+        for (int64_t g = 0; g < K / 32; ++g) {
+            for (int64_t q = 0; q < 2; ++q)
+                rad_store_code(qr, RAD_U5, g * 2 + q, 2 * (int)((n * 3 + g * 5 + q) & 15) + 1);
+            for (int64_t c = 0; c < 4; ++c)
+                rad_store_code(cr, RAD_U10, g * 4 + c,
+                               (int)((n * 97 + g * 131 + c * 17) & 1023));
+            for (int64_t l = 0; l < 4; ++l) {
+                const uint32_t sb = (uint32_t)((n * 29 + g * 7 + l * 43) & 255);
+                for (int64_t j = 0; j < 8; ++j)
+                    rad_store_code(sr, RAD_U1, g * 32 + l * 8 + j, (int)((sb >> j) & 1u));
+            }
+        }
+    }
     return p;
 }
 
@@ -23355,6 +23443,315 @@ static void moe_iq4_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, int
     }
 }
 
+/* IQ3_XXS and IQ2_S (u8/u10 grid codes, sign bytes, a u5 sub-scale and an f16 d) against a host
+ * decode of the same planes, over every launcher form and both bands. Both are unrotated with bf16
+ * activations: the codes view joins signs and grid (the relayout checks the grid) and the scale
+ * view joins the sub-scales, d and the per-tensor factor. */
+static void moe_iq_grid_gemm(const Plugin& pl, int64_t Tr, const MoeW4Shape& sh, bool iq3,
+                             const Planes* realp = nullptr,
+                             const std::vector<float>* exp = nullptr) {
+    const RadKernelInfo* r = find(pl, "moe_gemm_w4a8");
+    const std::string what = std::string("moe_gemm_w4a8 ") + (iq3 ? "iq3xxs32a16" : "iq2s32a16") +
+                             " vs a host decode (T=" + std::to_string(Tr) + ", " + sh.name + ")";
+    if (!r || !r->layout || !r->relayout) { ok(what.c_str(), false, "row or hooks absent"); return; }
+
+    const int64_t ne = sh.ne, group = 128, top_k = 2;
+    const int64_t Nc[2] = { sh.N0, sh.N1 }, Kc[2] = { sh.K0, sh.K1 };
+    const int64_t nec[2] = { (ne + 1) / 2, ne / 2 };
+    const int64_t N = std::max(sh.N0, sh.N1), K = std::max(sh.K0, sh.K1);
+    const int64_t M = sh.sorted_a ? Tr : Tr / top_k;
+    const char* aord = sh.sorted_a ? "sorted" : "token";
+    const int64_t fy = N / sh.parts;
+    const char* dt = iq3 ? "iq3xxs32a16" : "iq2s32a16";
+    const int64_t gsz = iq3 ? 32 : 16;
+    std::vector<RadParam> lp = { PI("N", sh.N0), PI("K", sh.K0), PI("N_odd", sh.N1),
+                                 PI("K_odd", sh.K1), PI("group", group), PS("dtype", dt) };
+
+    std::vector<uint8_t>  wq[2];
+    std::vector<uint16_t> ws[2];
+    std::vector<Planes>   cp[2];
+    for (int c = 0; c < 2; ++c) {
+        const int ow = c ? 6 : 2, os = c ? 7 : 3;
+        const int64_t wbytes = iq3 ? Nc[c] * Kc[c] * 3 / 8 : Nc[c] * Kc[c] * 9 / 32;
+        const int64_t sbytes = Nc[c] * (Kc[c] / 16);
+        wq[c].assign((size_t)(nec[c] * wbytes), 0);
+        ws[c].assign((size_t)(nec[c] * Nc[c] * (Kc[c] / 16)), 0);
+        std::vector<float> wsrc((size_t)(Nc[c] * Kc[c]), 0.0f);
+        for (int64_t x = 0; x < nec[c]; ++x) {
+            cp[c].push_back(realp ? *realp
+                                  : iq3 ? iq3xxs_planes(wsrc, Nc[c], Kc[c])
+                                        : iq2s_planes(wsrc, Nc[c], Kc[c]));
+            std::vector<uint8_t> w, sc;
+            const int rw = stored(r, lp, ow, cp[c].back(), { "codes", "signs", "grid" }, &w);
+            const int rs = stored(r, lp, os, cp[c].back(), { "scale", "scale.1", "scale.2" }, &sc);
+            if (rw != RAD_OK || rs != RAD_OK) {
+                ok(what.c_str(), false,
+                   "layout rc " + std::to_string(rw) + "/" + std::to_string(rs));
+                return;
+            }
+            if ((int64_t)w.size() != wbytes || (int64_t)sc.size() != sbytes) {
+                ok(what.c_str(), false, "stored byte counts do not match the format's planes");
+                return;
+            }
+            std::memcpy(wq[c].data() + (size_t)(x * wbytes), w.data(), w.size());
+            std::memcpy((uint8_t*)ws[c].data() + (size_t)x * sc.size(), sc.data(), sc.size());
+        }
+    }
+
+    std::vector<uint16_t> aq((size_t)(M * K));
+    for (int64_t m = 0; m < M; ++m)
+        for (int64_t k = 0; k < K; ++k)
+            aq[(size_t)(m * K + k)] =
+                h_to_bf16((float)(((m * 17 + k * 5) % 97) - 48) * 0.25f);
+
+    std::vector<int32_t> off((size_t)(ne + 1), 0), sorted((size_t)Tr, -1);
+    const int64_t live = Tr - 3;
+    for (int64_t e = 0; e <= ne; ++e) off[(size_t)e] = (int32_t)((live * e) / ne);
+    off[(size_t)ne] = (int32_t)live;
+    for (int64_t i = 0; i < live; ++i) sorted[(size_t)i] = (int32_t)((i * 7 + 3) % Tr);
+
+    void* d_a     = dalloc(aq.size() * 2);
+    void* d_w[2]  = { dalloc(wq[0].size()), dalloc(wq[1].size()) };
+    void* d_ws[2] = { dalloc(ws[0].size() * 2), dalloc(ws[1].size() * 2) };
+    void* d_s     = dalloc(sorted.size() * 4);
+    void* d_o     = dalloc(off.size() * 4);
+    void* d_y     = dalloc((size_t)(Tr * N * 2));
+    st_memcpy(d_a, aq.data(), aq.size() * 2, hipMemcpyHostToDevice);
+    for (int c = 0; c < 2; ++c) {
+        st_memcpy(d_w[c],  wq[c].data(), wq[c].size(),     hipMemcpyHostToDevice);
+        st_memcpy(d_ws[c], ws[c].data(), ws[c].size() * 2, hipMemcpyHostToDevice);
+    }
+    st_memcpy(d_s, sorted.data(), sorted.size() * 4, hipMemcpyHostToDevice);
+    st_memcpy(d_o, off.data(),    off.size() * 4,    hipMemcpyHostToDevice);
+    {
+        std::vector<uint16_t> junk((size_t)(Tr * N), 0x7f7fu);
+        st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
+    }
+
+    std::vector<RadTensor> ts = {
+        T(d_a,     RAD_BF16,     { M, K }),
+        T(nullptr, RAD_F32,      { 1, 1 }),
+        T(d_w[0],  iq3 ? (uint32_t)HALO_DT_MOEIQ3 : (uint32_t)HALO_DT_MOEIQ2,
+                  { nec[0], sh.N0, sh.K0 }),
+        T(d_ws[0], RAD_F16,      { nec[0], sh.N0, sh.K0 / 32 }),
+        T(d_s,     RAD_I32,      { Tr }),
+        T(d_o,     RAD_I32,      { ne + 1 }),
+        T(d_w[1],  iq3 ? (uint32_t)HALO_DT_MOEIQ3 : (uint32_t)HALO_DT_MOEIQ2,
+                  { nec[1], sh.N1, sh.K1 }),
+        T(d_ws[1], RAD_F16,      { nec[1], sh.N1, sh.K1 / 32 }),
+        T(d_y,     RAD_BF16,     { Tr, N }),
+    };
+    std::vector<RadParam> ps = {
+        PI("M", M), PI("N", sh.N0), PI("K", sh.K0), PI("N_odd", sh.N1), PI("K_odd", sh.K1),
+        PI("parts", sh.parts), PI("n_expert", ne), PI("top_k", top_k), PI("group", group),
+        PS("a_order", aord), PS("dtype", dt),
+    };
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    const int64_t map_bytes = (1 + 2 * (ne + Tr / 16 + 2)) * 4;
+    void* d_map = dalloc((size_t)map_bytes);
+
+    /* The host decode reads a code's grid row directly: IQ3_XXS has one code a four values and
+     * IQ2_S one an eight, and a sign byte an eight values, so value k's code is k/4 or k/8 and its
+     * sign is bit k%8 of sign byte k/8. Each sub-scale's K group is summed before the fold, as
+     * the kernel does. */
+    std::vector<double> ref((size_t)(Tr * N), 0.0);
+    for (int64_t i = 0; i < Tr; ++i) {
+        const int32_t f = sorted[(size_t)i];
+        int64_t e = 0;
+        while (e + 1 < ne && off[(size_t)(e + 1)] <= i) ++e;
+        const int c = (int)(e & 1);
+        const int64_t x = e / 2, fc = Nc[c] / sh.parts;
+        for (int64_t n = 0; n < N; ++n) {
+            double want = 0.0;
+            const int64_t pp = n / fy, j = n - pp * fy;
+            if (f >= 0 && i < live && j < fc) {
+                const int64_t tok = sh.sorted_a ? i : f / top_k, wr = pp * fc + j;
+                const Planes& q = cp[c][(size_t)x];
+                if (exp) {
+                    const int64_t kk = Kc[c];
+                    for (int64_t k = 0; k < kk; ++k)
+                        want += (double)(*exp)[(size_t)(wr * kk + k)] *
+                                (double)h_bf16(aq[(size_t)(tok * K + k)]);
+                } else {
+                const int64_t cw = iq3 ? 4 : 8;
+                const int64_t crow = q.row_bytes(0), srow = q.row_bytes(2), qrow = q.row_bytes(3),
+                              drow = q.row_bytes(4);
+                const uint8_t* cr = q.data[0].data() + wr * crow;
+                const uint8_t* sr = q.data[2].data() + wr * srow;
+                const uint8_t* qr = q.data[3].data() + wr * qrow;
+                const uint8_t* dr = q.data[4].data() + wr * drow;
+                const uint32_t cdt = q.enc.plane[0].dtype;
+                const float fac = iq3 ? 0.25f : 0.125f;
+                for (int64_t k0 = 0; k0 < Kc[c]; k0 += gsz) {
+                    double part = 0.0;
+                    for (int64_t k = k0; k < k0 + gsz; ++k) {
+                        const int64_t code = (int64_t)rad_load_f32(cr, cdt, k / cw);
+                        const uint8_t* gw = q.data[1].data() + code * cw;
+                        const double val = (double)gw[k % cw];
+                        const double sign = ((sr[k / 8] >> (k % 8)) & 1u) ? -1.0 : 1.0;
+                        part += val * sign * (double)h_bf16(aq[(size_t)(tok * K + k)]);
+                    }
+                    const int64_t si = k0 / gsz;
+                    const double sub = (double)rad_load_f32(qr, RAD_U5, si);
+                    const double d = (double)rad_load_f32(dr, RAD_F16, k0 / 256);
+                    want += part * sub * d * (double)fac;
+                }
+                }
+            }
+            ref[(size_t)(i * N + n)] = want;
+        }
+    }
+
+    static const char* const kForm[] = { "rule", "aligned prefill form", "decode form",
+                                         "uniform prefill grid" };
+    const int f_lo = pl.pin_moe ? 1 : 0, f_hi = pl.pin_moe ? 3 : 0;
+    for (int form = f_lo; form <= f_hi; ++form) {
+        const std::string label = what + " " + kForm[form];
+        if (pl.pin_moe) pl.pin_moe(form);
+        {
+            std::vector<uint16_t> junk((size_t)(Tr * N), 0x7f7fu);
+            st_memcpy(d_y, junk.data(), junk.size() * 2, hipMemcpyHostToDevice);
+        }
+        a.scratch = form == 3 ? nullptr : d_map;
+        a.scratch_bytes = form == 3 ? 0 : map_bytes;
+        const int rc = r->launch(&a, nullptr);
+        st_stream_sync(nullptr);
+        if (pl.pin_moe) pl.pin_moe(0);
+        if (rc != RAD_OK) { ok(label.c_str(), false, "launch rc=" + std::to_string(rc)); continue; }
+
+        std::vector<uint16_t> got((size_t)(Tr * N));
+        st_memcpy(got.data(), d_y, got.size() * 2, hipMemcpyDeviceToHost);
+        double worst = 0.0;
+        int64_t bad = 0;
+        std::string first;
+        for (int64_t i = 0; i < Tr; ++i)
+            for (int64_t n = 0; n < N; ++n) {
+                const double want = ref[(size_t)(i * N + n)];
+                const uint32_t u = (uint32_t)got[(size_t)(i * N + n)] << 16;
+                float gf;
+                std::memcpy(&gf, &u, 4);
+                const double err = std::fabs((double)gf - want);
+                if (!(err <= 0.004 * std::fabs(want) + 1e-4)) {
+                    if (!bad++)
+                        first = ", first at row " + std::to_string(i) + " col " +
+                                std::to_string(n) + ": " + std::to_string(gf) + " for " +
+                                std::to_string(want);
+                    if (!(err <= worst)) worst = err;
+                }
+            }
+        ok(label.c_str(), bad == 0, std::to_string(bad) + " of " + std::to_string(Tr * N) +
+                                    " elements off, worst " + std::to_string(worst) + first);
+        /* RAD_IQ_TIME=1 prints warm timings beside the correctness lines (the weights fit in
+         * cache, so this is the kernel's arithmetic rate, not the engine's cold read rate). */
+        if (std::getenv("RAD_IQ_TIME")) {
+            hipEvent_t e0, e1;
+            st_ev_create(&e0); st_ev_create(&e1);
+            const int it = 50;
+            st_ev_record(e0, nullptr);
+            for (int z = 0; z < it; ++z) r->launch(&a, nullptr);
+            st_ev_record(e1, nullptr);
+            st_ev_sync(e1);
+            float ms = 0.0f;
+            st_ev_elapsed(&ms, e0, e1);
+            st_ev_destroy(e0); st_ev_destroy(e1);
+            const double fl = 2.0 * (double)Tr * (double)N * (double)K;
+            std::printf("  time %s %s %.3f ms  %.2f TFLOP/s\n", dt, kForm[form], ms / it,
+                        fl * it / (ms * 1e-3) / 1e12);
+        }
+    }
+}
+
+
+/* IQ3_XXS / IQ2_S on a real Unsloth UD expert, dumped by `tools/ud_repack dump`: the canonical
+ * planes and llama.cpp's f32 dequantisation. The planes pass the row's inverse first, then the
+ * actual grouped GEMM at both bands against the dumped reference, so every weight contributes to
+ * the checked sums (the gate_up harness's activations are dense, not one-hot; the fixture is the
+ * real GGUF expert). RAD_MOE_IQ3_DIR / RAD_MOE_IQ2_DIR name the sample directory; unset is a
+ * skip, not a failure. */
+static void moe_iq_grid_real(const Plugin& pl, bool iq3) {
+    const char* env = std::getenv(iq3 ? "RAD_MOE_IQ3_DIR" : "RAD_MOE_IQ2_DIR");
+    const char* what = iq3 ? "moe_gemm_w4a8 iq3xxs32a16 on real GGUF blocks"
+                           : "moe_gemm_w4a8 iq2s32a16 on real GGUF blocks";
+    if (!env || !*env) {
+        skip(what, iq3 ? "RAD_MOE_IQ3_DIR is not set" : "RAD_MOE_IQ2_DIR is not set");
+        return;
+    }
+    const RadKernelInfo* r = find(pl, "moe_gemm_w4a8");
+    if (!r || !r->layout || !r->relayout || !r->unrelayout) {
+        ok(what, false, "row or hooks absent");
+        return;
+    }
+    const std::string dir(env);
+    auto slurp = [&](const char* nm, std::vector<uint8_t>* out) {
+        std::FILE* f = std::fopen((dir + "/" + nm).c_str(), "rb");
+        if (!f) return false;
+        std::fseek(f, 0, SEEK_END);
+        const long sz = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        out->resize((size_t)sz);
+        const bool okr = std::fread(out->data(), 1, out->size(), f) == out->size();
+        std::fclose(f);
+        return okr;
+    };
+    std::vector<uint8_t> meta, expected;
+    if (!slurp("meta.json", &meta) || !slurp("expected.bin", &expected)) {
+        ok(what, false, "meta.json or expected.bin is missing");
+        return;
+    }
+    const std::string mt(meta.begin(), meta.end());
+    auto field = [&](const char* key) -> int64_t {
+        const size_t at = mt.find(std::string("\"") + key + "\":");
+        return at == std::string::npos ? 0 : std::strtoll(mt.c_str() + at + 4 + std::strlen(key), nullptr, 10);
+    };
+    const int64_t N = field("N"), K = field("K");
+    if (N <= 0 || K <= 0 || (int64_t)expected.size() != N * K * 4) {
+        ok(what, false, "the sample's meta and expected.bin disagree");
+        return;
+    }
+
+    Planes p;
+    rad_enc_clear(&p.enc);
+    rad_enc_copy_str(p.enc.scheme, "affine");
+    rad_enc_add_plane(&p.enc, "codes", iq3 ? RAD_U8 : RAD_U10, 1, iq3 ? 4 : 8);
+    rad_enc_add_table(&p.enc, "grid", RAD_U8, iq3 ? 256 : 1024, iq3 ? 4 : 8);
+    rad_enc_add_plane(&p.enc, "signs", RAD_U1, 1, 1);
+    rad_enc_add_plane(&p.enc, "scale", RAD_U5, 1, iq3 ? 32 : 16);
+    rad_enc_add_plane(&p.enc, "scale.1", RAD_F16, 1, 256);
+    rad_enc_add_plane(&p.enc, "scale.2", RAD_F32, 0, 0);
+    p.size(N, K);
+    const char* names[6] = { "codes.bin", "grid.bin", "signs.bin", "scale.bin", "scale1.bin",
+                             "scale2.bin" };
+    for (int i = 0; i < 6; ++i) {
+        if (i == 1) {
+            const size_t gb = iq3 ? sizeof kIq3XxsGrid : sizeof kIq2SGrid;
+            p.data[1].assign(iq3 ? (const uint8_t*)kIq3XxsGrid : (const uint8_t*)kIq2SGrid,
+                             (iq3 ? (const uint8_t*)kIq3XxsGrid : (const uint8_t*)kIq2SGrid) + gb);
+            continue;
+        }
+        std::vector<uint8_t> f;
+        if (!slurp(names[i], &f)) {
+            ok(what, false, std::string("a sample plane is missing: ") + names[i]);
+            return;
+        }
+        if (f.size() != p.data[(size_t)i].size()) {
+            ok(what, false, std::string(names[i]) + " is " + std::to_string(f.size()) +
+                             " bytes, the plane is " + std::to_string(p.data[(size_t)i].size()));
+            return;
+        }
+        std::memcpy(p.data[(size_t)i].data(), f.data(), f.size());
+    }
+
+    std::vector<float> exp((size_t)(N * K));
+    std::memcpy(exp.data(), expected.data(), exp.size() * 4);
+    MoeW4Shape sh{ "real expert 0", N, K, N, K, 1, 16, false };
+    for (const int64_t t : { (int64_t)24, (int64_t)200, (int64_t)600 })
+        moe_iq_grid_gemm(pl, t, sh, iq3, &p, &exp);
+
+}
+
 /* The four-class grouped GEMM, each class at its own geometry, against a host decode.
  *
  * moe_w4_gemm's four-class pass pairs geometries (0 with 2, 1 with 3), with class 0 always wide.
@@ -33448,6 +33845,26 @@ static void device_phase(const Plugin& pl) {
             for (const int64_t t : { (int64_t)24, (int64_t)200, (int64_t)600 })
                 for (int fmt = 0; fmt < 3; ++fmt) moe_iq4_gemm(pl, t, sh, fmt);
         }
+        /* IQ3_XXS and IQ2_S: the two grid forms, unrotated with bf16 activations. K is whole
+         * 256-value super-blocks; a decode-band routing (T 24, 16 experts), a prefill chunk and
+         * a wider expert table are all covered. */
+        static const MoeW4Shape kIqGridShapes[] = {
+            { "iq grid one class",   256, 256, 256, 256, 1, 16 },
+            { "iq grid gate/up 2:1", 256, 256, 128, 256, 2, 16 },
+            { "iq grid down sorted", 256, 256, 256, 256, 1, 16, true },
+            { "iq grid 300 experts", 256, 256, 128, 256, 2, 300 },
+            { "iq grid K 768",       256, 768, 256, 768, 1, 8 },
+            { "iq grid K 2560",      640, 2560, 640, 2560, 1, 8 },
+            { "iq grid ne2 K 2560",  640, 2560, 640, 2560, 1, 2 },
+        };
+        for (const MoeW4Shape& sh : kIqGridShapes)
+            for (const int64_t t : { (int64_t)24, (int64_t)200, (int64_t)600 })
+                for (const bool iq3 : { true, false }) moe_iq_grid_gemm(pl, t, sh, iq3);
+        for (const bool iq3 : { true, false })
+            moe_iq_grid_gemm(pl, 2560, kIqGridShapes[6], iq3);
+        /* A real UD expert, when a sample is present. */
+        moe_iq_grid_real(pl, true);
+        moe_iq_grid_real(pl, false);
     }
 
     if (sel("glm_index_layout")) glm_index_layout_check(pl);

@@ -266,7 +266,15 @@ enum {
      * (K/4 bytes) and the same sign dwords as HALO_DT_MOEW5 (K/8 bytes), interleaved per 128 of K as
      * 32 bytes of magnitudes then 16 of signs (halo_layout.cpp, moew3_row; $HALO_W3_IL=0 keeps the two
      * planes apart). A row is 3K/8 bytes. */
-    HALO_DT_MOEW3      = RAD_DT_PLUGIN_BASE + 9
+    HALO_DT_MOEW3      = RAD_DT_PLUGIN_BASE + 9,
+    /* The grouped MoE GEMM's IQ3_XXS expert weight: per row, the K/4 one-byte grid codes, then the
+     * K/8 sign bytes (one sign byte per eight values, bit j for value j). A row is 3K/8 bytes. The
+     * code indexes halo_moe_grids.h's kIq3XxsGrid; the layout hook checks the container's grid
+     * plane against it. */
+    HALO_DT_MOEIQ3     = RAD_DT_PLUGIN_BASE + 10,
+    /* The same GEMM's IQ2_S expert weight: per row, the K/8 ten-bit grid codes packed LSB first
+     * (5K/32 bytes), then the K/8 sign bytes. A row is 9K/32 bytes. */
+    HALO_DT_MOEIQ2     = RAD_DT_PLUGIN_BASE + 11
 };
 
 /* The grouped MoE GEMM's code tables, as the four dwords w4_e4m3's byte permutes read

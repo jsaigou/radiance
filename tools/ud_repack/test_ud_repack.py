@@ -8,7 +8,11 @@ from ggml_blocks import BLOCK, SPLIT, DECODE, MERGE, dequant_ref
 import kq_layout as kq
 
 D_OFFS = {'Q8_0': [0], 'Q4_K': [0, 2], 'Q5_K': [0, 2], 'Q6_K': [208], 'Q5_0': [0], 'IQ4_NL': [0], 'IQ4_XS': [0],
-          'Q2_0': [0]}
+          'Q2_0': [0], 'IQ3_XXS': [0], 'IQ2_S': [0]}
+
+# The kq row layouts cover the non-grid types; the grid types are decoded directly from their
+# canonical planes (SPLIT/DECODE/MERGE) rather than serialised into a kq row.
+KQ_TYPES = [t for t in SPLIT if t in kq.SPEC]
 
 
 def random_blocks(ty, n, rng):
@@ -39,7 +43,7 @@ class Synthetic(unittest.TestCase):
             self.assertTrue(np.array_equal(MERGE[ty](SPLIT[ty](b)), b), ty)
 
     def test_serialised_rows_roundtrip_and_decode_equal(self):
-        for ty in SPLIT:
+        for ty in KQ_TYPES:
             qk, bb = BLOCK[ty]; K = qk * (8 if qk == 256 else 64) if qk == 256 else 2048; rows = 7
             b = random_blocks(ty, rows * (K // qk), self.rng)
             pl = SPLIT[ty](b)
@@ -56,7 +60,8 @@ class Synthetic(unittest.TestCase):
         for (ty, v), w in want.items():
             self.assertAlmostEqual(kq.bits_per_weight(ty, v), w, msg=(ty, v))
         # P matches the GGUF block size exactly for every type
-        for ty, (qk, bb) in BLOCK.items():
+        for ty in KQ_TYPES:
+            qk, bb = BLOCK[ty]
             self.assertAlmostEqual(kq.bits_per_weight(ty, 'P'), 8 * bb / qk, msg=ty)
 
     def test_agrees_with_the_gguf_python_package_when_present(self):
