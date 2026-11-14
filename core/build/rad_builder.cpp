@@ -1043,7 +1043,8 @@ int Builder::decl_name_map(const RadNameMap* m) {
     }
     if (m->mode != RAD_MAP_COPY && m->mode != RAD_MAP_CONCAT && m->mode != RAD_MAP_WNORM &&
         m->mode != RAD_MAP_ROWS && m->mode != RAD_MAP_TRANSPOSE && m->mode != RAD_MAP_EMA &&
-        m->mode != RAD_MAP_TAP && m->mode != RAD_MAP_COLS) {
+        m->mode != RAD_MAP_TAP && m->mode != RAD_MAP_COLS && m->mode != RAD_MAP_REGROUP &&
+        m->mode != RAD_MAP_NEGLOG) {
         err(RAD_E_INVAL, "name map for '%s': unknown mode %d", m->declared, m->mode);
         return RAD_E_INVAL;
     }
@@ -1054,10 +1055,12 @@ int Builder::decl_name_map(const RadNameMap* m) {
                                    : "the magnitude and the direction", m->n_src);
         return RAD_E_INVAL;
     }
-    if ((m->mode == RAD_MAP_TRANSPOSE || m->mode == RAD_MAP_TAP || m->mode == RAD_MAP_COLS) &&
-        m->n_src != 1) {
+    if ((m->mode == RAD_MAP_TRANSPOSE || m->mode == RAD_MAP_TAP || m->mode == RAD_MAP_COLS ||
+         m->mode == RAD_MAP_REGROUP || m->mode == RAD_MAP_NEGLOG) && m->n_src != 1) {
         err(RAD_E_INVAL, "name map for '%s': a %s map names one source, not %d", m->declared,
-            m->mode == RAD_MAP_TAP ? "tap" : m->mode == RAD_MAP_COLS ? "column" : "transpose",
+            m->mode == RAD_MAP_TAP ? "tap" : m->mode == RAD_MAP_COLS ? "column"
+            : m->mode == RAD_MAP_REGROUP ? "regroup" : m->mode == RAD_MAP_NEGLOG ? "neglog"
+            : "transpose",
             m->n_src);
         return RAD_E_INVAL;
     }
@@ -1077,9 +1080,22 @@ int Builder::decl_name_map(const RadNameMap* m) {
     /* This copy is field by field: a field added to RadNameMap must be added here too. A missed
      * src_index would stay 0 ("sub-tensor 0") instead of the ABI default -1 ("whole tensor",
      * also map_base() in arch/common/rad_arch.h), so every map would ask for slice 0. */
-    for (int i = 0; i < m->n_src; ++i) c.src_index[i] = m->src_index[i];
-    for (int i = m->n_src; i < 8; ++i) c.src_index[i] = -1;
-    for (int i = 0; i < 8; ++i) c.src_rows[i] = i < m->n_src ? m->src_rows[i] : 0;
+    /* REGROUP and NEGLOG name one source and carry four integers (start, span, a, inner) in the
+     * first two slots of both arrays. */
+    const bool four = m->mode == RAD_MAP_REGROUP || m->mode == RAD_MAP_NEGLOG;
+    for (int i = 0; i < m->n_src || (four && i < 2); ++i) c.src_index[i] = m->src_index[i];
+    for (int i = four ? 2 : m->n_src; i < 8; ++i) c.src_index[i] = -1;
+    for (int i = 0; i < 8; ++i) c.src_rows[i] = (i < m->n_src || (four && i < 2)) ? m->src_rows[i] : 0;
+    if (four && (m->src_index[0] < 0 || m->src_rows[0] <= 0 || m->src_rows[1] <= 0 ||
+                 m->src_index[1] < 0 || m->concat_dim < 0 ||
+                 (m->src_index[1] > 1 && m->src_rows[0] % ((int64_t)m->src_index[1] * m->src_rows[1])))) {
+        err(RAD_E_INVAL, "name map for '%s': a %s map needs start >= 0, span > 0, a >= 0, inner > 0 "
+                         "and a span of a whole number of a * inner (got start %d, span %lld, "
+                         "a %d, inner %lld)", m->declared,
+            m->mode == RAD_MAP_REGROUP ? "regroup" : "neglog", m->src_index[0],
+            (long long)m->src_rows[0], m->src_index[1], (long long)m->src_rows[1]);
+        return RAD_E_INVAL;
+    }
     if (m->mode == RAD_MAP_ROWS)
         for (int i = 0; i < m->n_src; ++i)
             if (m->src_index[i] < 0 || m->src_rows[i] <= 0) {

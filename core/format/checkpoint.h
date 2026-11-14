@@ -262,6 +262,10 @@ private:
 struct ImportForm {
     uint32_t codes = RAD_DT_INVALID, zero = RAD_DT_INVALID, scale = RAD_DT_INVALID;
     int64_t  block[2] = { 0, 0 };
+    /* `ggml=planes`: a GGUF block tensor is written as the planes its blocks split into (Q8_0,
+     * Q4_K, Q5_K, Q6_K), every dequantised value unchanged. A rule that cannot do that (a
+     * tensor of a block type with no plane form here) is refused when the plan is made. */
+    bool     ggml_planes = false;
 };
 
 /* A declared weight's source, as the name map resolves it: pieces joined along `concat_dim`, and
@@ -295,6 +299,10 @@ struct CkptWeight {
     /* GGUF Q8_0, Q4_K or Q6_K blocks (also `imported`): ckpt_plane_rows splits each row's blocks
      * into the planes of `enc` (ggml_planes.h), and ckpt_rows_f32 dequantises them. */
     bool        ggml_blocks = false;
+    /* With ggml_blocks, one piece whose columns are read in runs in another order (RAD_MAP_REGROUP
+     * of the last dimension): (first column, columns) per run of the output row, each a whole
+     * number of blocks. Empty: the columns in their own order. */
+    std::vector<std::pair<int64_t, int64_t>> col_segments;
     /* A weight-normalised tensor (RAD_MAP_WNORM): `pieces` is its direction v alone, and every
      * element of v with first index i reads times wnorm_scale[i] = g_i / ||v_i||. Not trivial
      * (the values change), so a recipe rule stores it. */
@@ -323,7 +331,7 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
 /* The quantiser name of a recipe rule rad-convert handles itself through ckpt_import_form. */
 constexpr const char* kImportRule = "import";
 
-/* An import rule's options (codes=DTYPE, zero=DTYPE, scale=DTYPE, block=RxC) as an ImportForm.
+/* An import rule's options (codes=DTYPE, zero=DTYPE, scale=DTYPE, block=RxC, ggml=planes) as an ImportForm.
  * RAD_E_INVAL, with the option named in `why`, for an option it does not take or a value it
  * cannot read. */
 int ckpt_import_form_parse(const std::vector<std::pair<std::string, std::string>>& options,

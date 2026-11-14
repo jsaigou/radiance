@@ -189,6 +189,17 @@ void unpack_q5_0(const void* v, int64_t nb, uint8_t* const* row) {
     c.flush();
 }
 
+void unpack_q2_0(const void* v, int64_t nb, uint8_t* const* row) {
+    const block_q2_0* b = (const block_q2_0*)v;
+    Bits c(row[0]);
+    for (int64_t i = 0; i < nb; ++i) {
+        for (int j = 0; j < QK2_0; ++j)
+            c.put((uint32_t)((b[i].qs[j / 4] >> ((j % 4) * 2)) & 3u), 2);
+        put16(row[1], i, b[i].d);
+    }
+    c.flush();
+}
+
 void unpack_q5_1(const void* v, int64_t nb, uint8_t* const* row) {
     const block_q5_1* b = (const block_q5_1*)v;
     Bits c(row[0]);
@@ -508,6 +519,7 @@ const Kind kKinds[] = {
     { "q4_1",    GGML_TYPE_Q4_1,    QK4_1,  quantize_q4_1,    unpack_q4_1 },
     { "q5_0",    GGML_TYPE_Q5_0,    QK5_0,  quantize_q5_0,    unpack_q5_0 },
     { "q5_1",    GGML_TYPE_Q5_1,    QK5_1,  quantize_q5_1,    unpack_q5_1 },
+    { "q2_0",    GGML_TYPE_Q2_0,    QK2_0,  quantize_q2_0,    unpack_q2_0 },
     { "q8_0",    GGML_TYPE_Q8_0,    QK8_0,  quantize_q8_0,    unpack_q8_0 },
     { "q2_K",    GGML_TYPE_Q2_K,    QK_K,   quantize_q2_K,    unpack_q2_K },
     { "q3_K",    GGML_TYPE_Q3_K,    QK_K,   quantize_q3_K,    unpack_q3_K },
@@ -545,6 +557,10 @@ RadEncoding encoding_of(ggml_type t) {
         case GGML_TYPE_Q5_0:
             plane("codes", RAD_I5, 1);
             plane("scale", RAD_F16, 32);
+            break;
+        case GGML_TYPE_Q2_0:
+            plane("codes", RAD_U2, 1);
+            plane("scale", RAD_F16, 64);
             break;
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_1:

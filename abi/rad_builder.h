@@ -620,7 +620,8 @@ int rad_op_declared(RadBuilder* b, const char* op);
  * convert-time fusions (q/k/v into one qkv, gate and up into gate_up). It is the only component
  * that knows both sides, and rad-convert reads the map from it (spec §2.4). */
 enum { RAD_MAP_COPY = 0, RAD_MAP_CONCAT = 1, RAD_MAP_WNORM = 2, RAD_MAP_ROWS = 3,
-       RAD_MAP_TRANSPOSE = 4, RAD_MAP_EMA = 5, RAD_MAP_TAP = 6, RAD_MAP_COLS = 7 };
+       RAD_MAP_TRANSPOSE = 4, RAD_MAP_EMA = 5, RAD_MAP_TAP = 6, RAD_MAP_COLS = 7,
+       RAD_MAP_REGROUP = 8, RAD_MAP_NEGLOG = 9 };
 
 typedef struct RadNameMap {
     const char* declared;        /* the name given to rad_decl_weight */
@@ -682,7 +683,24 @@ typedef struct RadNameMap {
  * of dimension 2 is the 2-D convolution it then is.
  *
  * TRANSPOSE, EMA, TAP and COLS are computed at convert in f32, like WNORM, and stored as the recipe
- * says. */
+ * says.
+ *
+ * RAD_MAP_REGROUP reorders one span of one dimension of src[0] without touching a value: the span
+ * [src_index[0], src_index[0] + src_rows[0]) of dimension `concat_dim` holds a * b runs of
+ * `inner` elements (a = src_index[1], inner = src_rows[1]; b follows from the span), stored
+ * [a][b][inner], and is read [b][a][inner]. Elements outside the span keep their place. It undoes
+ * a transposition of head groups a converter applied to a checkpoint: llama.cpp stores Qwen3.5/3.6
+ * value heads tiled (head r * b + k of the file is head k * a + r of the model). A dimension 0
+ * regroup is a row permutation and a quantised source (GGUF blocks) stays its own planes, row by
+ * row; a regroup of the last dimension of a GGUF block tensor permutes whole runs of columns and
+ * needs `inner` to be a whole number of every plane's block (refused otherwise). A plain float
+ * source is read in its own dtype. Never rounds.
+ *
+ * RAD_MAP_NEGLOG is REGROUP's parameters on a float tensor and log(-x) of every element: the A_log
+ * a GGUF stores as `ssm_a = -exp(A_log)`. a = src_index[1] of 1 (or 0) regroups nothing. Computed
+ * at convert in f64 and stored as the recipe says (`cast dtype=f32`); the result is rounded to the
+ * nearest bf16 when that bf16's exponential is within two f32 ulps of -x (the value the
+ * checkpoint held), else kept as the f32. A positive or zero source element is refused. */
 
 int rad_decl_name_map(RadBuilder* b, const RadNameMap* m);
 

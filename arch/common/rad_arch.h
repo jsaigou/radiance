@@ -586,6 +586,33 @@ inline int map_slice_concat(RadBuilder* b, const char* declared,
     return rad_decl_name_map(b, &m);
 }
 
+/* The span [start, start + span) of dimension `dim` of a checkpoint tensor, read with its `a` x `b`
+ * runs of `inner` elements transposed ([a][b][inner] to [b][a][inner]); the rest in place
+ * (RAD_MAP_REGROUP). Lossless: no value is touched. */
+inline RadNameMap map_regroup_base(const char* declared, int mode, const char* src, int dim,
+                                   int start, int64_t span, int a, int64_t inner) {
+    RadNameMap m = map_base(declared, mode);
+    m.n_src         = 1;
+    m.src[0]        = src;
+    m.concat_dim    = dim;
+    m.src_index[0]  = start;
+    m.src_rows[0]   = span;
+    m.src_index[1]  = a;
+    m.src_rows[1]   = inner;
+    return m;
+}
+inline int map_regroup(RadBuilder* b, const char* declared, const char* src, int dim, int start,
+                       int64_t span, int a, int64_t inner) {
+    RadNameMap m = map_regroup_base(declared, RAD_MAP_REGROUP, src, dim, start, span, a, inner);
+    return rad_decl_name_map(b, &m);
+}
+/* log(-x) of a float checkpoint tensor, regrouped as above when a > 1 (RAD_MAP_NEGLOG). */
+inline int map_neglog(RadBuilder* b, const char* declared, const char* src, int dim, int start,
+                      int64_t span, int a, int64_t inner) {
+    RadNameMap m = map_regroup_base(declared, RAD_MAP_NEGLOG, src, dim, start, span, a, inner);
+    return rad_decl_name_map(b, &m);
+}
+
 /* A convert-time fusion: q/k/v into qkv, gate and up into gate_up. Only the plugin knows both
  * sides, and rad-convert reads the map from it (spec §2.4). One GEMM launch and one movement unit
  * instead of three, at the cost of placing q, k and v on different tiers. */

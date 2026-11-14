@@ -2184,8 +2184,11 @@ const SrcTensor* Checkpoint::slice(const SrcTensor& st, int index, const char* d
 }
 
 const SrcTensor* Checkpoint::rows(const SrcTensor& st, int64_t r0, int64_t n, const char* declared) {
-    if (st.shape.empty() || st.rad_dtype == RAD_DT_INVALID || st.gptq_bits || st.ct_group ||
-        st.pbits) {
+    /* A GGUF block tensor takes rows too: a row is whole blocks, so a row range is a byte range. */
+    const bool ggml_blocks = st.rad_dtype == RAD_DT_INVALID && gguf_dtype(st.ggml) &&
+                             !st.gptq_bits && !st.ct_group && !st.pbits;
+    if (st.shape.empty() || (st.rad_dtype == RAD_DT_INVALID && !ggml_blocks) || st.gptq_bits ||
+        st.ct_group || st.pbits) {
         RAD_ERR("'%s' asks for rows of '%s', which is not a plainly stored tensor of rows",
                 declared, st.name.c_str());
         return nullptr;
@@ -2562,6 +2565,102 @@ static int resolve_derived(Checkpoint& ck, const std::vector<const RadNameMap*>&
     return RAD_OK;
 }
 
+/* RAD_MAP_REGROUP / RAD_MAP_NEGLOG's segments: the span [start, start + span) of a dimension of
+ * length `len` holds a * b runs of `inner`, stored [a][b][inner] and read [b][a][inner]; what is
+ * outside stays. Returns (first, count) along the dimension in output order. */
+static bool regroup_segments(const RadNameMap& m, int64_t len, std::vector<std::pair<int64_t, int64_t>>* seg,
+                             std::string* why) {
+    const int64_t start = m.src_index[0], span = m.src_rows[0], inner = m.src_rows[1];
+    const int64_t a = m.src_index[1] > 0 ? m.src_index[1] : 1;
+    if (start < 0 || span <= 0 || start + span > len || inner <= 0 || span % (a * inner)) {
+        if (why) *why = "the span [" + std::to_string(start) + ", " + std::to_string(start + span) +
+                        ") of a dimension of " + std::to_string(len) + " is not a * b runs of " +
+                        std::to_string(inner) + " (a = " + std::to_string(a) + ")";
+        return false;
+    }
+    const int64_t b = span / (a * inner);
+    seg->clear();
+    if (start > 0) seg->push_back({ 0, start });
+    for (int64_t k = 0; k < b; ++k)
+        for (int64_t r = 0; r < a; ++r) seg->push_back({ start + (r * b + k) * inner, inner });
+    if (start + span < len) seg->push_back({ start + span, len - start - span });
+    return true;
+}
+
+/* RAD_MAP_NEGLOG: A_log = log(-x), regrouped as the map says, in f32 values. */
+static int resolve_neglog(Checkpoint& ck, const RadNameMap& m, bool optional, CkptWeight* out,
+                          std::string* why) {
+    auto refuse = [&](int rc, std::string msg) {
+        if (why) *why = std::move(msg);
+        return rc;
+    };
+    const SrcTensor* a = ck.find(m.src[0]);
+    if (!a) {
+        if (optional) return refuse(RAD_E_NOTFOUND, "none of its tensors is there");
+        return refuse(RAD_E_NOTFOUND, std::string("it needs checkpoint tensor '") + m.src[0] +
+                                      "', which is not in " + ck.path());
+    }
+    if (a->rad_dtype == RAD_DT_INVALID || a->shape.empty())
+        return refuse(RAD_E_UNSUPPORTED, "'" + a->name + "' is not a plain float tensor");
+    const int64_t n = a->numel();
+    std::vector<float> src((size_t)n);
+    if (piece_f32(*a, 0, n, src.data()) < 0)
+        return refuse(RAD_E_FORMAT, "'" + a->name + "' cannot be read as f32");
+    const size_t rank = a->shape.size();
+    const int d = m.concat_dim;
+    if (d < 0 || (size_t)d >= rank) return refuse(RAD_E_SHAPE, "dimension out of range");
+    int64_t outer = 1, inner = 1;
+    for (int i = 0; i < d; ++i) outer *= a->shape[(size_t)i];
+    for (size_t i = (size_t)d + 1; i < rank; ++i) inner *= a->shape[i];
+    std::vector<std::pair<int64_t, int64_t>> seg;
+    std::string w2;
+    if (!regroup_segments(m, a->shape[(size_t)d], &seg, &w2)) return refuse(RAD_E_SHAPE, w2);
+    out->derived.assign((size_t)n, 0.0f);
+    int64_t at = 0, bf = 0, kept = 0;
+    double worst = 0;
+    auto ulp = [](float x) { return std::nextafter(std::fabs(x), INFINITY) - std::fabs(x); };
+    for (int64_t o = 0; o < outer; ++o) {
+        at = 0;
+        for (const auto& [first, cnt] : seg) {
+            for (int64_t i = 0; i < cnt * inner; ++i) {
+                const float x = src[(size_t)((o * a->shape[(size_t)d] + first) * inner + i)];
+                if (!(x < 0.0f) || !std::isfinite(x))
+                    return refuse(RAD_E_FORMAT, "'" + a->name + "' holds " + std::to_string(x) +
+                                                "; log(-x) needs every element negative");
+                const float l32 = (float)std::log(-(double)x);
+                /* the nearest bf16 (the checkpoint's A_log is bf16), when its exponential is the
+                 * stored -exp(A_log) to two f32 ulps */
+                uint32_t u;
+                std::memcpy(&u, &l32, 4);
+                u = (u + 0x7FFFu + ((u >> 16) & 1u)) & 0xFFFF0000u;
+                float lb;
+                std::memcpy(&lb, &u, 4);
+                const float back_b = (float)std::exp((double)lb);
+                float v = l32;
+                if (std::fabs(back_b - (-x)) <= 2.0f * ulp(x)) { v = lb; ++bf; } else ++kept;
+                const float back = (float)std::exp((double)v);
+                worst = std::max(worst, (double)(std::fabs(back - (-x)) / std::fabs(x)));
+                out->derived[(size_t)((o * a->shape[(size_t)d] + (at + i / inner)) * inner + i % inner)] = v;
+            }
+            at += cnt;
+        }
+    }
+    out->rank = (uint32_t)rank;
+    for (size_t i = 0; i < rank; ++i) out->shape[i] = a->shape[i];
+    out->pieces.assign(1, a);
+    out->scales.assign(1, nullptr);
+    out->concat_dim = 0;
+    rad_enc_view(out->rank, out->shape, &out->rows, &out->cols);
+    out->trivial = false;
+    char buf[200];
+    std::snprintf(buf, sizeof buf, "%lld of %lld values are the bf16 whose exp is -x to 2 ulp, %lld "
+                  "stay f32; worst |exp(result) + x| / |x| = %.2e", (long long)bf,
+                  (long long)(bf + kept), (long long)kept, worst);
+    out->why = "it is A_log = log(-x) of '" + a->name + "' (" + buf + "), computed at convert -- a "
+               "recipe rule stores it";
+    return RAD_OK;
+}
+
 int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, bool optional,
                  CkptWeight* out, std::string* why) {
     auto refuse = [&](int rc, std::string m) {
@@ -2579,16 +2678,53 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
     if (maps.empty()) return refuse(RAD_E_NOTFOUND, "the name map has no entry for it");
     if (maps.front()->mode == RAD_MAP_WNORM)
         return resolve_wnorm(ck, *maps.front(), optional, out, why);
+    if (maps.front()->mode == RAD_MAP_NEGLOG)
+        return resolve_neglog(ck, *maps.front(), optional, out, why);
     if (maps.front()->mode == RAD_MAP_TRANSPOSE || maps.front()->mode == RAD_MAP_EMA ||
         maps.front()->mode == RAD_MAP_TAP || maps.front()->mode == RAD_MAP_COLS)
         return resolve_derived(ck, maps, optional, out, why);
     struct Src1 { const char* name; int index; int64_t rows; };
     std::vector<Src1> srcs;
-    const bool row_pieces = maps.front()->mode == RAD_MAP_ROWS;
-    for (const RadNameMap* pm : maps)
-        for (int k = 0; k < pm->n_src; ++k)
-            srcs.push_back({ pm->src[k], pm->src_index[k], pm->src_rows[k] });
-    out->concat_dim = row_pieces ? 0 : maps.front()->concat_dim;
+    bool row_pieces = maps.front()->mode == RAD_MAP_ROWS;
+    std::vector<std::pair<int64_t, int64_t>> col_segments;   /* REGROUP of a GGUF tensor's columns */
+    if (maps.front()->mode == RAD_MAP_REGROUP) {
+        /* A regroup of dimension 0 is a row permutation: the same pieces a ROWS map would name.
+         * One of the last dimension of a quantised tensor is a permutation of whole block runs of
+         * every row, which the planes below carry (`col_segments`). */
+        const RadNameMap& pm = *maps.front();
+        const SrcTensor* t = ck.find(pm.src[0]);
+        if (!t) {
+            if (optional) return refuse(RAD_E_NOTFOUND, "none of its tensors is there");
+            return refuse(RAD_E_NOTFOUND, std::string("it needs checkpoint tensor '") + pm.src[0] +
+                                          "', which is not in " + ck.path());
+        }
+        const int d = pm.concat_dim;
+        if (d < 0 || (size_t)d >= t->shape.size())
+            return refuse(RAD_E_SHAPE, "regroup of dimension " + std::to_string(d) + " of '" +
+                                       t->name + "', which has rank " +
+                                       std::to_string(t->shape.size()));
+        std::vector<std::pair<int64_t, int64_t>> seg;
+        std::string w2;
+        if (!regroup_segments(pm, t->shape[(size_t)d], &seg, &w2))
+            return refuse(RAD_E_SHAPE, "regroup of '" + t->name + "': " + w2);
+        if (d == 0) {
+            row_pieces = true;
+            for (const auto& [first, cnt] : seg) srcs.push_back({ pm.src[0], (int)first, cnt });
+        } else if ((size_t)d + 1 == t->shape.size() && t->rad_dtype == RAD_DT_INVALID &&
+                   t->shape.size() == 2 && ggml_plane_encoding(t->ggml, &out->enc)) {
+            col_segments = std::move(seg);
+            srcs.push_back({ pm.src[0], -1, 0 });
+        } else {
+            return refuse(RAD_E_UNSUPPORTED, "regroup of dimension " + std::to_string(d) + " of '" +
+                                             t->name + "' is a row permutation or a column "
+                                             "permutation of a GGUF block tensor; this is neither");
+        }
+    } else {
+        for (const RadNameMap* pm : maps)
+            for (int k = 0; k < pm->n_src; ++k)
+                srcs.push_back({ pm->src[k], pm->src_index[k], pm->src_rows[k] });
+    }
+    out->concat_dim = row_pieces || maps.front()->mode == RAD_MAP_REGROUP ? 0 : maps.front()->concat_dim;
 
     /* The mode decides what several sources mean:
      *
@@ -2717,9 +2853,16 @@ int ckpt_resolve(Checkpoint& ck, const Program& prog, const std::string& name, b
         if (!one_type) {
             out->why = "its GGUF pieces are of different block types";
         } else if (ggml_plane_encoding(p0.ggml, &enc)) {
+            const int64_t qk = gguf_dtype(p0.ggml)->blck;
+            bool aligned = true;
+            for (const auto& [first, cnt] : col_segments) aligned = aligned && first % qk == 0 && cnt % qk == 0;
             if (out->pieces.size() > 1 && (d != 0 || out->rank < 2)) {
                 out->why = "its GGUF pieces are joined along a column, across their blocks";
+            } else if (!aligned) {
+                out->why = "its regrouped column runs do not start and end on the " +
+                           std::to_string(qk) + "-value blocks of " + gguf_dtype(p0.ggml)->name;
             } else {
+                out->col_segments = std::move(col_segments);
                 out->imported = true;
                 out->ggml_blocks = true;
                 out->enc = enc;
@@ -2972,7 +3115,7 @@ namespace {
  * ggml block types decodable to f32. Their geometry lives in core/text; decoding lives here, where
  * weights are read. Q4_K and Q6_K are the K-quants this HYV3 GGUF adapter needs. */
 enum { GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q4_1 = 3, GGML_Q5_0 = 6, GGML_Q5_1 = 7,
-       GGML_Q8_0 = 8, GGML_Q4_K = 12, GGML_Q6_K = 14, GGML_BF16 = 30 };
+       GGML_Q8_0 = 8, GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14, GGML_BF16 = 30 };
 
 int ggml_rows_f32(uint32_t type, const uint8_t* p, int64_t n, float* dst) {
     auto half = [&](const uint8_t* q) { uint16_t h; std::memcpy(&h, q, 2); return rad_f16_to_f32(h); };
@@ -3044,6 +3187,34 @@ int ggml_rows_f32(uint32_t type, const uint8_t* p, int64_t n, float* dst) {
                         const int v = j * 32 + l;
                         const uint8_t q = qs[32 * (v / 64) + v % 32];
                         const int code = (v % 64) < 32 ? q & 15 : q >> 4;
+                        dst[b * 256 + v] = ds * (float)code - ms;
+                    }
+                }
+            }
+            return RAD_OK;
+        case GGML_Q5_K:
+            /* block_q5_K: d, dmin, scales[12], qh[32] @16, qs[128] @48. Q4_K's scale and min, a
+             * fifth code bit from qh[v % 32] bit v / 32 (dequantize_row_q5_K). */
+            for (int64_t b = 0; b < n / 256; ++b, p += 176) {
+                const float d = half(p), dmin = half(p + 2);
+                const uint8_t* scales = p + 4;
+                const uint8_t* qh = p + 16;
+                const uint8_t* qs = p + 48;
+                for (int j = 0; j < 8; ++j) {
+                    uint32_t sc, mn;
+                    if (j < 4) {
+                        sc = scales[j] & 63u;
+                        mn = scales[j + 4] & 63u;
+                    } else {
+                        sc = (scales[j + 4] & 15u) | ((uint32_t)(scales[j - 4] >> 6) << 4);
+                        mn = (scales[j + 4] >> 4) | ((uint32_t)(scales[j] >> 6) << 4);
+                    }
+                    const float ds = d * (float)sc, ms = dmin * (float)mn;
+                    for (int l = 0; l < 32; ++l) {
+                        const int v = j * 32 + l;
+                        const uint8_t q = qs[32 * (v / 64) + v % 32];
+                        const int code = ((v % 64) < 32 ? q & 15 : q >> 4) |
+                                         (((qh[l] >> j) & 1) << 4);
                         dst[b * 256 + v] = ds * (float)code - ms;
                     }
                 }
@@ -3206,6 +3377,23 @@ int ckpt_rows_f32(const CkptWeight& w, int64_t r0, int64_t nr, float* out, std::
         }
         return RAD_OK;
     }
+    if (!w.col_segments.empty()) {
+        /* Dequantise each whole source row, then lay its column runs in the regrouped order. */
+        const SrcTensor& piece = *w.pieces[0];
+        std::vector<float> src_row((size_t)w.cols);
+        const int64_t prows = piece.numel() / w.cols, rb = piece.bytes / prows;
+        for (int64_t r = 0; r < nr; ++r) {
+            const int rc = ggml_rows_f32(piece.ggml, (const uint8_t*)piece.data + (r0 + r) * rb,
+                                         w.cols, src_row.data());
+            if (rc < 0) return refuse(rc, "'" + piece.name + "' cannot be read as f32");
+            int64_t at = 0;
+            for (const auto& [first, cnt] : w.col_segments) {
+                std::memcpy(out + r * w.cols + at, &src_row[(size_t)first], (size_t)cnt * sizeof(float));
+                at += cnt;
+            }
+        }
+        return RAD_OK;
+    }
     Joined j;
     j.init(w.pieces, w.concat_dim);
     /* Runs arrive in order, so the cursor is the count already written. */
@@ -3293,6 +3481,10 @@ int ckpt_import_form_parse(const std::vector<std::pair<std::string, std::string>
         if (dt) {
             *dt = rad_dtype_parse(v.c_str());
             if (*dt == RAD_DT_INVALID) return refuse("import's " + k + "=" + v + " is not a dtype");
+        } else if (k == "ggml") {
+            if (v != "planes")
+                return refuse("import's ggml=" + v + " is not ggml=planes, the only form it takes");
+            f->ggml_planes = true;
         } else if (k == "block") {
             long long a = 0, b = 0;
             char x = 0, tail = 0;
@@ -3302,7 +3494,7 @@ int ckpt_import_form_parse(const std::vector<std::pair<std::string, std::string>
             f->block[0] = a;
             f->block[1] = b;
         } else {
-            return refuse("the import rule takes codes=, zero=, scale= and block=, not " + k);
+            return refuse("the import rule takes codes=, zero=, scale=, block= and ggml=planes, not " + k);
         }
     }
     return RAD_OK;
@@ -3315,6 +3507,25 @@ int ckpt_import_form(CkptWeight* w, const ImportForm& f, std::string* why) {
     };
     char en[160];
     rad_enc_format(&w->enc, en, sizeof en);
+    if (f.ggml_planes) {
+        /* The GGUF import, spelled out: the blocks' own planes, exact by construction. Anything
+         * else is declined (a float weight has nothing to import) or refused (a block type the
+         * reader cannot split, which would otherwise be requantised from a decode). */
+        if (f.codes != RAD_DT_INVALID || f.zero != RAD_DT_INVALID || f.scale != RAD_DT_INVALID ||
+            f.block[0] || f.block[1])
+            return refuse(RAD_E_INVAL, "import's ggml=planes takes no codes=, zero=, scale= or "
+                                       "block=: the planes are the blocks' own");
+        if (w->ggml_blocks) {
+            w->form = f;
+            w->why = "it is a GGUF block tensor written as its own planes, value for value";
+            return RAD_OK;
+        }
+        if (w->trivial)
+            return refuse(RAD_E_UNSUPPORTED, "'" + w->name + "' is a plain float tensor; there are "
+                                             "no blocks to write as planes");
+        return refuse(RAD_E_FORMAT, "'" + w->name + "' cannot be written as planes exactly: " +
+                                    (w->why.empty() ? std::string(en) : w->why));
+    }
     if (w->pieces.empty() || w->paro || w->wnorm || !w->derived.empty())
         return refuse(RAD_E_FORMAT, "'" + w->name + "' is " + en + ", which the import rule does "
                                     "not re-express");
@@ -3648,6 +3859,40 @@ int ckpt_plane_rows(const CkptWeight& w, int k, int64_t r0, int64_t nr, void* ds
         std::vector<uint8_t> split((size_t)at[w.enc.n_planes]);
         uint8_t* row[RAD_ENC_MAX_PLANES] = { nullptr };
         for (int i = 0; i < w.enc.n_planes; ++i) row[i] = split.data() + at[i];
+        if (!w.col_segments.empty()) {
+            /* Runs of columns in another order (RAD_MAP_REGROUP): each run is whole blocks, so
+             * its planes are a byte-aligned stretch of each plane's row (ckpt_resolve checked the
+             * run starts and ends on a block, and the planes' block widths divide a block). The
+             * run's blocks are split on their own and the stretches placed at the run's output
+             * column. */
+            const SrcTensor& piece = *w.pieces[0];
+            const GgufDtype& gd = *gguf_dtype(piece.ggml);
+            const int64_t prows = piece.numel() / w.cols, rb = piece.bytes / prows;
+            std::vector<uint8_t> part((size_t)at[w.enc.n_planes]);
+            for (int64_t r = r0; r < r0 + nr; ++r) {
+                int64_t out_col = 0;
+                for (const auto& [first, cnt] : w.col_segments) {
+                    uint8_t* prow[RAD_ENC_MAX_PLANES] = { nullptr };
+                    int64_t pat[RAD_ENC_MAX_PLANES + 1] = { 0 };
+                    for (int i = 0; i < w.enc.n_planes; ++i) {
+                        int64_t qr = 0, qc = 0;
+                        rad_enc_plane_dims(&w.enc.plane[i], 1, cnt, &qr, &qc);
+                        pat[i + 1] = pat[i] + rad_enc_row_bytes(w.enc.plane[i].dtype, qc);
+                        prow[i] = part.data() + pat[i];
+                    }
+                    ggml_plane_row(piece.ggml, (const uint8_t*)piece.data + r * rb +
+                                   (first / gd.blck) * gd.block_bytes, cnt, prow);
+                    /* where this run's stretch of plane i starts in the whole row */
+                    int64_t qr = 0, qc = 0;
+                    rad_enc_plane_dims(&w.enc.plane[k], 1, out_col, &qr, &qc);
+                    const int64_t dst = rad_enc_row_bytes(w.enc.plane[k].dtype, qc);
+                    std::memcpy(o + (r - r0) * (at[k + 1] - at[k]) + dst, prow[k],
+                                (size_t)(pat[k + 1] - pat[k]));
+                    out_col += cnt;
+                }
+            }
+            return RAD_OK;
+        }
         int64_t base = 0;
         for (const SrcTensor* piece : w.pieces) {
             const int64_t prows = piece->numel() / w.cols, rb = piece->bytes / prows;

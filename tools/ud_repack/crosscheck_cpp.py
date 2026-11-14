@@ -11,7 +11,9 @@ from test_ud_repack import random_blocks
 # python plane name -> C++ plane role, per ggml type id
 MAP = {'Q8_0': (8, {'codes': 'codes', 'd': 'scale'}),
        'Q4_K': (12, {'codes': 'codes', 'sc': 'scale', 'd': 'scale.1', 'mm': 'min', 'dmin': 'min.1'}),
-       'Q6_K': (14, {'lo4+hi2': 'codes', 'sc': 'scale', 'd': 'scale.1'})}
+       'Q5_K': (13, {'codes5': 'codes', 'sc': 'scale', 'd': 'scale.1', 'mm': 'min', 'dmin': 'min.1'}),
+       'Q6_K': (14, {'lo4+hi2': 'codes', 'sc': 'scale', 'd': 'scale.1'}),
+       'Q2_0': (42, {'codes': 'codes', 'd': 'scale'})}
 
 
 def main():
@@ -26,6 +28,12 @@ def main():
         d = tempfile.mkdtemp(); fn = os.path.join(d, 'blocks.bin'); b.tofile(fn)
         subprocess.check_call([exe, str(tid), fn, str(rows), str(K), os.path.join(d, 'p')], stdout=subprocess.DEVNULL)
         pl = SPLIT[ty](b); mine = kq.plane_bytes(ty, pl, rows, 'P')
+        if ty == 'Q5_K':   # C++ stores the whole 5-bit code in one plane; python's kq layout splits lo4 / hi1
+            mine = {'codes5': kq.pack_bits(pl['codes'].reshape(rows, -1), 5), 'sc': mine['sc'], 'd': mine['d'],
+                    'mm': mine['mm'], 'dmin': mine['dmin']}
+        if ty == 'Q2_0':
+            mine = {'codes': kq.pack_bits(pl['codes'].reshape(rows, -1), 2),
+                    'd': np.ascontiguousarray(pl['d'].astype('<f2')).view(np.uint8).reshape(rows, -1)}
         if ty == 'Q6_K':   # C++ stores q-32 as 6-bit two's complement; python stores q (0..63) split in lo4/hi2
             c6 = ((pl['codes'].astype(np.int32) - 32) & 63).reshape(rows, -1)
             mine = {'lo4+hi2': kq.pack_bits(c6, 6), 'sc': mine['sc'], 'd': mine['d']}

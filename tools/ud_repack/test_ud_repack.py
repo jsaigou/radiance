@@ -7,7 +7,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ggml_blocks import BLOCK, SPLIT, DECODE, MERGE, dequant_ref
 import kq_layout as kq
 
-D_OFFS = {'Q8_0': [0], 'Q4_K': [0, 2], 'Q5_K': [0, 2], 'Q6_K': [208], 'Q5_0': [0], 'IQ4_NL': [0], 'IQ4_XS': [0]}
+D_OFFS = {'Q8_0': [0], 'Q4_K': [0, 2], 'Q5_K': [0, 2], 'Q6_K': [208], 'Q5_0': [0], 'IQ4_NL': [0], 'IQ4_XS': [0],
+          'Q2_0': [0]}
 
 
 def random_blocks(ty, n, rng):
@@ -66,6 +67,8 @@ class Synthetic(unittest.TestCase):
             self.skipTest('gguf package not installed')
         T = gguf.GGMLQuantizationType
         for ty in SPLIT:
+            if not hasattr(T, ty):
+                continue    # the gguf package predates type 42 (Q2_0); the reference is llama.cpp's formula
             b = random_blocks(ty, 500, self.rng)
             ref = quants.dequantize(b, getattr(T, ty)).reshape(500, -1)
             self.assertTrue(bits_equal(DECODE[ty](SPLIT[ty](b)), ref), ty)
