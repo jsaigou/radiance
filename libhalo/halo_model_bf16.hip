@@ -241,6 +241,41 @@ __global__ __launch_bounds__(kThreads) void embed_lookup_iq4_kernel(
     dst[0] = OUT_F16 ? iq4_f32_to_f16(v) : f32_to_bf16(v);
 }
 
+// ---------------------------------------------------------------------------- embed_lookup_iq4xs
+// The main token embedding in llama.cpp's IQ4_XS form (libquant's `iq4_xs`): u4 codes into the same
+// kvalues_iq4nl codebook, a signed 6-bit scale per 32 values stored as `ls - 32`, and an f16 `d`
+// per 256. `sc6` is the [rows, n_embd/32] i6 plane (six bits an element, a row starting on a byte);
+// `sc1` the [rows, n_embd/256] f16 plane. The arithmetic is avx_gemm.cpp's decode_iq4_xs_rows and
+// libref's ref_embed_lookup_iq4xs: level (7 bits) * sub-scale (6) * d (11) is exact in f32, and the
+// single rounding is the store. A negative or out-of-range id writes a zero row.
+__device__ __forceinline__ int iq4_xs_scale6(const uint8_t* row, uint32_t ib) {
+    const uint32_t o    = ib * 6u;
+    const uint32_t sh   = o & 7u;
+    const uint8_t* b    = row + (o >> 3);
+    uint32_t w = b[0];
+    if (sh + 6u > 8u) w |= (uint32_t)b[1] << 8;
+    return (int)(((w >> sh) & 63u) ^ 32u) - 32;                   /* 6-bit two's complement */
+}
+
+template <bool OUT_F16>
+__global__ __launch_bounds__(kThreads) void embed_lookup_iq4xs_kernel(
+    const int32_t* __restrict__ tok, const uint8_t* __restrict__ codes,
+    const uint8_t* __restrict__ sc6, const uint16_t* __restrict__ sc1, uint16_t* __restrict__ x,
+    uint32_t M, uint32_t n_embd, int32_t n_vocab, int32_t vocab_off, uint32_t x_ld) {
+    const uint64_t g = (uint64_t)blockIdx.x * kThreads + threadIdx.x;
+    if (g >= (uint64_t)M * n_embd) return;
+    const uint32_t m = (uint32_t)(g / n_embd), j = (uint32_t)(g % n_embd);
+    const int32_t id = tok[m] - vocab_off;
+    uint16_t* __restrict__ dst = x + (size_t)m * x_ld + j;
+    if (id < 0 || id >= n_vocab) { dst[0] = 0; return; }
+    const uint32_t byte = codes[(size_t)id * (n_embd >> 1) + (j >> 1)];
+    const uint32_t code = (byte >> (4 * (j & 1))) & 15;
+    const int ls = iq4_xs_scale6(sc6 + (size_t)id * ((n_embd >> 5) * 6 / 8), j >> 5);
+    const float d = iq4_scale_f32(sc1[(size_t)id * (n_embd >> 8) + (j >> 8)]);
+    const float v = (float)iq4_level(code) * (float)ls * d;
+    dst[0] = OUT_F16 ? iq4_f32_to_f16(v) : f32_to_bf16(v);
+}
+
 // ---------------------------------------------------------------------------- gather_rows
 // ref_gather_rows. Like the embedding gather, with the same negative-index rule, but the source
 // row pitch is the caller's: it gathers from padded activation buffers (one logits row per
@@ -1610,6 +1645,26 @@ extern "C" int halo_rad_embed_lookup(const RadArgs* a, RadStream stream) {
                                   mult, stream, ch) == 0 ? RAD_OK : RAD_E_DEVICE;
 }
 
+/* The IQ4_XS gather: u4 codes, a signed 6-bit scale per 32 values and an f16 `d` per 256, one
+ * thread an entry. n_embd must be whole 256s: a `d` covers a 256-value row block. */
+static int embed_lookup_iq4xs_emit(const int32_t* tok, const uint8_t* codes, const uint8_t* sc6,
+                                   const uint16_t* sc1, uint16_t* x, long long M, long long n_embd,
+                                   int n_vocab, int vocab_off, long long x_ld, bool out_f16,
+                                   RadStream stream) {
+    if (!tok || !codes || !sc6 || !sc1 || !x) return -1;
+    if (M <= 0 || n_embd <= 0 || n_vocab <= 0 || vocab_off < 0 || n_embd % 256) return -2;
+    if (!x_ld) x_ld = n_embd;
+    const uint64_t threads = (uint64_t)M * (uint64_t)n_embd;
+    const dim3 grid((uint32_t)((threads + kThreads - 1) / kThreads));
+#define HALO_ELXS(OUT_F16)                                                                         \
+    HALO_EMIT(stream, (embed_lookup_iq4xs_kernel<OUT_F16>), grid, dim3(kThreads), 0, tok, codes,   \
+              sc6, sc1, x, (uint32_t)M, (uint32_t)n_embd, (int32_t)n_vocab, (int32_t)vocab_off,    \
+              (uint32_t)x_ld)
+    const int rc = out_f16 ? HALO_ELXS(true) : HALO_ELXS(false);
+#undef HALO_ELXS
+    return rc == RAD_OK ? 0 : -4;
+}
+
 /* ------------------------------------------------------------------ embed_lookup_q */
 
 /* Operand 4, `ahead`, is not read: it carries upcoming prompt ids for a host reader that
@@ -1664,6 +1719,47 @@ extern "C" int halo_rad_embed_lookup_q(const RadArgs* a, RadStream stream) {
                                sc ? (const void*)halo_addr(sc) : nullptr,
                                sc && sc->dtype == RAD_F32, (uint16_t*)halo_addr(x), M,
                                (int)n_embd, (int)n_vocab, (int)voff, x_ld, stream) == 0
+               ? RAD_OK : RAD_E_DEVICE;
+}
+
+/* ------------------------------------------------------------------ embed_lookup_iq4xs */
+
+/* Operand 5, `ahead`, is not read: it carries upcoming prompt ids for a host reader that
+ * prefetches table rows from a file, and a card reads its table in place. */
+enum { ELXS_TOK = 0, ELXS_CODES, ELXS_SCALE, ELXS_SCALE1, ELXS_X };
+
+extern "C" int halo_rad_embed_lookup_iq4xs(const RadArgs* a, RadStream stream) {
+    const RadTensor* tok   = halo_opt(a, ELXS_TOK);
+    const RadTensor* codes = halo_opt(a, ELXS_CODES);
+    const RadTensor* sc6   = halo_opt(a, ELXS_SCALE);
+    const RadTensor* sc1   = halo_opt(a, ELXS_SCALE1);
+    const RadTensor* x     = halo_opt(a, ELXS_X);
+    if (!tok || !codes || !sc6 || !sc1 || !x) return HALO_NO(RAD_E_INVAL);
+    HALO_NEED(dt_i32(tok));
+    if (codes->dtype != RAD_U4 || sc6->dtype != RAD_I6 || sc1->dtype != RAD_F16)
+        return HALO_NO(RAD_E_DTYPE);
+    if (x->dtype != RAD_BF16 && x->dtype != RAD_F16) return HALO_NO(RAD_E_DTYPE);
+    if (!halo_contig(tok) || !halo_contig(codes) || !halo_contig(sc6) || !halo_contig(sc1))
+        return HALO_NO(RAD_E_STRIDE);
+
+    const long long n_embd = halo_geti_or(a, "n_embd", halo_dim(codes, (int)codes->rank - 1));
+    const long long n_vocab = halo_geti_or(a, "n_vocab", halo_dim(codes, (int)codes->rank - 2));
+    const long long voff = halo_geti_or(a, "vocab_offset", 0);
+    if (n_embd <= 0 || n_vocab <= 0 || voff < 0 || n_embd % 256) return HALO_NO(RAD_E_SHAPE);
+    if (halo_numel(codes) < n_vocab * n_embd || halo_numel(sc6) < n_vocab * (n_embd / 32) ||
+        halo_numel(sc1) < n_vocab * (n_embd / 256))
+        return HALO_NO(RAD_E_SHAPE);
+
+    long long M = 0;
+    const long long x_ld = halo_rows_pitch(x, n_embd, &M);
+    if (x_ld < 0) return HALO_NO(RAD_E_STRIDE);
+    if (M <= 0 || halo_numel(tok) < M) return HALO_NO(RAD_E_SHAPE);
+    return embed_lookup_iq4xs_emit((const int32_t*)halo_addr(tok),
+                                   (const uint8_t*)halo_addr(codes),
+                                   (const uint8_t*)halo_addr(sc6),
+                                   (const uint16_t*)halo_addr(sc1), (uint16_t*)halo_addr(x), M,
+                                   n_embd, (int)n_vocab, (int)voff, x_ld, x->dtype == RAD_F16,
+                                   stream) == 0
                ? RAD_OK : RAD_E_DEVICE;
 }
 
