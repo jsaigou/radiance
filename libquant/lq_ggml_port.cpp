@@ -131,6 +131,7 @@ static size_t ggml_type_size(enum ggml_type type) {
         case GGML_TYPE_Q4_1:    return sizeof(block_q4_1);
         case GGML_TYPE_Q5_0:    return sizeof(block_q5_0);
         case GGML_TYPE_Q5_1:    return sizeof(block_q5_1);
+        case GGML_TYPE_Q2_0:    return sizeof(block_q2_0);
         case GGML_TYPE_Q8_0:    return sizeof(block_q8_0);
         case GGML_TYPE_Q2_K:    return sizeof(block_q2_K);
         case GGML_TYPE_Q3_K:    return sizeof(block_q3_K);
@@ -156,6 +157,7 @@ static int64_t ggml_blck_size(enum ggml_type type) {
         case GGML_TYPE_Q4_1:   return QK4_1;
         case GGML_TYPE_Q5_0:   return QK5_0;
         case GGML_TYPE_Q5_1:   return QK5_1;
+        case GGML_TYPE_Q2_0:   return QK2_0;
         case GGML_TYPE_Q8_0:   return QK8_0;
         case GGML_TYPE_IQ4_NL: return QK4_NL;
         default:               return QK_K;
@@ -4267,6 +4269,44 @@ void ggml_quantize_init(enum ggml_type type) {
         default: // nothing
             break;
     }
+}
+
+
+/* ---- ggml-quants.c: Q2_0. A block is 64 values, one f16 scale (the block's amax), and 2-bit
+ * codes naming (-1, 0, +1, +2) x scale; quantize_q2_0 has no imatrix path upstream. */
+void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK2_0;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            const float a = fabsf(x[i*qk + j]);
+            if (a > amax) amax = a;
+        }
+        const float d = amax;
+        const float id = d > 0.0f ? 1.0f / d : 0.0f;
+        y[i].d = GGML_FP32_TO_FP16(d);
+        for (int j = 0; j < qk / 4; ++j) y[i].qs[j] = 0;
+        for (int j = 0; j < qk; ++j) {
+            const float w = x[i*qk + j];
+            int q = (int)roundf(w * id) + 1;
+            if (q < 0) q = 0;
+            if (q > 3) q = 3;
+            y[i].qs[j / 4] |= ((uint8_t)q << ((j % 4) * 2));
+        }
+    }
+}
+
+size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow,
+                     int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights;
+    if (n_per_row % QK2_0) {
+        std::fprintf(stderr, "libquant: q2_0 needs a row a whole number of %d values\n", (int)QK2_0);
+        std::abort();
+    }
+    quantize_row_q2_0_ref(src, (block_q2_0 *)dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_Q2_0, n_per_row);
 }
 
 bool ggml_quantize_requires_imatrix(enum ggml_type type) {

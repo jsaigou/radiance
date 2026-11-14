@@ -62,6 +62,10 @@ const Type kTypes[] = {
                "zero=bf16[1x32]", true, 256, 0.751 },
     { "iq1_m", "affine:codes=u11[1x8],grid=i8{2048x8},scale=u4[1x16],scale.1=f16[1x256],"
                "zero=bf16[1x8]", false, 256, 0.770 },
+    /* Q2_0's four levels are (-1, 0, +1, +2) x the block amax, so on this fixture's 10x outliers
+     * the positive ones clamp at +2d and the relative error is far above the other types'; the
+     * bound only has to be tight enough to catch a wrong plane layout (which decodes to noise). */
+    { "q2_0", "u2*f16[1x64]", false, 64, 4.2 },
 };
 
 /* llama.cpp's iq1_* and iq2_* types, whose searches are exhaustive over a neighbour grid. */

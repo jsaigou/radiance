@@ -89,6 +89,7 @@ enum ggml_type {
     GGML_TYPE_IQ2_S   = 22,
     GGML_TYPE_IQ4_XS  = 23,
     GGML_TYPE_IQ1_M   = 29,
+    GGML_TYPE_Q2_0    = 42,   /* llama.cpp's Q2_0: 64 values, f16 scale, 2-bit codes */
 };
 
 /* ================================================================== ggml-common.h's blocks */
@@ -110,6 +111,13 @@ struct block_q4_1 {
     uint8_t qs[QK4_1 / 2]; // nibbles / quants
 };
 static_assert(sizeof(block_q4_1) == 2 * sizeof(ggml_half) + QK4_1 / 2, "wrong q4_1 block size/padding");
+
+constexpr int QK2_0 = 64;
+struct block_q2_0 {
+    ggml_half d;              // delta (scale)
+    uint8_t qs[QK2_0 / 4];    // 2 bits per value
+};
+static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
 
 constexpr int QK5_0 = 32;
 struct block_q5_0 {
@@ -318,6 +326,8 @@ size_t quantize_q4_1(const float * src, void * dst, int64_t nrow, int64_t n_per_
 size_t quantize_q5_0(const float * src, void * dst, int64_t nrow, int64_t n_per_row,
                      const float * quant_weights);
 size_t quantize_q5_1(const float * src, void * dst, int64_t nrow, int64_t n_per_row,
+                     const float * quant_weights);
+size_t quantize_q2_0(const float * src, void * dst, int64_t nrow, int64_t n_per_row,
                      const float * quant_weights);
 size_t quantize_q8_0(const float * src, void * dst, int64_t nrow, int64_t n_per_row,
                      const float * quant_weights);
