@@ -139,6 +139,7 @@ static inline float ld_dt(uint32_t dt, const void* p, int64_t i) {
         case RAD_U32:    return (float)((const uint32_t*)p)[i];
         case RAD_I64:    return (float)((const int64_t*)p)[i];
         case RAD_I4:     return w4_code(p, i);
+        case RAD_U4:     return rad_load_f32(p, RAD_U4, i);
         case RAD_I2:     return w2_code(p, i);
         case RAD_FP4E2M1:  return mxfp4_code(p, i);
         case RAD_E8M0:   return e8m0_to_f32(((const uint8_t*)p)[i]);

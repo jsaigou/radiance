@@ -20,6 +20,8 @@
 #include <dlfcn.h>
 #include <unistd.h>
 
+#include <utility>
+
 using namespace qfix;
 
 namespace {
@@ -813,6 +815,57 @@ TEST(the_ngram_table_is_the_canonical_plane) {
     golden("ngram", stored("ngram", nf, kp, "rtn", g, "ple.ngram.weight", V, E, w,
                            { { 1, { "codes" } }, { 2, { "scale" } } }),
            0xa5e81d9b9ff05c2aull);
+    dlclose(so);
+}
+
+/* The IQ4_NL table (llama.cpp's iq4_nl, libquant's planes): u4 codes, a 16-entry i8 codebook and
+ * an f16 scale per 32 values. The host gather reads it as stored, so the layout hook accepts the
+ * codes and the per-32 scale operands and declines to rearrange them; a scale of another block, or
+ * a width that is not whole 32s, is refused. */
+TEST(the_ngram_table_reads_iq4_nl_as_stored) {
+#if !defined(__x86_64__)
+    SKIP("libavx is x86-64 only");
+#endif
+    NEED_LIBQUANT();
+    const std::string avx = home() + "/kernels/libavx.so";
+    void* so = dlopen(avx.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!so) ARTIFACT_MISSING(avx + " (does not load: " + dlerror() + ")");
+    Hooks nf;
+    nf.layout = (RadLayoutFn)dlsym(so, "avx_layout_ngram");
+    REQUIRE(nf.layout != nullptr);
+
+    const int64_t V = 100, E = 64;
+    const std::vector<float> w = draw(V * E, 28, 20.0f);
+    const RadQuantizerInfo* ggml = quantizer("ggml");
+    REQUIRE(ggml != nullptr);
+    Opts qo;
+    qo.s("type", "iq4_nl");
+    const Quantised q = quantise(ggml, qo, "ple.ngram.weight", V, E, w);
+    REQUIRE_EQ(q.status, RAD_OK);
+    CHECK(rad_enc_is(&q.enc, "affine"));
+    REQUIRE(rad_enc_plane(&q.enc, "table") != nullptr);
+    CHECK_EQ(rad_enc_plane(&q.enc, "table")->extent[1], 16);
+    CHECK_EQ(rad_enc_plane(&q.enc, "scale")->block[1], 32);
+    CHECK_EQ(rad_enc_plane(&q.enc, "scale")->dtype, (uint32_t)RAD_F16);
+
+    Opts kp;
+    kp.i("n_vocab", V).i("n_embd", E);
+    for (const auto& op : { std::pair<int, const char*>{ 1, "codes" },
+                            std::pair<int, const char*>{ 2, "scale" } }) {
+        Selection s = select(q, V, E, { op.second });
+        RadLayout L{};
+        CHECK_EQ(nf.layout(kp.data(), kp.n(), op.first, &q.enc, s.sel.data(), s.t.data(),
+                           (int)s.t.size(), &L), RAD_E_UNSUPPORTED);
+    }
+    /* The scale operand at the wrong extent (one per row rather than one per 32) is a different
+     * reading of the same bytes. */
+    {
+        Selection s = select(q, V, E, { "scale" });
+        s.t[0].shape[1] = 1;
+        RadLayout L{};
+        CHECK_EQ(nf.layout(kp.data(), kp.n(), 2, &q.enc, s.sel.data(), s.t.data(), 1, &L),
+                 RAD_E_SHAPE);
+    }
     dlclose(so);
 }
 

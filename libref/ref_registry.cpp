@@ -785,7 +785,10 @@ static const RadParamSpec pEmbed[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_voc
                                        /* embed_lookup_q's: the scale its layout quantises with;
                                         * a parameter because a global scale needs the whole
                                         * table and the transform sees one block. */
-                                       P_F64O("wscale") };
+                                       P_F64O("wscale"),
+                                       /* The table's stored form for the shape hook: "iq4_nl" is
+                                        * u4 codes and an f16 scale per 32 values. */
+                                       P_STRO("wform") };
 /* embed_lookup's list: pEmbed plus `mult`, the factor every gathered row is multiplied by (Gemma's
  * sqrt(hidden)). embed_lookup_q has its table scale instead. */
 static const RadParamSpec pEmbedM[] = { P_INT("M"), P_INT("n_embd"), P_INT("n_vocab"),
@@ -2217,7 +2220,8 @@ static bool ref_readable(uint32_t dt) {
     switch (dt) {
         case RAD_F32: case RAD_F16: case RAD_BF16: case RAD_F8E4M3: case RAD_F8E5M2:
         case RAD_I8: case RAD_U8: case RAD_BOOL: case RAD_I16: case RAD_U16: case RAD_I32:
-        case RAD_U32: case RAD_I64: case RAD_I4: case RAD_I2: case RAD_FP4E2M1: case RAD_E8M0:
+        case RAD_U32: case RAD_I64: case RAD_I4: case RAD_U4: case RAD_I2: case RAD_FP4E2M1:
+        case RAD_E8M0:
             return true;
         default:
             return false;
@@ -2227,7 +2231,7 @@ static bool ref_storable(uint32_t dt) {
     switch (dt) {
         case RAD_F32: case RAD_F16: case RAD_BF16: case RAD_F8E4M3: case RAD_F8E5M2:
         case RAD_I8: case RAD_U8: case RAD_BOOL: case RAD_I16: case RAD_U16: case RAD_I32:
-        case RAD_U32: case RAD_I64: case RAD_I4: case RAD_I2: case RAD_FP4E2M1:
+        case RAD_U32: case RAD_I64: case RAD_I4: case RAD_U4: case RAD_I2: case RAD_FP4E2M1:
             return true;
         default:
             return false;

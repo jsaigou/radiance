@@ -370,6 +370,11 @@ std::vector<Case> build_cases() {
         add("embed_lookup_q", { HI("M", 9), HI("n_embd", 128), HI("n_vocab", 64), HS("dtype", dt),
                                 HI("vocab_offset", 0), HF("wscale", 0.01) });
     }
+    /* The IQ4_NL table: u4 codes into the fixed 16-level codebook, an f16 scale per 32. Only the
+     * bf16 activation: the general gather has no u4 form to fall back to. */
+    add("embed_lookup_q", { HI("M", 9), HI("n_embd", 128), HI("n_vocab", 64),
+                            HS("dtype", "bf16"), HI("vocab_offset", 0),
+                            HS("wform", "iq4_nl") });
 
     /* Attention. q_len 1 is decode, 17 a ragged verify window, 64 the prefill panel form
      * (q_len >= 32, uniform). `window` 0 is unbounded, 8 sliding (a different loop bound). */
