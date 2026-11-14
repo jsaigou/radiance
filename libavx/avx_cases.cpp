@@ -375,6 +375,9 @@ std::vector<Case> build_cases() {
     add("embed_lookup_q", { HI("M", 9), HI("n_embd", 128), HI("n_vocab", 64),
                             HS("dtype", "bf16"), HI("vocab_offset", 0),
                             HS("wform", "iq4_nl") });
+    add("embed_lookup_q", { HI("M", 9), HI("n_embd", 128), HI("n_vocab", 64),
+                            HS("dtype", "f16"), HI("vocab_offset", 0),
+                            HS("wform", "iq4_nl") });
 
     /* Attention. q_len 1 is decode, 17 a ragged verify window, 64 the prefill panel form
      * (q_len >= 32, uniform). `window` 0 is unbounded, 8 sliding (a different loop bound). */

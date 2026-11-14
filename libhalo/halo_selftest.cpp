@@ -30805,8 +30805,8 @@ static void embed_lookup_iq4_case(const Plugin& pl) {
     static const int8_t kv[16] = { -127, -104, -83, -65, -49, -35, -22, -10,
                                     1,    13,   25,  38,  53,  69,  89,  113 };
     const int64_t NV = 1031, M = 37;
-    struct Shape { int64_t ne; bool host_codes; };
-    const Shape shapes[] = { { 160, false }, { 160, true }, { 64, false } };
+    struct Shape { int64_t ne; bool host_codes; bool f16; };
+    const Shape shapes[] = { { 160, false, false }, { 160, true, false }, { 64, false, true } };
     std::vector<void*> pinned;
     std::string bad;
     for (const Shape& sh : shapes) {
@@ -30857,9 +30857,9 @@ static void embed_lookup_iq4_case(const Plugin& pl) {
         std::vector<RadTensor> ts = { T(d_tok, RAD_I32, { M }),
                                       T(d_tab, RAD_U4, { NV, sh.ne }),
                                       T(d_sc, RAD_F16, { NV, sh.ne / 32 }),
-                                      T(d_x, RAD_BF16, { M, sh.ne }) };
+                                      T(d_x, sh.f16 ? RAD_F16 : RAD_BF16, { M, sh.ne }) };
         std::vector<RadParam> ps = { PI("M", M), PI("n_embd", sh.ne), PI("n_vocab", NV),
-                                     PS("dtype", "bf16"), PS("wform", "iq4_nl") };
+                                     PS("dtype", sh.f16 ? "f16" : "bf16"), PS("wform", "iq4_nl") };
         RadArgs a;
         std::memset(&a, 0, sizeof(a));
         a.t = ts.data(); a.n_t = (int)ts.size();
@@ -30877,17 +30877,18 @@ static void embed_lookup_iq4_case(const Plugin& pl) {
                 if (id >= 0 && id < NV) {
                     const uint8_t byte = tab[(size_t)id * rowb + (size_t)(i >> 1)];
                     const int code = (byte >> (4 * (i & 1))) & 15;
-                    want = rad_f32_to_bf16((float)kv[code] *
-                                           rad_f16_to_f32(sc[(size_t)id * (size_t)(sh.ne / 32) +
-                                                             (size_t)(i >> 5)]));
+                    const float v = (float)kv[code] *
+                                    rad_f16_to_f32(sc[(size_t)id * (size_t)(sh.ne / 32) +
+                                                      (size_t)(i >> 5)]);
+                    want = sh.f16 ? rad_f32_to_f16(v) : rad_f32_to_bf16(v);
                 }
                 if (got[(size_t)(m * sh.ne + i)] != want) ++wrong;
             }
         }
         if (rc != RAD_OK || wrong)
-            bad += fmt("n_embd=%lld %s: rc=%d, %lld of %lld entries differ; ", (long long)sh.ne,
-                       sh.host_codes ? "pinned codes" : "vram codes", rc, (long long)wrong,
-                       (long long)(M * sh.ne));
+            bad += fmt("n_embd=%lld %s %s: rc=%d, %lld of %lld entries differ; ",
+                       (long long)sh.ne, sh.host_codes ? "pinned codes" : "vram codes",
+                       sh.f16 ? "f16" : "bf16", rc, (long long)wrong, (long long)(M * sh.ne));
     }
     for (void* h : pinned) hip_ck(hipHostFree(h), "hipHostFree", __LINE__);
     ok(what, bad.empty(), bad);
