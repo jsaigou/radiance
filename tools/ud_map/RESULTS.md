@@ -189,6 +189,6 @@ GGUF + declared plan.
 - The layout hook and `halo_rows.cpp` already accept `w3nl64a8h`; `halo_layout.cpp`'s
   `w4nl64a8h`-family checks already include it, and `moe_gemm_launch<5>` already dispatches it.
 
-With that and L3 merged, the fast container is buildable; the first conversion will stop on the
-first IQ3_XXS layer until it lands. No kernel, `tools/ud_repack` or other arch change is needed
-for this lane.
+With that and L3 merged, the fast container is buildable; until both land, a conversion stops on
+the first `w3nl64a8h` expert or dense `Q6_K`/`Q8_0` weight (the plan's blocked list is 26.244 +
+3.525 GiB). No kernel, `tools/ud_repack` or other arch change is needed for this lane.
