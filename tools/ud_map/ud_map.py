@@ -38,6 +38,10 @@ TYPES = {
     "IQ4_XS":  (4.25,     "iq4_xs", False),
     "IQ3_XXS": (3.0625,   "iq3_xxs", False),
     "IQ2_S":   (2.5625,   "iq2_s",  False),
+    # llama.cpp type 42 is Q2_0: 64 values, f16 scale, 2-bit codes (-1,0,+1,+2), 2.25 bpw.
+    # libquant has no kind for it yet (port quantize_q2_0/unpack); the GGUF names it TYPE42.
+    "TYPE42":  (2.25,     None,     False),
+    "Q2_0":    (2.25,     None,     False),
     "F32":     (32.0,     None,     True),
     "F16":     (16.0,     None,     True),
     "BF16":    (16.0,     None,     True),
