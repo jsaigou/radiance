@@ -1573,38 +1573,56 @@ static const RadOpSchema kSchemas[] = {
  * stored joined (abi/rad_planes.h); a view of one plane is stored as it is. The selections
  * accepted are libref's (libref/ref_moe.cpp: cb_check), so a weight libref refuses at declare is
  * refused here too, and both libraries store the same bytes under one tag. */
-struct CbForm { int bits; int64_t group; uint32_t sdt; bool level; };
+/* What a codebook `dtype` stores: code width and dtype, the scale's group and dtype, whether the
+ * scale view carries a second level, the table's dtype (0 for an implicit one), and whether the
+ * activation is rotated (fwht128). */
+struct CbForm { int bits; int64_t group; uint32_t sdt; bool level; uint32_t cdt; uint32_t tdt;
+                bool rot; };
 static CbForm cb_form(const RadParam* p, int n_p) {
     const RadParam* d = rad_param_find(p, n_p, "dtype");
     const char* s = d && d->kind == RAD_P_STR ? d->sval : nullptr;
-    if (s && !std::strcmp(s, "w4nla8h"))   return CbForm{ 4, 128, RAD_BF16, false };
-    if (s && !std::strcmp(s, "w4nl64a8h")) return CbForm{ 4, 64, RAD_F8E4M3, true };
-    if (s && !std::strcmp(s, "w4nl32a8h")) return CbForm{ 4, 32, RAD_F8E4M3, true };
-    if (s && !std::strcmp(s, "w5nl64a8h")) return CbForm{ 5, 64, RAD_F8E4M3, true };
-    return CbForm{ 0, 0, 0, false };
+    if (s && !std::strcmp(s, "w4nla8h"))   return CbForm{ 4, 128, RAD_BF16, false, RAD_U4, RAD_F32, true };
+    if (s && !std::strcmp(s, "w4nl64a8h")) return CbForm{ 4, 64, RAD_F8E4M3, true, RAD_U4, RAD_F32, true };
+    if (s && !std::strcmp(s, "w4nl32a8h")) return CbForm{ 4, 32, RAD_F8E4M3, true, RAD_U4, RAD_F32, true };
+    if (s && !std::strcmp(s, "w5nl64a8h")) return CbForm{ 5, 64, RAD_F8E4M3, true, RAD_U5, RAD_F32, true };
+    /* The unrotated GGUF forms: IQ4_NL joins an i8 table; Q5_0 and Q2_0 have implicit ones and
+     * are stored as single planes. All three carry f16 scales and bf16 activations. */
+    if (s && !std::strcmp(s, "iq4nl32a16")) return CbForm{ 4, 32, RAD_F16, false, RAD_U4, RAD_I8, false };
+    if (s && !std::strcmp(s, "q50a16"))     return CbForm{ 5, 32, RAD_F16, false, RAD_I5, 0,      false };
+    if (s && !std::strcmp(s, "q20a16"))     return CbForm{ 2, 64, RAD_F16, false, RAD_U2, 0,      false };
+    return CbForm{ 0, 0, 0, false, 0, 0, false };
 }
 static int cb_check(const RadParam* p, int n_p, int operand, const RadEncoding* enc,
                     const int* sel, int n_planes) {
     const CbForm f = cb_form(p, n_p);
     const bool codes = operand == 2 || operand == 6 || operand == 8 || operand == 10;
     const bool scale = operand == 3 || operand == 7 || operand == 9 || operand == 11;
-    if (!f.bits || (!codes && !scale) || !enc || !sel || n_planes != 2 ||
-        std::strcmp(enc->transform, "fwht128") != 0)
+    const bool rot = enc && (f.rot ? std::strcmp(enc->transform, "fwht128") == 0
+                                    : enc->transform[0] == 0);
+    if (!f.bits || (!codes && !scale) || !enc || !sel || n_planes < 1 || !rot)
         return RAD_E_DTYPE;
-    for (int i = 0; i < 2; ++i)
+    for (int i = 0; i < n_planes; ++i)
         if (sel[i] < 0 || sel[i] >= enc->n_planes) return RAD_E_SHAPE;
     const RadEncPlane& a = enc->plane[sel[0]];
-    const RadEncPlane& b = enc->plane[sel[1]];
-    if (codes)
-        return !std::strcmp(a.role, "codes") && a.kind == RAD_PLANE_TILED &&
-               a.dtype == (f.bits == 5 ? (uint32_t)RAD_U5 : (uint32_t)RAD_U4) &&
-               a.block[0] == 1 && a.block[1] == 1 && !std::strcmp(b.role, "table") &&
-               b.kind == RAD_PLANE_TABLE && b.dtype == RAD_F32 && b.extent[0] == 1 &&
+    if (codes) {
+        const bool ct = a.kind == RAD_PLANE_TILED && !std::strcmp(a.role, "codes") &&
+                        a.dtype == f.cdt && a.block[0] == 1 && a.block[1] == 1;
+        if (!ct) return RAD_E_DTYPE;
+        if (!f.tdt) return n_planes == 1 ? RAD_OK : RAD_E_DTYPE;
+        if (n_planes != 2) return RAD_E_DTYPE;
+        const RadEncPlane& b = enc->plane[sel[1]];
+        return !std::strcmp(b.role, "table") && b.kind == RAD_PLANE_TABLE &&
+               b.dtype == f.tdt && b.extent[0] == 1 &&
                b.extent[1] == ((int64_t)1 << f.bits)
                    ? RAD_OK : RAD_E_DTYPE;
-    return f.level && !std::strcmp(a.role, "scale") && a.kind == RAD_PLANE_TILED &&
-           a.dtype == f.sdt && a.block[0] == 1 && a.block[1] == f.group &&
-           !std::strcmp(b.role, "scale.1") && b.kind == RAD_PLANE_TILED && b.dtype == RAD_F32 &&
+    }
+    if (n_planes != (f.level ? 2 : 1)) return RAD_E_DTYPE;
+    if (std::strcmp(a.role, "scale") || a.kind != RAD_PLANE_TILED || a.dtype != f.sdt ||
+        a.block[0] != 1 || a.block[1] != f.group)
+        return RAD_E_DTYPE;
+    if (!f.level) return RAD_OK;
+    const RadEncPlane& b = enc->plane[sel[1]];
+    return !std::strcmp(b.role, "scale.1") && b.kind == RAD_PLANE_TILED && b.dtype == RAD_F32 &&
            b.block[0] == 0 && b.block[1] == 0
                ? RAD_OK : RAD_E_DTYPE;
 }
@@ -1645,7 +1663,9 @@ static int avx_moe_cb_unrelayout(const RadParam* p, int n_p, int operand, const 
 
 #define DT_FLOAT "bf16 f16 f32 fp8_e4m3 fp8_e5m2 i8 i32, chosen per operand from its own dtype"
 #define DT_ANY   "any dtype rad_types.h names, per operand"
-#define DT_FLOAT_CB DT_FLOAT "; or u4 / u5 codes into an f32 table, joined (w4nl* / w5nl*)"
+#define DT_FLOAT_CB DT_FLOAT "; or codebook experts: u4 / u5 codes into an f32 table, joined " \
+                            "(w4nl* / w5nl*), IQ4_NL's u4 codes into an i8 table, or Q5_0's " \
+                            "i5 / Q2_0's u2 codes"
 
 /* Rows launch through the baseline-compiled thunks, which are valid before rad_plugin_open
  * (avx_dispatch.cpp). */

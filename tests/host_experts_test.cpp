@@ -40,17 +40,25 @@ constexpr int64_t kEmbd = 256, kFF = 128, kExperts = 8, kTopK = 2, kHC = 4, kLow
 /* The protected experts, kept bf16 by the recipe: a pair, so the rest split by parity. */
 bool protected_expert(long long e) { return e == 3 || e == 5; }
 
+/* The served container's encoding by dtype: the rotated codebooks as libquant writes them, and
+ * the three unrotated GGUF forms (no transform, f16 scales per 32 or 64, and IQ4_NL's i8 table). */
 RadEncoding codebook(const char* dtype) {
     const bool w5 = !std::strcmp(dtype, "w5nl64a8h"), bf = !std::strcmp(dtype, "w4nla8h");
-    const int64_t group = !std::strcmp(dtype, "w4nl32a8h") ? 32 : bf ? 128 : 64;
+    const bool iq4 = !std::strcmp(dtype, "iq4nl32a16"), q50 = !std::strcmp(dtype, "q50a16");
+    const bool q20 = !std::strcmp(dtype, "q20a16"), unrot = iq4 || q50 || q20;
+    const int64_t group = iq4 || q50 ? 32 : q20 ? 64 : !std::strcmp(dtype, "w4nl32a8h")
+                                                                     ? 32
+                                                                     : bf ? 128 : 64;
     RadEncoding e;
     rad_enc_clear(&e);
     rad_enc_copy_str(e.scheme, "affine");
-    rad_enc_copy_str(e.transform, "fwht128");
-    rad_enc_add_plane(&e, "codes", w5 ? RAD_U5 : RAD_U4, 1, 1);
-    rad_enc_add_plane(&e, "scale", bf ? RAD_BF16 : RAD_F8E4M3, 1, group);
-    if (!bf) rad_enc_add_plane(&e, "scale.1", RAD_F32, 0, 0);
-    rad_enc_add_table(&e, "table", RAD_F32, 1, w5 ? 32 : 16);
+    rad_enc_copy_str(e.transform, unrot ? "" : "fwht128");
+    rad_enc_add_plane(&e, "codes", iq4 ? RAD_U4 : q50 ? RAD_I5 : q20 ? RAD_U2
+                         : w5 ? RAD_U5 : RAD_U4, 1, 1);
+    rad_enc_add_plane(&e, "scale", unrot ? RAD_F16 : bf ? RAD_BF16 : RAD_F8E4M3, 1, group);
+    if (!bf && !unrot) rad_enc_add_plane(&e, "scale.1", RAD_F32, 0, 0);
+    if (!q50 && !q20)
+        rad_enc_add_table(&e, "table", iq4 ? RAD_I8 : RAD_F32, 1, iq4 ? 16 : w5 ? 32 : 16);
     return e;
 }
 
@@ -124,7 +132,7 @@ int declare_layer(RadBuilder* b, MoeFP8* mlp, HyperConn* hc) {
     MoeFP8::Src ms{};
     RAD_ARCH_TRY(moe_expert_sources(b, nm, "format", "model.layers.0.mlp.experts", &ms));
     RAD_ARCH_TRY(MoeFP8::probe(b, nm, 0, ms, &mc));
-    if (!mc.expert_rot || !mc.expert_nl) return RAD_E_DTYPE;
+    if (!mc.expert_nl && !mc.expert_q50 && !mc.expert_q20) return RAD_E_DTYPE;
 
     const int64_t T = kTok, ER = mc.rows * mc.top_k;
     ActFP8 x, hr, eff, sff;
@@ -190,7 +198,8 @@ TEST(flash_next_experts_declare_on_libavx_alone) {
     Registry reg;
     const int st = reg.load_dir(home() + "/kernels", { "libavx" });
     if (st == RAD_E_IO || !reg.plugin("libavx")) ARTIFACT_MISSING(home() + "/kernels/libavx.so");
-    for (const char* dtype : { "w4nla8h", "w4nl64a8h", "w4nl32a8h", "w5nl64a8h" }) {
+    for (const char* dtype : { "w4nla8h", "w4nl64a8h", "w4nl32a8h", "w5nl64a8h",
+                               "iq4nl32a16", "q50a16", "q20a16" }) {
         Builder b(reg, meta(), ctx());
         b.set_sources([dtype](const std::string& name, const Program&, WeightSource* out) {
             return sources(dtype, name, out);
@@ -225,13 +234,20 @@ TEST(flash_next_experts_declare_on_libavx_alone) {
                 }
             }
         }
+        const bool rotated = std::strcmp(dtype, "iq4nl32a16") != 0 &&
+                             std::strcmp(dtype, "q50a16") != 0 &&
+                             std::strcmp(dtype, "q20a16") != 0;
         for (const char* want : { "hc_read", "hc_write", "gemm_nt", "router_topk", "moe_scatter",
-                                  "moe_gemm_q", "had_quant_act_fp8", "silu_mul", "moe_gemm",
-                                  "gemm_nt_q", "moe_gather" })
+                                  "moe_gemm_q", "silu_mul", "moe_gemm", "gemm_nt_q", "moe_gather" })
             if (!ops.count(want)) {
                 fprintf(stderr, "    %s: the layer declares no '%s'\n", dtype, want);
                 CHECK(false);
             }
+        /* Only a rotated form rotates the routed activation on its own (`op_hq`). */
+        if (rotated && !ops.count("had_quant_act_fp8")) {
+            fprintf(stderr, "    %s: the rotated layer declares no 'had_quant_act_fp8'\n", dtype);
+            CHECK(false);
+        }
 
         /* Each codebook view of several planes joined; the protected experts' and a single
          * plane's stored as they are. */
@@ -247,8 +263,15 @@ TEST(flash_next_experts_declare_on_libavx_alone) {
                 CHECK(w.layout_tag.empty());
             }
         }
-        /* Six codebook experts, codes view and (but at w4nla8h) scale view, both projections. */
-        CHECK_EQ(joined, (std::strcmp(dtype, "w4nla8h") ? 4 : 2) * 6);
+        /* Six codebook experts and two projections: w4nla8h and IQ4_NL join one view each (codes
+         * and, for IQ4_NL, its i8 table); the E4M3-leveled forms join codes and scales, two views;
+         * Q5_0 and Q2_0 store both single planes as they are. */
+        const int views = !std::strcmp(dtype, "w4nla8h") || !std::strcmp(dtype, "iq4nl32a16")
+                              ? 1
+                              : !std::strcmp(dtype, "q50a16") || !std::strcmp(dtype, "q20a16")
+                                    ? 0
+                                    : 2;
+        CHECK_EQ(joined, views * 12);
     }
 }
 

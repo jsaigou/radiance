@@ -206,13 +206,19 @@ static void bench_cvt(Lib& avx, Lib& ref) {
  * FLOP/s against the FMA peak (--peak measures both). */
 namespace moebench {
 
-struct Form { const char* dtype; int bits; int64_t group; uint32_t sdt; bool level; };
+struct Form { const char* dtype; int bits; int64_t group; uint32_t sdt; bool level; bool a16;
+              uint32_t cdt; uint32_t tdt; };
 const Form kForms[] = {
-    { "w4nla8h",   4, 128, RAD_BF16,   false },
-    { "w4nl64a8h", 4, 64,  RAD_F8E4M3, true },
-    { "w4nl32a8h", 4, 32,  RAD_F8E4M3, true },
-    { "w5nl64a8h", 5, 64,  RAD_F8E4M3, true },
+    { "w4nla8h",   4, 128, RAD_BF16,   false, false, RAD_U4, RAD_F32 },
+    { "w4nl64a8h", 4, 64,  RAD_F8E4M3, true,  false, RAD_U4, RAD_F32 },
+    { "w4nl32a8h", 4, 32,  RAD_F8E4M3, true,  false, RAD_U4, RAD_F32 },
+    { "w5nl64a8h", 5, 64,  RAD_F8E4M3, true,  false, RAD_U5, RAD_F32 },
+    { "iq4nl32a16",4, 32,  RAD_F16,    false, true,  RAD_U4, RAD_I8  },
+    { "q50a16",    5, 32,  RAD_F16,    false, true,  RAD_I5, 0       },
+    { "q20a16",    2, 64,  RAD_F16,    false, true,  RAD_U2, 0       },
 };
+const int8_t kIq4Nl[16] = { -127, -104, -83, -65, -49, -35, -22, -10,
+                            1,    13,   25,  38,  53,  69,  89, 113 };
 const float kW4nl[16] = { 1.125f, 3.25f, 5.5f, 8.0f, 11.0f, 14.0f, 18.0f, 22.0f,
                           -1.125f, -3.25f, -5.5f, -8.0f, -11.0f, -14.0f, -18.0f, -22.0f };
 const float kW5nl[32] = { 0.8125f, 2.5f, 4.0f, 5.5f, 7.5f, 9.0f, 11.0f, 12.0f,
@@ -249,18 +255,22 @@ bool build(const RadKernelInfo* k, const Form& f, int64_t N, int64_t K, const ch
     RadEncoding e;
     rad_enc_clear(&e);
     rad_enc_copy_str(e.scheme, "affine");
-    rad_enc_copy_str(e.transform, "fwht128");
-    const uint32_t cdt = f.bits == 5 ? RAD_U5 : RAD_U4;
+    rad_enc_copy_str(e.transform, f.a16 ? "" : "fwht128");
+    const uint32_t cdt = f.cdt;
     const int ic = rad_enc_add_plane(&e, "codes", cdt, 1, 1);
     const int is = rad_enc_add_plane(&e, "scale", f.sdt, 1, f.group);
     const int il = f.level ? rad_enc_add_plane(&e, "scale.1", RAD_F32, 0, 0) : -1;
-    const int it = rad_enc_add_table(&e, "table", RAD_F32, 1, (int64_t)1 << f.bits);
+    const int it = f.tdt ? rad_enc_add_table(&e, "table", f.tdt, 1, (int64_t)1 << f.bits) : -1;
     const int64_t SC = (K + f.group - 1) / f.group;
     const int64_t rbc = rad_dtype_bytes(cdt, K), rbs = rad_dtype_bytes(f.sdt, SC);
-    std::vector<uint8_t> pc((size_t)(N * rbc)), ps((size_t)(N * rbs)), pl(4), pt(4u << f.bits);
+    std::vector<uint8_t> pc((size_t)(N * rbc)), ps((size_t)(N * rbs)), pl(4),
+        pt(f.tdt == RAD_I8 ? 16u : 4u << f.bits);
     const float lv = 0x1p-13f;
     std::memcpy(pl.data(), &lv, 4);
-    std::memcpy(pt.data(), f.bits == 5 ? kW5nl : kW4nl, pt.size());
+    if (it >= 0) {
+        if (f.tdt == RAD_I8) std::memcpy(pt.data(), kIq4Nl, 16);
+        else std::memcpy(pt.data(), f.bits == 5 ? kW5nl : kW4nl, pt.size());
+    }
     const RadParam p[] = { RadParam{ "dtype", RAD_P_STR, 0, 0, f.dtype, 0 },
                            RadParam{ "a_order", RAD_P_STR, 0, 0, order, 0 } };
     auto plane = [](void* d, uint32_t dt, int64_t r, int64_t c) {
@@ -287,9 +297,11 @@ bool build(const RadKernelInfo* k, const Form& f, int64_t N, int64_t K, const ch
             RadTensor t[2];
             int n = 0;
             if (v == 0) {
-                sel[0] = ic; sel[1] = it; n = 2;
-                t[0] = plane(pc.data(), cdt, N, K);
-                t[1] = plane(pt.data(), RAD_F32, 1, (int64_t)1 << f.bits);
+                sel[0] = ic; t[0] = plane(pc.data(), cdt, N, K); n = 1;
+                if (f.tdt) {
+                    sel[1] = it; n = 2;
+                    t[1] = plane(pt.data(), f.tdt, 1, (int64_t)1 << f.bits);
+                }
             } else {
                 sel[0] = is; t[0] = plane(ps.data(), f.sdt, N, SC); n = 1;
                 if (f.level) { sel[1] = il; t[1] = plane(pl.data(), RAD_F32, 1, 1); n = 2; }
@@ -299,9 +311,10 @@ bool build(const RadKernelInfo* k, const Form& f, int64_t N, int64_t K, const ch
                                      : RAD_E_UNSUPPORTED;
             std::unique_ptr<Buf> b;
             if (rc == RAD_E_UNSUPPORTED && n == 1) {
-                b.reset(new Buf((int64_t)ps.size()));
-                std::memcpy(b->p, ps.data(), ps.size());
-                if (ex == 0) out->sdt = f.sdt;
+                const std::vector<uint8_t>& src = v ? ps : pc;
+                b.reset(new Buf((int64_t)src.size()));
+                std::memcpy(b->p, src.data(), src.size());
+                if (ex == 0) (v ? out->sdt : out->cdt) = e.plane[sel[0]].dtype;
             } else if (rc == RAD_OK && k->relayout) {
                 b.reset(new Buf(L.bytes));
                 if (k->relayout(p, 2, opd + v, &e, sel, t, n, b->p, L.bytes) != RAD_OK) return false;
@@ -354,20 +367,21 @@ int64_t route(int64_t M, uint64_t seed, std::vector<int32_t>* sorted, std::vecto
 double time_proj(const RadKernelInfo* k, const Form& f, const Proj& pj, bool gate_up, int64_t M,
                  int reps, double* bytes, int* status) {
     const int64_t T = M * kTopK, AR = gate_up ? M : T, N = pj.N, K = pj.K, SG = (K + 127) / 128;
-    std::vector<uint8_t> aq((size_t)(AR * K)), y((size_t)(T * N * 2));
-    std::vector<float> as((size_t)(AR * SG));
+    std::vector<uint8_t> aq((size_t)(AR * K) * (f.a16 ? 2 : 1)), y((size_t)(T * N * 2));
+    std::vector<float> as((size_t)(f.a16 ? 0 : AR * SG));
     uint64_t s = 99;
-    for (auto& b : aq) {
-        b = (uint8_t)(hsplitmix(s) & 0xff);
-        if ((b & 0x7f) == 0x7f) b = 0x38;       /* not the format's one NaN */
-    }
+    for (auto& b : aq) b = (uint8_t)(hsplitmix(s) & 0xff);
+    if (!f.a16)
+        for (size_t i = 0; i < aq.size(); ++i) {
+            if ((aq[i] & 0x7f) == 0x7f) aq[i] = 0x38;   /* not the format's one NaN */
+        }
     for (size_t i = 0; i < as.size(); ++i) as[i] = 0.01f + 0.001f * (float)(i % 11);
     std::vector<void*> tab[4];
     for (int64_t e = 0; e < kExperts; ++e) {
         tab[(e % 2) * 2].push_back(pj.codes[(size_t)e]->p);
         tab[(e % 2) * 2 + 1].push_back(pj.scales[(size_t)e]->p);
     }
-    const int64_t scols = f.level ? K : SG;
+    const int64_t scols = f.level ? K : (f.a16 ? (K + f.group - 1) / f.group : SG);
     auto table = [&](int i) {
         RadTensor t{};
         t.data = tab[i].data();
@@ -402,8 +416,10 @@ double time_proj(const RadKernelInfo* k, const Form& f, const Proj& pj, bool gat
     *status = RAD_OK;
     for (int r = -1; r < reps; ++r) {
         const int64_t touched = route(M, 1000 + (uint64_t)r, &sorted, &off);
-        RadTensor t[9] = { dense(aq.data(), RAD_F8E4M3, { AR, K }),
-                           dense(as.data(), RAD_F32, { AR, SG }), table(0), table(1),
+        RadTensor t[9] = { dense(aq.data(), f.a16 ? (uint32_t)RAD_BF16 : (uint32_t)RAD_F8E4M3,
+                                 { AR, K }),
+                           f.a16 ? RadTensor{} : dense(as.data(), RAD_F32, { AR, SG }),
+                           table(0), table(1),
                            dense(sorted.data(), RAD_I32, { T }),
                            dense(off.data(), RAD_I32, { kExperts + 1 }), table(2), table(3),
                            dense(y.data(), RAD_BF16, { T, N }) };
@@ -1091,7 +1107,8 @@ int main(int argc, char** argv) {
                 "  --moe           moe_gemm_q over Qwen3.8-Flash-Next's codebook experts at the\n"
                 "                  model's geometry (1.3 GB of experts), and stop\n"
                 "  --moe-dtype L   the codebook forms --moe runs, comma-separated (default\n"
-                "                  w4nl64a8h; also w4nla8h, w4nl32a8h, w5nl64a8h)\n"
+                "                  w4nl64a8h; also w4nla8h, w4nl32a8h, w5nl64a8h, iq4nl32a16,\n"
+                "                  q50a16, q20a16)\n"
                 "  --threads N     OpenMP threads for the ceilings, the kernels, --moe and --joined\n"
                 "                  (default 1)\n"
                 "  --level L       time only ISA level L (0 scalar .. 3 avx512)\n"
