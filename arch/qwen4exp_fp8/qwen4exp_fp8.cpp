@@ -204,6 +204,10 @@ struct Model {
     std::vector<Layer> layers;
 
     rad_weight w_tok = 0, w_lm_head = 0;
+    /* The main token embedding when the container holds it as IQ4_XS (the UD map's form): the
+     * codes and its two scale planes are three weight operands of one gather. */
+    rad_weight w_tok_scale = 0, w_tok_d = 0;
+    bool       tok_iq4xs = false;
     rad_op op_embed = 0, op_embed_ar = 0, op_rope_cs = 0, op_gather = 0, op_logits = 0;
 
     /* ---- media (arch/common/rad_block_vit.h): the vision tower and the scatter of its rows over
@@ -920,26 +924,77 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                           nm.ckpt("model.language_model.embed_tokens.weight")));
     RAD_ARCH_TRY(map_copy_alt(b, nm.f("output.weight"), nm.ckpt("lm_head.weight"),
                               nm.ckpt("model.language_model.embed_tokens.weight")));
-    m.w_tok = decl_w(b, nm.f("token_embd.weight"), RAD_BF16, {g.n_vocab, g.n_embd},
-                     RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
+    /* The main token embedding is bf16 as the FP8 checkpoint ships it, or IQ4_XS when the map
+     * mirrors the Unsloth UD GGUF (u4 codes, a signed 6-bit scale per 32 values, an f16 `d` per
+     * 256). The encoding decides which gather the op is: a plain weight takes embed_lookup over
+     * one tensor, and IQ4_XS takes the codes and its two scale planes as three operands of
+     * embed_lookup_iq4xs. This is NOT the PLE n-gram table, which rad_block_ple.h declares. */
+    const char* tn = nm.f("token_embd.weight");
+    RadEncoding te{};
+    const bool tok_enc = weight_enc(b, tn, &te);
+    {
+        const RadEncPlane* tb  = rad_enc_plane(&te, "table");
+        const RadEncPlane* s6  = rad_enc_plane(&te, "scale");
+        const RadEncPlane* s16 = rad_enc_plane(&te, "scale.1");
+        m.tok_iq4xs = tok_enc && rad_enc_is(&te, "affine") && te.n_planes == 4 &&
+                      !te.transform[0] && te.plane[0].dtype == RAD_U4 &&
+                      te.plane[0].block[0] == 1 && te.plane[0].block[1] == 1 && tb &&
+                      tb->kind == RAD_PLANE_TABLE && tb->dtype == RAD_I8 && tb->extent[0] == 1 &&
+                      tb->extent[1] == 16 && s6 && s6->kind == RAD_PLANE_TILED &&
+                      s6->dtype == RAD_I6 && s6->block[0] == 1 && s6->block[1] == 32 && s16 &&
+                      s16->kind == RAD_PLANE_TILED && s16->dtype == RAD_F16 &&
+                      s16->block[0] == 1 && s16->block[1] == 256;
+    }
+    if (m.tok_iq4xs && (g.n_embd % 256 || g.n_embd < 256)) {
+        fprintf(stderr, "radiance: qwen4exp: IQ4_XS token embedding with n_embd %lld, not whole "
+                        "256-value scale blocks\n", (long long)g.n_embd);
+        return RAD_E_SHAPE;
+    }
+    if (m.tok_iq4xs) {
+        m.w_tok = decl_view(b, tn, nullptr, "codes", RAD_U4, {g.n_vocab, g.n_embd},
+                            RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
+        m.w_tok_scale = decl_view(b, nm.f("token_embd.scale"), tn, "scale", RAD_I6,
+                                  {g.n_vocab, g.n_embd / 32}, RAD_ACCESS_VOCAB, RAD_SHARD_ROW,
+                                  grp_model());
+        m.w_tok_d = decl_view(b, nm.f("token_embd.scale1"), tn, "scale.1", RAD_F16,
+                              {g.n_vocab, g.n_embd / 256}, RAD_ACCESS_VOCAB, RAD_SHARD_ROW,
+                              grp_model());
+    } else {
+        m.w_tok = decl_w(b, tn, RAD_BF16, {g.n_vocab, g.n_embd},
+                         RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
+    }
     m.w_lm_head = decl_w(b, nm.f("output.weight"),
                          weight_codes_dtype(b, nm.f("output.weight"), RAD_BF16),
                          {g.n_vocab, g.n_embd}, RAD_ACCESS_VOCAB, RAD_SHARD_ROW, grp_model());
-    if (!m.w_tok || !m.w_lm_head) return RAD_E_INVAL;
+    if (!m.w_tok || !m.w_lm_head ||
+        (m.tok_iq4xs && (!m.w_tok_scale || !m.w_tok_d))) return RAD_E_INVAL;
     /* The rank's rows, stated explicitly: a vocabulary the world does not divide (248320 at three
      * ranks) is split by rad_arch.h's rule (ceil to a 128-row block, last rank short), not the
      * core's even share. Where it divides, the span equals the even share. */
     if (g.world > 1) {
         RAD_ARCH_TRY(rad_weight_shard_span(b, m.w_tok,     g.vocab_off, g.vocab_off + g.n_vocab));
         RAD_ARCH_TRY(rad_weight_shard_span(b, m.w_lm_head, g.vocab_off, g.vocab_off + g.n_vocab));
+        if (m.tok_iq4xs) {
+            RAD_ARCH_TRY(rad_weight_shard_span(b, m.w_tok_scale, g.vocab_off,
+                                               g.vocab_off + g.n_vocab));
+            RAD_ARCH_TRY(rad_weight_shard_span(b, m.w_tok_d, g.vocab_off,
+                                               g.vocab_off + g.n_vocab));
+        }
     }
 
-    m.op_embed = rw(b, RAD_OP(b, "embed_lookup",
-                       RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n_embd", g.n_embd),
-                                  RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
-                                  RAD_INT("vocab_offset", g.vocab_off)),
-                       RAD_WEIGHTS(m.w_tok)),
-                   {}, {m.a_x.x});
+    m.op_embed = m.tok_iq4xs
+        ? rw(b, RAD_OP(b, "embed_lookup_iq4xs",
+                  RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n_embd", g.n_embd),
+                             RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
+                             RAD_INT("vocab_offset", g.vocab_off)),
+                  RAD_WEIGHTS(m.w_tok, m.w_tok_scale, m.w_tok_d)),
+              {}, {m.a_x.x})
+        : rw(b, RAD_OP(b, "embed_lookup",
+                  RAD_PARAMS(RAD_RANGE("M", 1, T), RAD_INT("n_embd", g.n_embd),
+                             RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
+                             RAD_INT("vocab_offset", g.vocab_off)),
+                  RAD_WEIGHTS(m.w_tok)),
+              {}, {m.a_x.x});
     /* The encoder's rows overwrite the lookup before its reduction (see MediaRows). */
     m.media = VisionTower::present(meta) && ctx->max_enc_patches > 0;
     if (m.media) RAD_ARCH_TRY(m.mrows.declare(b, T, g.n_embd, m.a_x.x));
@@ -1528,8 +1583,12 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
                     (long long)T, (long long)K, (long long)R);
     }
 
-    RAD_ISSUE(c, m.op_embed,
-              praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok), brows(m.a_x.x, T));
+    if (m.tok_iq4xs)
+        RAD_ISSUE(c, m.op_embed, praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok),
+                  RAD_W(m.w_tok_scale), RAD_W(m.w_tok_d), brows(m.a_x.x, T));
+    else
+        RAD_ISSUE(c, m.op_embed,
+                  praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok), brows(m.a_x.x, T));
     m.mrows.step(c, batch, m.a_x.x, T);
     on1(true, [&] { RAD_ISSUE_N(c, m.op_embed_ar, T * g.n_embd, brows(m.a_x.x, T), RAD_NONE); });
     wait1();
@@ -1606,8 +1665,12 @@ static void step_pipelined(RadCtx* c, const RadBatch* batch, Model& m, const int
 static void step_serial(RadCtx* c, const RadBatch* batch, Model& m, const int32_t* pcu) {
     const Geom& g = m.g;
     const int64_t T = batch->n_tok;
-    RAD_ISSUE(c, m.op_embed,
-              praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok), brows(m.a_x.x, T));
+    if (m.tok_iq4xs)
+        RAD_ISSUE(c, m.op_embed, praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok),
+                  RAD_W(m.w_tok_scale), RAD_W(m.w_tok_d), brows(m.a_x.x, T));
+    else
+        RAD_ISSUE(c, m.op_embed,
+                  praw(batch->token_ids, RAD_I32, T), RAD_W(m.w_tok), brows(m.a_x.x, T));
     m.mrows.step(c, batch, m.a_x.x, T);
     /* Unconditional, unlike qwen35_fp8's: the first block has no norm to fold it into, only a
      * gated-residual read. */

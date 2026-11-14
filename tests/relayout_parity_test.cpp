@@ -869,6 +869,70 @@ TEST(the_ngram_table_reads_iq4_nl_as_stored) {
     dlclose(so);
 }
 
+/* The main token embedding's IQ4_XS table (llama.cpp's iq4_xs, libquant's planes): u4 codes, a
+ * 16-entry i8 codebook, a signed 6-bit scale per 32 values and an f16 `d` per 256. The host gather
+ * reads the three stored planes as they are, so the layout hook accepts each operand and declines
+ * to rearrange it; a scale of another block, a `d` of another block, or a width that is not whole
+ * 256s is refused. */
+TEST(the_token_table_reads_iq4_xs_as_stored) {
+#if !defined(__x86_64__)
+    SKIP("libavx is x86-64 only");
+#endif
+    NEED_LIBQUANT();
+    const std::string avx = home() + "/kernels/libavx.so";
+    void* so = dlopen(avx.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (!so) ARTIFACT_MISSING(avx + " (does not load: " + dlerror() + ")");
+    Hooks nf;
+    nf.layout = (RadLayoutFn)dlsym(so, "avx_layout_embed_xs");
+    REQUIRE(nf.layout != nullptr);
+
+    const int64_t V = 100, E = 512;
+    const std::vector<float> w = draw(V * E, 28, 20.0f);
+    const RadQuantizerInfo* ggml = quantizer("ggml");
+    REQUIRE(ggml != nullptr);
+    Opts qo;
+    qo.s("type", "iq4_xs");
+    const Quantised q = quantise(ggml, qo, "token_embd.weight", V, E, w);
+    REQUIRE_EQ(q.status, RAD_OK);
+    CHECK(rad_enc_is(&q.enc, "affine"));
+    REQUIRE(rad_enc_plane(&q.enc, "table") != nullptr);
+    CHECK_EQ(rad_enc_plane(&q.enc, "table")->extent[1], 16);
+    CHECK_EQ(rad_enc_plane(&q.enc, "scale")->block[1], 32);
+    CHECK_EQ(rad_enc_plane(&q.enc, "scale")->dtype, (uint32_t)RAD_I6);
+    CHECK_EQ(rad_enc_plane(&q.enc, "scale.1")->block[1], 256);
+    CHECK_EQ(rad_enc_plane(&q.enc, "scale.1")->dtype, (uint32_t)RAD_F16);
+
+    Opts kp;
+    kp.i("n_vocab", V).i("n_embd", E);
+    for (const auto& op : { std::pair<int, const char*>{ 1, "codes" },
+                            std::pair<int, const char*>{ 2, "scale" },
+                            std::pair<int, const char*>{ 3, "scale.1" } }) {
+        Selection s = select(q, V, E, { op.second });
+        RadLayout L{};
+        CHECK_EQ(nf.layout(kp.data(), kp.n(), op.first, &q.enc, s.sel.data(), s.t.data(),
+                           (int)s.t.size(), &L), RAD_E_UNSUPPORTED);
+    }
+    /* A `d` plane at one value a row rather than one per 256 is a different reading of the same
+     * bytes. */
+    {
+        Selection s = select(q, V, E, { "scale.1" });
+        s.t[0].shape[1] = 1;
+        RadLayout L{};
+        CHECK_EQ(nf.layout(kp.data(), kp.n(), 3, &q.enc, s.sel.data(), s.t.data(), 1, &L),
+                 RAD_E_SHAPE);
+    }
+    /* The block grid needs whole 256-value rows. */
+    {
+        Opts bad;
+        bad.i("n_vocab", V).i("n_embd", 384);
+        Selection s = select(q, V, E, { "codes" });
+        RadLayout L{};
+        CHECK_EQ(nf.layout(bad.data(), bad.n(), 1, &q.enc, s.sel.data(), s.t.data(),
+                           (int)s.t.size(), &L), RAD_E_SHAPE);
+    }
+    dlclose(so);
+}
+
 TEST(a_kernel_refuses_an_encoding_it_does_not_read) {
     NEED_LIBQUANT();
     const int64_t N = 64, K = 256;

@@ -1931,6 +1931,53 @@ RadModelMeta qwen4exp_meta() {
 }
 }  /* namespace */
 
+/* The main token embedding (`token_embd`) is declared from its container encoding, outside
+ * rad_block_ple.h: an IQ4_XS source (u4 codes, a 16-entry i8 codebook, a signed i6 scale per 32
+ * values and an f16 `d` per 256) becomes three views and one embed_lookup_iq4xs. With no encoding
+ * the same weight stays the bf16 embed_lookup it was. */
+TEST(the_token_embedding_declares_iq4_xs_when_the_container_holds_it) {
+    using namespace rad::arch;
+    RadEncoding xs = rad_enc_affine(RAD_U4, RAD_I6, 1, 32);
+    rad_enc_add_table(&xs, "table", RAD_I8, 1, 16);
+    rad_enc_add_plane(&xs, "scale.1", RAD_F16, 1, 256);
+
+    RadModelMeta meta = qwen4exp_meta();
+    RadBuildCtx c = build_ctx();
+    RadBuilder b;
+    b.encs = { { "token_embd.weight", xs } };
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+
+    const RecWeight* codes = find_w(b, "token_embd.weight");
+    const RecWeight* scale = find_w(b, "token_embd.scale");
+    const RecWeight* d     = find_w(b, "token_embd.scale1");
+    REQUIRE(codes && scale && d);
+    CHECK_EQ(codes->d.dtype, (uint32_t)RAD_U4);
+    CHECK_EQ(codes->d.shape[0], meta.n_vocab);
+    CHECK_EQ(codes->d.shape[1], meta.n_embd);
+    CHECK_EQ(scale->d.dtype, (uint32_t)RAD_I6);
+    CHECK_EQ(scale->d.shape[0], meta.n_vocab);
+    CHECK_EQ(scale->d.shape[1], meta.n_embd / 32);
+    CHECK_EQ(d->d.dtype, (uint32_t)RAD_F16);
+    CHECK_EQ(d->d.shape[0], meta.n_vocab);
+    CHECK_EQ(d->d.shape[1], meta.n_embd / 256);
+
+    const RecOp* gth = find_op(b, "embed_lookup_iq4xs");
+    REQUIRE(gth);
+    CHECK_EQ(gth->w.size(), 3u);
+    CHECK(find_op(b, "embed_lookup") == nullptr);
+
+    /* The plain form is untouched: a builder with no encoding for the weight declares the bf16
+     * table and embed_lookup. */
+    RadBuilder p;
+    REQUIRE_EQ(qwen4exp_fp8::declare(&p, &meta, &c), RAD_OK);
+    const RecWeight* pcodes = find_w(p, "token_embd.weight");
+    REQUIRE(pcodes);
+    CHECK_EQ(pcodes->d.dtype, (uint32_t)RAD_BF16);
+    CHECK(find_w(p, "token_embd.scale") == nullptr);
+    CHECK(find_op(p, "embed_lookup") != nullptr);
+    CHECK(find_op(p, "embed_lookup_iq4xs") == nullptr);
+}
+
 TEST(qwen4exp_pass_key_reuses_only_proven_uniform_prefill_grids) {
     RadModelMeta meta = qwen4exp_meta();
     RadBuildCtx build = build_ctx(0, 1);
