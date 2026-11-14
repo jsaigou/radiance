@@ -25,6 +25,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -636,7 +637,7 @@ def source_quant(path):
 
 def _plan_namespace(args, declared, policy, recipe_out=None, json_out=None):
     return argparse.Namespace(
-        gguf=args.gguf, declared=declared, source=args.source,
+        gguf=args.gguf, declared=declared, source=getattr(args, "source", None),
         recipe_out=recipe_out, json=json_out,
         mtp=getattr(args, "mtp", "keep"), vision=getattr(args, "vision", "keep"),
         policy=policy, gptq=getattr(args, "gptq", False),
@@ -758,6 +759,7 @@ def build(args):
                                    tol=getattr(args, "tol", 0.20),
                                    draft_tol=getattr(args, "draft_tol", 0.75),
                                    skip_gguf=getattr(args, "skip_gguf", False),
+                                   max_experts=getattr(args, "max_experts", 0),
                                    policy="auto")
         return rc if verify(vargs) else 1
     return rc
@@ -1601,6 +1603,23 @@ def _wait_server(port, proc, key=None, timeout=900):
     return False
 
 
+def _stop_server(proc):
+    """Terminate the server's whole process group: a flock wrapper is a parent, and terminating
+    it alone would leave the engine holding the card and the GPU lock."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait(timeout=30)
+
+
 def _metrics(port, key=None):
     import urllib.request
     h = {"Authorization": "Bearer " + key} if key else {}
@@ -1615,7 +1634,10 @@ def _metrics(port, key=None):
             parts = ln.split()
             if len(parts) >= 2:
                 try:
+                    # Keep the labelled key and the bare metric name, so a caller can ask for
+                    # radiance:draft_acceptance_ratio without knowing the engine's labels.
                     out[parts[0]] = float(parts[-1])
+                    out[parts[0].split("{")[0]] = float(parts[-1])
                 except ValueError:
                     pass
     return out
@@ -1728,7 +1750,8 @@ def score_quality(args):
     cmd = _server_cmd(args, args.model, port)
     log = open(os.path.join(args.out_dir, "server.log"), "w")
     print("+ " + shlex.join(cmd), flush=True)
-    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
+    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env,
+                            start_new_session=True)
     try:
         if not _wait_server(port, proc, key, args.timeout):
             print("ud_map score quality: the server did not come up; see " + log.name,
@@ -1769,11 +1792,7 @@ def score_quality(args):
         print(json.dumps(summary, indent=1))
         return 0
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        _stop_server(proc)
         log.close()
 
 
@@ -1794,7 +1813,8 @@ def _measure_one(args, name, path):
     cmd = _server_cmd(args, path, port, spec=spec)
     log = open(os.path.join(args.out_dir, f"server-{name}.log"), "w")
     print("+ " + shlex.join(cmd), flush=True)
-    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env)
+    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env,
+                            start_new_session=True)
     try:
         if not _wait_server(port, proc, key, args.timeout):
             return dict(name=name, model=path, error="server did not start")
@@ -1820,15 +1840,16 @@ def _measure_one(args, name, path):
         decs = [x["decode_tok_s"] for x in recs if x["decode_tok_s"]]
         ttfts = [x["ttft"] for x in recs if x["ttft"]]
         acc = after.get("radiance:draft_acceptance_ratio")
-        if acc is None:
-            acc = after.get("radiance:draft_acceptance_ratio{}")
+        steps = after.get("radiance:engine_steps_decode_total")
+        toks = after.get("radiance:decode_tokens_total")
+        tps = (toks / steps) if toks and steps else None
         return dict(name=name, model=path, file_bytes=os.path.getsize(path),
                     spec=spec,
                     A_decode_tok_s_1stream=decs[0] if decs else None,
                     A_decode_tok_s_agg=(sum(x.get("n") or 0 for x in recs) / wall
                                         if wall > 0 else None),
                     A_ttft_p50=(sorted(ttfts)[len(ttfts) // 2] if ttfts else None),
-                    A_tokens_per_step=after.get("radiance:tokens_per_step"),
+                    A_tokens_per_step=tps,
                     acceptance=acc,
                     B_prefill_ttft=b["ttft"], B_decode_tok_s=b["decode_tok_s"],
                     metrics_delta={k: after[k] - before.get(k, 0) for k in after
@@ -1836,11 +1857,7 @@ def _measure_one(args, name, path):
                                    after[k] != before.get(k, 0)},
                     errors=[x["error"] for x in recs + [b] if x.get("error")])
     finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        _stop_server(proc)
         log.close()
 
 
@@ -1963,6 +1980,7 @@ def main():
     b.add_argument("--tol", type=float, default=0.20)
     b.add_argument("--draft-tol", type=float, default=0.75)
     b.add_argument("--skip-gguf", action="store_true")
+    b.add_argument("--max-experts", type=int, default=0)
     b.add_argument("--rad-convert")
     _common(b)
     b.set_defaults(fn=build)
