@@ -526,6 +526,8 @@ struct MoeFP8 {
     static constexpr bool fmt_rot(int f) {
         return f == 2 || f == 4 || f == 5 || f == 6 || f == 7 || f == 15;
     }
+    /* IQ4_XS, the one form whose `moe_gemm_q_s2` op takes a third weight table a class. */
+    static constexpr bool fmt_s2(int f) { return f == 16; }
     /* format_of's numbers as the grouped GEMMs' dtype strings. */
     static constexpr const char* kServed[17] = { "fp8a8", "w4a8", "w4a8h", "bf16", "w4nla8h",
                                                 "w4nl64a8h", "w4nl32a8h", "w5nl64a8h", "mxfp4a8", "fp8a8f32",
@@ -2071,6 +2073,25 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
         RAD_ISSUE_N(c_, op_gu, rows, brow_slice(w.h.x, r0, rows, g.n_embd),
                     RAD_WTAB(w_gu[0], ne), brows(w.sorted, rows * k), brows(w.eoff, ne + 1),
                     brows(w.egu, rows * k));
+    /* IQ4_XS's `moe_gemm_q_s2` carries a THIRD table a class (the f16 d), so each class's run is
+     * codes, scale, scale1 in declaration order. Omit it and the op is issued two operands short
+     * of its schema at the shared op's positions. */
+    else if (fmt_s2(fmt[0]) && ncls == 4)
+        RAD_ISSUE_N(c_, op_gu, rows, brow_slice(w.h.x, r0, rows, g.n_embd), RAD_NONE,
+                    RAD_WTAB(w_gu[0], n4[0]), RAD_WTAB(w_gus[0], n4[0]), RAD_WTAB(w_gus1[0], n4[0]),
+                    brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+                    RAD_WTAB(w_gu[1], n4[1]), RAD_WTAB(w_gus[1], n4[1]), RAD_WTAB(w_gus1[1], n4[1]),
+                    RAD_WTAB(w_gu[2], n4[2]), RAD_WTAB(w_gus[2], n4[2]), RAD_WTAB(w_gus1[2], n4[2]),
+                    RAD_WTAB(w_gu[3], n4[3]), RAD_WTAB(w_gus[3], n4[3]), RAD_WTAB(w_gus1[3], n4[3]),
+                    brows(w.egu, rows * k));
+    else if (fmt_s2(fmt[0]))
+        RAD_ISSUE_N(c_, op_gu, rows, brow_slice(w.h.x, r0, rows, g.n_embd), RAD_NONE,
+                    RAD_WTAB(w_gu[0], n_reg / 2), RAD_WTAB(w_gus[0], n_reg / 2),
+                    RAD_WTAB(w_gus1[0], n_reg / 2),
+                    brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+                    RAD_WTAB(w_gu[1], n_reg / 2), RAD_WTAB(w_gus[1], n_reg / 2),
+                    RAD_WTAB(w_gus1[1], n_reg / 2),
+                    brows(w.egu, rows * k));
     else if (gu_unrot && ncls == 4)
         RAD_ISSUE_N(c_, op_gu, rows, brow_slice(w.h.x, r0, rows, g.n_embd), RAD_NONE,
                     RAD_WTAB(w_gu[0], n4[0]), RAD_WTAB(w_gus[0], n4[0]),
@@ -2110,6 +2131,22 @@ inline void MoeFP8::pass(RadCtx* c_, int64_t T, int64_t r0, int64_t rows, bool o
     if (c.expert_bf16)
         RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff.x, rows * k), RAD_WTAB(w_dn[0], ne),
                     brows(w.sorted, rows * k), brows(w.eoff, ne + 1), brows(w.edn, rows * k));
+    else if (fmt_s2(fmt[1]) && ncls == 4)
+        RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff.x, rows * k), RAD_NONE,
+                    RAD_WTAB(w_dn[0], n4[0]), RAD_WTAB(w_dns[0], n4[0]), RAD_WTAB(w_dns1[0], n4[0]),
+                    brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+                    RAD_WTAB(w_dn[1], n4[1]), RAD_WTAB(w_dns[1], n4[1]), RAD_WTAB(w_dns1[1], n4[1]),
+                    RAD_WTAB(w_dn[2], n4[2]), RAD_WTAB(w_dns[2], n4[2]), RAD_WTAB(w_dns1[2], n4[2]),
+                    RAD_WTAB(w_dn[3], n4[3]), RAD_WTAB(w_dns[3], n4[3]), RAD_WTAB(w_dns1[3], n4[3]),
+                    brows(w.edn, rows * k));
+    else if (fmt_s2(fmt[1]))
+        RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff.x, rows * k), RAD_NONE,
+                    RAD_WTAB(w_dn[0], n_reg / 2), RAD_WTAB(w_dns[0], n_reg / 2),
+                    RAD_WTAB(w_dns1[0], n_reg / 2),
+                    brows(w.sorted, rows * k), brows(w.eoff, n_reg + 1),
+                    RAD_WTAB(w_dn[1], n_reg / 2), RAD_WTAB(w_dns[1], n_reg / 2),
+                    RAD_WTAB(w_dns1[1], n_reg / 2),
+                    brows(w.edn, rows * k));
     else if (dn_unrot && ncls == 4)
         RAD_ISSUE_N(c_, op_dn, rows, brows(w.eff.x, rows * k), RAD_NONE,
                     RAD_WTAB(w_dn[0], n4[0]), RAD_WTAB(w_dns[0], n4[0]),

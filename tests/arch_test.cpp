@@ -1943,6 +1943,8 @@ TEST(the_token_embedding_declares_iq4_xs_when_the_container_holds_it) {
 
     RadModelMeta meta = qwen4exp_meta();
     RadBuildCtx c = build_ctx();
+    /* A speculative deployment declares the MTP head, the second reader of the token table. */
+    c.max_tok = 2048; c.max_seqs = 8; c.max_spec = 3; c.max_ctx = 200000;
     RadBuilder b;
     b.encs = { { "token_embd.weight", xs } };
     REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
@@ -1961,9 +1963,16 @@ TEST(the_token_embedding_declares_iq4_xs_when_the_container_holds_it) {
     CHECK_EQ(d->d.shape[0], meta.n_vocab);
     CHECK_EQ(d->d.shape[1], meta.n_embd / 256);
 
-    const RecOp* gth = find_op(b, "embed_lookup_iq4xs");
-    REQUIRE(gth);
-    CHECK_EQ(gth->w.size(), 3u);
+    /* Both the trunk and the MTP head gather from the same IQ4_XS table, each with the three
+     * planes: the head used to declare a bf16 `embed_lookup` over the codes view, which the
+     * kernel refused at issue. */
+    int xs_ops = 0;
+    for (const RecOp& o : b.ops)
+        if (o.op == "embed_lookup_iq4xs") {
+            CHECK_EQ(o.w.size(), 3u);
+            ++xs_ops;
+        }
+    CHECK_EQ(xs_ops, 2);
     CHECK(find_op(b, "embed_lookup") == nullptr);
 
     /* The plain form is untouched: a builder with no encoding for the weight declares the bf16
@@ -2935,6 +2944,109 @@ TEST(iq4_xs_expert_declarations_use_the_s2_op_and_both_scales) {
     }
     CHECK(scale_i6 > 0);
     CHECK(scale1_f16 > 0);
+
+    /* The issue path: L10's declaration was complete, but each `moe_gemm_q_s2` issue listed only
+     * the shared two-table run -- 9 of the schema's 11 operands, which the engine refuses. Every
+     * issue now carries the activation, its absent A16 scale, three tables a class (codes, i6
+     * scale, f16 d), the sort, the offsets and y. */
+    std::unique_ptr<Kit> k = kit(b, { 1 }, {});
+    RadCtx run{};
+    run.b = &b;
+    run.batch = &k->b;
+    qwen4exp_fp8::step(&run, &k->b);
+    int s2_issues = 0;
+    for (const RecIssue& i : run.issues) {
+        const RecOp* o = b.op_of(i.op);
+        if (!o || o->op != "moe_gemm_q_s2") continue;
+        ++s2_issues;
+        CHECK_EQ((int)i.opd.size(), 11);
+        CHECK_EQ(i.opd[1].kind, (uint8_t)RAD_OPK_NONE);   /* a_scale, absent on the A16 form */
+        int wt = 0;
+        for (const RadOperand& od : i.opd) wt += (od.kind == RAD_OPK_WTAB);
+        CHECK_EQ(wt, 6);                                  /* codes, scale and d for both classes */
+    }
+    CHECK(s2_issues > 0);
+}
+
+/* The same IQ4_XS experts at four ranks: the width splits by expert number mod 4, so both
+ * projections take `moe_gemm_q_s2_mod4`, and each of the four classes contributes a third table.
+ * The issue must carry all 17 operands (the sort and offsets between the four table runs and y),
+ * the mod4 form of the same count bug. */
+TEST(iq4_xs_four_classes_issue_the_s2_mod4_op_with_every_operand) {
+    using namespace rad::arch;
+    /* Every class is a whole 256-value d group, the granularity of IQ4_XS's second level: the
+     * down projection contracts the class's K and its d covers 256 of it. (A container whose
+     * 128-column blocks do not cut into whole d groups cannot take the mod4 form at all, so this
+     * is a direct block test rather than a qwen4exp model: the eight-layer fixture's 640 splits
+     * 256/128/128/128.) */
+    const int64_t F = 512;
+    RadEncoding iq = rad_enc_affine(RAD_U4, RAD_I6, 1, 32);
+    rad_enc_add_table(&iq, "table", RAD_I8, 1, 16);
+    rad_enc_add_plane(&iq, "scale.1", RAD_F16, 1, 256);
+    REQUIRE(rad_enc_valid(&iq));
+    CHECK_EQ(MoeFP8::format_of(iq), 16);
+
+    RadBuilder b;
+    b.encs = { { "ffn_gate_up_exps", iq }, { "ffn_down_exps", iq } };
+    Names nm("");
+    Geom g{};
+    g.n_embd = 4096;
+    g.max_tok = 32;
+    g.world = 4;
+    g.rank = 0;
+    MoeFP8::Src src{};
+    src.router = "mlp.gate.weight";
+    src.experts = "mlp.experts";
+    src.cfg.n_expert = src.cfg.n_expert_all = 512;
+    src.cfg.top_k = 10;
+    src.cfg.rows = 32;
+    REQUIRE_EQ(MoeFP8::probe(&b, nm, 3, src, &src.cfg), RAD_OK);
+    CHECK_EQ(src.cfg.expert_iq4xs, 1);
+    for (int q = 0; q < 4; ++q) {
+        src.cfg.ff_lo4[q] = 0;
+        src.cfg.ff_hi4[q] = F;
+    }
+    src.cfg.n_ff_exp = F;
+
+    MoeFP8::Wire w{};
+    auto buf = [&](const char* name, uint32_t dt, int64_t rows, int64_t cols) {
+        return decl_b(&b, name, dt, { rows, cols });
+    };
+    w.h.x = buf("h", RAD_BF16, 32, 4096);
+    REQUIRE_EQ(w.h.declare_qs(&b, nm, g, "h", 4096), RAD_OK);
+    w.logits = buf("logits", RAD_BF16, 32, 512);
+    w.ids = buf("ids", RAD_I32, 32, 10);
+    w.ew = buf("ew", RAD_BF16, 32, 10);
+    w.eoff = decl_b(&b, "offset", RAD_I32, { 513 });
+    w.ecnt = decl_b(&b, "count", RAD_I32, { 512 });
+    w.sorted = decl_b(&b, "sorted", RAD_I32, { 320 });
+    w.egu = buf("gate_up", RAD_BF16, 320, 2 * F);
+    w.eff.x = buf("ff", RAD_BF16, 320, F);
+    REQUIRE_EQ(w.eff.declare_qs(&b, nm, g, "ff", F, 320), RAD_OK);
+    w.edn = buf("down", RAD_BF16, 320, 4096);
+    MoeFP8 moe;
+    REQUIRE_EQ(moe.declare(&b, nm, g, 3, w, src, false, false), RAD_OK);
+    CHECK_EQ(moe.ncls, 4);
+    CHECK_EQ(count_op(b, "moe_gemm_q_s2_mod4"), 2);
+    CHECK_EQ(count_op(b, "moe_gemm_q"), 0);
+
+    RadCtx ctx;
+    ctx.b = &b;
+    ctx.rank = 0;
+    ctx.world = 4;
+    moe.pass(&ctx, 8, 4, 4);
+    int issues = 0;
+    for (const RecIssue& i : ctx.issues) {
+        const RecOp* o = b.op_of(i.op);
+        if (!o || o->op != "moe_gemm_q_s2_mod4") continue;
+        ++issues;
+        CHECK_EQ((int)i.opd.size(), 17);
+        CHECK_EQ(i.opd[1].kind, (uint8_t)RAD_OPK_NONE);   /* a_scale, absent on the A16 form */
+        int wt = 0;
+        for (const RadOperand& od : i.opd) wt += (od.kind == RAD_OPK_WTAB);
+        CHECK_EQ(wt, 12);                                 /* codes, scale and d per class */
+    }
+    CHECK_EQ(issues, 2);   /* both projections */
 }
 
 /* Q2_0 is the third unrotated form: u2 codes at an f16 scale per 64, bf16 activations. */
