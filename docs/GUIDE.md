@@ -2282,7 +2282,7 @@ flags are refused on it, and so are the pixel bands.
 | `GET /health`, `/v1/health`, `/ping`, `POST /ping` | liveness |
 | `GET /load` | current load |
 | `GET /version` | server version |
-| `GET /props` | llama-server's props: `n_ctx`, `total_slots`, `modalities`, `model_path`, the chat template and its capabilities, `bos_token`/`eos_token`, and the request defaults under llama-server's names |
+| `GET /props` | llama-server's props: `n_ctx`, `total_slots`, `modalities`, `model_path`, the chat template and its capabilities, `bos_token`/`eos_token`, and the request defaults under llama-server's names. Keyless, `model_path` and the template source answer the local operator only (§6.6); the capability flags stay open — clients build requests from them |
 | `POST /apply-template` | the prompt a chat request renders to, as llama-server returns it |
 | `POST /v1/chat/completions/input_tokens` | how many tokens that prompt is |
 | `GET /server_info` | the whole configuration of the running engine |
