@@ -108,6 +108,30 @@ TEST(two_containers_are_refused_by_name) {
     CHECK(why.find("--model") != std::string::npos);
 }
 
+/* A repo fetched with hfget holds its source weights in the directory; a lone .rad among them
+ * -- whoever put it there -- must not be served in their place without one word said. The
+ * engine names the ambiguity instead of resolving it by rank. */
+TEST(a_container_beside_other_weights_is_not_served_silently) {
+    TempDir t;
+    t.touch("model-00001-of-00002.safetensors");
+    t.touch("model-00002-of-00002.safetensors");
+    t.touch("model.safetensors.index.json");
+    t.touch("decoy.rad");
+    std::string why;
+    CHECK_EQ(hf_served_path(t.path, &why), std::string());
+    CHECK(why.find("decoy.rad") != std::string::npos);
+    CHECK(why.find("--model") != std::string::npos);
+    /* gguf competes too, and without any competitor the lone container is still the answer. */
+    TempDir g;
+    g.touch("model.gguf");
+    g.touch("converted.rad");
+    CHECK_EQ(hf_served_path(g.path, &why), std::string());
+    TempDir r;
+    r.touch("qwen.rad");
+    r.touch("config.json");
+    CHECK_EQ(hf_served_path(r.path, &why), r.path + "/qwen.rad");
+}
+
 TEST(the_download_dir_defaults_to_the_xdg_cache) {
     const char* x = std::getenv("XDG_CACHE_HOME");
     const std::string saved = x ? x : "";

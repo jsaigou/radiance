@@ -97,18 +97,30 @@ std::string hf_default_download_dir() {
 
 std::string hf_served_path(const std::string& dir, std::string* why) {
     std::vector<std::string> rad;
+    int64_t other_fmt = 0;
     std::error_code ec;
     for (const fs::directory_entry& e : fs::directory_iterator(dir, ec)) {
         std::error_code fe;
-        if (e.is_regular_file(fe) && e.path().filename().string().ends_with(".rad"))
-            rad.push_back(e.path().filename().string());
+        if (!e.is_regular_file(fe)) continue;
+        const std::string name = e.path().filename().string();
+        if (name.ends_with(".rad")) rad.push_back(name);
+        /* A repo fetched with hfget holds its source weights beside anything the operator or a
+         * conversion added later; a container sitting among them is not self-appointing. */
+        else if (name.ends_with(".safetensors") || name.ends_with(".gguf")) ++other_fmt;
     }
     if (ec) {
         *why = dir + ": " + ec.message();
         return std::string();
     }
     if (rad.empty()) return dir;
-    if (rad.size() == 1) return dir + "/" + rad[0];
+    if (rad.size() == 1) {
+        if (other_fmt > 0) {
+            *why = dir + " holds the container " + rad[0] + " beside safetensors or gguf weights; " +
+                   "pass the one to serve as --model " + dir + "/<file>";
+            return std::string();
+        }
+        return dir + "/" + rad[0];
+    }
     std::string names;
     for (size_t i = 0; i < rad.size(); ++i) names += (i ? ", " : "") + rad[i];
     *why = dir + " holds " + std::to_string(rad.size()) + " containers (" + names +

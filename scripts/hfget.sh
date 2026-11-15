@@ -147,7 +147,7 @@ bad=$(printf '%s' "$listing" | jq -r '[.[] | select(.type == "file")
 [ -n "$bad" ] && { echo "hfget: the listing names '$bad', which does not land inside the destination" >&2; exit 1; }
 have_st=$(printf '%s' "$listing" | jq '[.[] | select(.path | endswith(".safetensors"))] | length')
 sel='.[] | select(.type == "file")'
-[ "$have_st" -gt 0 ] && sel="$sel"' | select((.path | test("\\.(bin|msgpack|h5|onnx|onnx_data|gguf)$") or test("(^|/)(pytorch_model|consolidated)[^/]*\\.pth$")) | not)'
+[ "$have_st" -gt 0 ] && sel="$sel"' | select((.path | test("\\.(bin|msgpack|h5|onnx|onnx_data|gguf|rad)$") or test("(^|/)(pytorch_model|consolidated)[^/]*\\.pth$")) | not)'
 
 list=$(mktemp "${TMPDIR:-/tmp}/hfget.XXXXXX")
 trap 'rm -f "$list" "$dest/.hfget-manifest.tmp"' EXIT INT TERM
