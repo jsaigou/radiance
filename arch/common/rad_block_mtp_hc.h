@@ -140,7 +140,10 @@ struct MtpHcBlock {
      * map) and declares the head's buffers if that returns true. */
     static const char* head_name(Names& nm) { return nm.f("mtp.draft_head.weight"); }
 
-    rad_weight w_tok = 0, w_lm = 0, w_fc_h = 0, w_fc_e = 0, w_pre_h = 0, w_pre_e = 0;
+    /* `w_tok_scale`/`w_tok_d` are the trunk's IQ4_XS token embedding's other two planes, zero
+     * when the token table is bf16 (`embed_lookup`). */
+    rad_weight w_tok = 0, w_tok_scale = 0, w_tok_d = 0;
+    rad_weight w_lm = 0, w_fc_h = 0, w_fc_e = 0, w_pre_h = 0, w_pre_e = 0;
     rad_weight w_dh = 0, w_dhs = 0;
 
     HyperConn    hc_attn{}, hc_mlp{}, mixer{};
@@ -173,15 +176,19 @@ struct MtpHcBlock {
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l, rad_kvgroup kv,
                  rad_kvgroup* qsa_bk, int64_t rotary_dim, rad_weight tok_embd, rad_weight lm_head,
-                 const HyperConn::Config& hc, int draft_depth, const Wire& wire, const Src& src);
+                 const HyperConn::Config& hc, int draft_depth, const Wire& wire, const Src& src,
+                 rad_weight tok_scale = 0, rad_weight tok_d = 0);
     void step(RadCtx* c, const RadBatch* batch) const;
 };
 
 inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l, rad_kvgroup kv,
                                rad_kvgroup* qsa_bk, int64_t rotary_dim, rad_weight tok_embd,
                                rad_weight lm_head, const HyperConn::Config& hc, int draft_depth,
-                               const Wire& wire, const Src& src) {
+                               const Wire& wire, const Src& src, rad_weight tok_scale,
+                               rad_weight tok_d) {
     g = geom; w = wire; layer = l; w_tok = tok_embd; w_lm = lm_head;
+    w_tok_scale = tok_scale; w_tok_d = tok_d;
+    if ((w_tok_scale == 0) != (w_tok_d == 0)) return RAD_E_INVAL;
     rows = g.max_tok; depth = draft_depth;
     /* The pre-fc norm over the wide stream is grouped, one rsqrt per sub-stream, like every gated
      * residual here. A flat norm fits the same [hc*n] gain and passes per-op checks; only the
@@ -220,17 +227,25 @@ inline int MtpHcBlock::declare(RadBuilder* b, Names& nm, const Geom& geom, int l
     if (!w_pre_h || !w_pre_e || !w_fc_h || !w_fc_e) return RAD_E_INVAL;
 
     /* Separate gather_rows and embed_lookup ops over the trunk's buffers and weights, because
-     * they write different buffers and liveness comes from each op's read/write sets. */
+     * they write different buffers and liveness comes from each op's read/write sets. An
+     * IQ4_XS token table takes the three-plane gather, exactly as the trunk does. */
     op_gather = rw(b, RAD_OP(b, "gather_rows",
                        RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n", HN),
                                   RAD_STR("dtype", g.dtype)),
                        RAD_NOWEIGHTS),
                    {w.src}, {w.hin});
-    op_embed = rw(b, RAD_OP(b, "embed_lookup",
-                     RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n_embd", g.n_embd),
-                                RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
-                                RAD_INT("vocab_offset", g.vocab_off)),
-                     RAD_WEIGHTS(w_tok)),
+    op_embed = w_tok_d
+        ? rw(b, RAD_OP(b, "embed_lookup_iq4xs",
+                       RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n_embd", g.n_embd),
+                                  RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
+                                  RAD_INT("vocab_offset", g.vocab_off)),
+                       RAD_WEIGHTS(w_tok, w_tok_scale, w_tok_d)),
+                 {}, {w.e})
+        : rw(b, RAD_OP(b, "embed_lookup",
+                       RAD_PARAMS(RAD_RANGE("M", 1, rows), RAD_INT("n_embd", g.n_embd),
+                                  RAD_INT("n_vocab", g.n_vocab), RAD_STR("dtype", g.dtype),
+                                  RAD_INT("vocab_offset", g.vocab_off)),
+                       RAD_WEIGHTS(w_tok)),
                  {}, {w.e});
     if (media) RAD_ARCH_TRY(mrows.declare(b, rows, g.n_embd, w.e));
     /* The trunk's table is vocab-sharded, so the lookup is partial and needs an exact
@@ -480,7 +495,11 @@ inline void MtpHcBlock::step(RadCtx* c, const RadBatch* batch) const {
                     RAD_B(w.src), praw(batch->out_ids, RAD_I32, batch->n_out),
                     brows(w.hin, batch->n_out));
 
-    RAD_ISSUE(c, op_embed, praw(batch->token_ids, RAD_I32, T), RAD_W(w_tok), brows(w.e, T));
+    if (w_tok_d)
+        RAD_ISSUE(c, op_embed, praw(batch->token_ids, RAD_I32, T), RAD_W(w_tok),
+                  RAD_W(w_tok_scale), RAD_W(w_tok_d), brows(w.e, T));
+    else
+        RAD_ISSUE(c, op_embed, praw(batch->token_ids, RAD_I32, T), RAD_W(w_tok), brows(w.e, T));
     mrows.step(c, batch, w.e, T);
     if (op_embed_ar)
         RAD_ISSUE_N(c, op_embed_ar, (int64_t)T * g.n_embd, brows(w.e, T), RAD_NONE);

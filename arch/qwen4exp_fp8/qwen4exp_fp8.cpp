@@ -1477,7 +1477,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
 
         m.mtp.media = m.media;
         RAD_ARCH_TRY(m.mtp.declare(b, nm, g, (int)g.n_layer, m.kv_full, &m.kv_qsa_bkey, m.n_rot,
-                                   m.w_tok, m.w_lm_head, m.hccfg, g.max_spec, tw, ts));
+                                   m.w_tok, m.w_lm_head, m.hccfg, g.max_spec, tw, ts,
+                                   m.w_tok_scale, m.w_tok_d));
         /* A head pass refills the rope table ahead of the head's ops (step), while the carry
          * `mtp_hin` still holds the rows the previous pass left. The refill is the trunk's
          * `rope_table` op, so the table's planned life would end at its last declared reader,
