@@ -2980,6 +2980,169 @@ TEST(iq2_s_expert_declarations_choose_the_unrotated_bf16_activation_path) {
     }
 }
 
+/* A UD map may store the two projections of a layer in different formats. IQ3_XXS gate_up (a grid
+ * code, u5 sub-scale per 32, already a group-32 form) over IQ4_NL down (u4 codes, an f16 scale per
+ * 32): both are unrotated with bf16 activations, but their codes and scale views differ, and the
+ * down plane must not be refused for not being iq3xxs32a16. The two scale views show the different
+ * declared extents: the grid form joins three planes at the weight's logical extents, IQ4_NL's is
+ * one plane per 32 of K. */
+TEST(iq3_gate_over_iq4nl_down_serve_each_projection_in_its_own_format) {
+    using namespace rad::arch;
+    RadModelMeta meta = qwen4exp_meta();
+    RadEncoding iq3 = iq_grid_enc(RAD_U8, 4, 256, 32);
+    RadEncoding iq4 = rad_enc_affine(RAD_U4, RAD_F16, 1, 32);
+    rad_enc_add_table(&iq4, "table", RAD_I8, 1, 16);
+    REQUIRE(rad_enc_valid(&iq3) && rad_enc_valid(&iq4));
+    CHECK_EQ(MoeFP8::format_of(iq3), 13);
+    CHECK_EQ(MoeFP8::format_of(iq4), 10);
+    const RadEncoding row8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 1, 128);
+    RadEncoding u2 = rad_enc_affine(RAD_U2, RAD_F16, 1, 128);
+    rad_enc_add_plane(&u2, "zero", RAD_U8, 1, 128);
+
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok = 2048; c.max_seqs = 8; c.max_spec = 3; c.max_ctx = 200000;
+    RadBuilder b;
+    b.encs = { { "ffn_gate_up_exps", iq3 }, { "ffn_down_exps", iq4 },
+               { "_hc_down.weight", row8 }, { "_hc_up.weight", row8 },
+               { "fc_hidden", row8 }, { "fc_embedding", row8 }, { "draft_head", u2 } };
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+    const qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[0];
+    CHECK_EQ(m.moecfg.expert_rot, 0);
+    CHECK_EQ(m.moecfg.expert_iq3, 1);
+    CHECK_EQ(m.moecfg.expert_iq4, 0);
+    CHECK_EQ(m.moecfg.fmt[0], 13);
+    CHECK_EQ(m.moecfg.fmt[1], 10);
+
+    int iq3_ops = 0, iq4_ops = 0, hq_ops = 0, rotated_ops = 0;
+    for (const RecOp& o : b.ops) {
+        if (o.op.rfind("moe_gemm", 0) == 0)
+            for (const auto& p : o.p) {
+                if (p.key != "dtype") continue;
+                if (p.sval == "iq3xxs32a16") ++iq3_ops;
+                if (p.sval == "iq4nl32a16") ++iq4_ops;
+            }
+        if (o.op == "had_quant_act_fp8") ++hq_ops;
+        if (o.op == "gated_had_quant_fp8") ++rotated_ops;
+    }
+    CHECK(iq3_ops > 0);
+    CHECK(iq4_ops > 0);
+    CHECK_EQ(hq_ops, 0);
+    CHECK_EQ(rotated_ops, 0);
+    for (const RecBuf& bf : b.bufs) CHECK(bf.name.find("moe_hr") == std::string::npos);
+
+    int gate_scales = 0, down_scales = 0;
+    for (const RecWeight& w : b.weights) {
+        const std::string n = w.name;
+        const bool is_scale = n.size() > 6 && n.compare(n.size() - 6, 6, ".scale") == 0;
+        if (!is_scale) continue;
+        if (n.find("ffn_gate_up_exps.") != std::string::npos) {
+            ++gate_scales;
+            CHECK(w.d.source != nullptr && w.d.planes &&
+                  std::string(w.d.planes) == "scale,scale.1,scale.2");
+            CHECK_EQ(w.d.dtype, (uint32_t)RAD_U5);
+            /* The grid form declares its scale at the logical extents (sgk 1). */
+            CHECK_EQ(w.d.shape[0], 2 * 640);
+            CHECK_EQ(w.d.shape[1], 2560);
+        } else if (n.find("ffn_down_exps.") != std::string::npos) {
+            ++down_scales;
+            CHECK(w.d.source != nullptr && w.d.planes && std::string(w.d.planes) == "scale");
+            CHECK_EQ(w.d.dtype, (uint32_t)RAD_F16);
+            /* IQ4_NL's f16 scale is one per 32 of K. */
+            CHECK_EQ(w.d.shape[1], 640 / 32);
+        }
+    }
+    CHECK(gate_scales > 0);
+    CHECK(down_scales > 0);
+
+    /* The run path: the gate_up GEMM reads `h`'s bf16 plane and the down GEMM the gated
+     * quantiser's, with no rotation, and every issue agrees with the declarations. */
+    std::unique_ptr<Kit> k = kit(b, { 1 }, {});
+    RadCtx run{};
+    run.b = &b;
+    run.batch = &k->b;
+    qwen4exp_fp8::step(&run, &k->b);
+    CHECK_LINT(b, &run);
+}
+
+/* IQ2_S gate_up over Q2_0 down: grid codes with a u5 sub-scale per 16 above u2 codes with an f16
+ * scale per 64. The two projections take different code dtypes, different scale planes and, in the
+ * declared views, different `sgk` (the grid's logical extents against Q2_0's 64). */
+TEST(iq2s_gate_over_q20_down_serve_each_projection_in_its_own_format) {
+    using namespace rad::arch;
+    RadModelMeta meta = qwen4exp_meta();
+    RadEncoding iq2 = iq_grid_enc(RAD_U10, 8, 1024, 16);
+    const RadEncoding q2 = rad_enc_affine(RAD_U2, RAD_F16, 1, 64);
+    REQUIRE(rad_enc_valid(&iq2) && rad_enc_valid(&q2));
+    CHECK_EQ(MoeFP8::format_of(iq2), 14);
+    CHECK_EQ(MoeFP8::format_of(q2), 12);
+    const RadEncoding row8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 1, 128);
+    RadEncoding u2 = rad_enc_affine(RAD_U2, RAD_F16, 1, 128);
+    rad_enc_add_plane(&u2, "zero", RAD_U8, 1, 128);
+
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok = 2048; c.max_seqs = 8; c.max_spec = 3; c.max_ctx = 200000;
+    RadBuilder b;
+    b.encs = { { "ffn_gate_up_exps", iq2 }, { "ffn_down_exps", q2 },
+               { "_hc_down.weight", row8 }, { "_hc_up.weight", row8 },
+               { "fc_hidden", row8 }, { "fc_embedding", row8 }, { "draft_head", u2 } };
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+    const qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[0];
+    CHECK_EQ(m.moecfg.expert_rot, 0);
+    CHECK_EQ(m.moecfg.expert_iq2, 1);
+    CHECK_EQ(m.moecfg.expert_q20, 0);
+    CHECK_EQ(m.moecfg.fmt[0], 14);
+    CHECK_EQ(m.moecfg.fmt[1], 12);
+
+    int iq2_ops = 0, q20_ops = 0, hq_ops = 0, rotated_ops = 0;
+    for (const RecOp& o : b.ops) {
+        if (o.op.rfind("moe_gemm", 0) == 0)
+            for (const auto& p : o.p) {
+                if (p.key != "dtype") continue;
+                if (p.sval == "iq2s32a16") ++iq2_ops;
+                if (p.sval == "q20a16") ++q20_ops;
+            }
+        if (o.op == "had_quant_act_fp8") ++hq_ops;
+        if (o.op == "gated_had_quant_fp8") ++rotated_ops;
+    }
+    CHECK(iq2_ops > 0);
+    CHECK(q20_ops > 0);
+    CHECK_EQ(hq_ops, 0);
+    CHECK_EQ(rotated_ops, 0);
+    for (const RecBuf& bf : b.bufs) CHECK(bf.name.find("moe_hr") == std::string::npos);
+
+    int gate_scales = 0, down_scales = 0;
+    for (const RecWeight& w : b.weights) {
+        const std::string n = w.name;
+        const bool is_scale = n.size() > 6 && n.compare(n.size() - 6, 6, ".scale") == 0;
+        if (!is_scale) continue;
+        if (n.find("ffn_gate_up_exps.") != std::string::npos) {
+            ++gate_scales;
+            CHECK(w.d.source != nullptr && w.d.planes &&
+                  std::string(w.d.planes) == "scale,scale.1,scale.2");
+            CHECK_EQ(w.d.dtype, (uint32_t)RAD_U5);
+            CHECK_EQ(w.d.shape[0], 2 * 640);
+            CHECK_EQ(w.d.shape[1], 2560);
+        } else if (n.find("ffn_down_exps.") != std::string::npos) {
+            ++down_scales;
+            CHECK(w.d.source != nullptr && w.d.planes && std::string(w.d.planes) == "scale");
+            CHECK_EQ(w.d.dtype, (uint32_t)RAD_F16);
+            /* Q2_0's f16 scale is one per 64 of K. */
+            CHECK_EQ(w.d.shape[1], 640 / 64);
+        }
+    }
+    CHECK(gate_scales > 0);
+    CHECK(down_scales > 0);
+
+    /* The run path: the gate_up GEMM reads `h`'s bf16 plane and the down GEMM the gated
+     * quantiser's, with no rotation, and every issue agrees with the declarations. */
+    std::unique_ptr<Kit> k = kit(b, { 1 }, {});
+    RadCtx run{};
+    run.b = &b;
+    run.batch = &k->b;
+    qwen4exp_fp8::step(&run, &k->b);
+    CHECK_LINT(b, &run);
+}
+
 /* w3nl64a8h is the rotated codebook at three bits: u3 codes into an eight-entry f32 table, an
  * E4M3 scale per 64 of K under the fixed second level, and fwht128. It is the w4nl64a8h family's
  * smallest form, so the arch must resolve the same rotated activation path (the preceding
