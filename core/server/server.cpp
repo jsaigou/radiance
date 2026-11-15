@@ -463,15 +463,15 @@ void Server::log_admitted(const OaiRequest& r) const {
     if (r.endpoint == Endpoint::Chat)
         RAD_INFO("req %s %s%s%s model=%s msgs=%d tools=%d prompt=%lld tok n=%d max_tokens=%lld",
                  r.id.c_str(), kind, r.stream ? " stream" : "", from_peer(r.peer).c_str(),
-                 r.model.c_str(), r.n_messages, r.n_tools, (long long)n_prompt, r.n,
+                 log_sanitize(r.model).c_str(), r.n_messages, r.n_tools, (long long)n_prompt, r.n,
                  (long long)r.max_tokens);
     else
         RAD_INFO("req %s %s%s%s model=%s prompts=%zu prompt=%lld tok n=%d max_tokens=%lld",
                  r.id.c_str(), kind, r.stream ? " stream" : "", from_peer(r.peer).c_str(),
-                 r.model.c_str(), r.prompts.size(), (long long)n_prompt, r.n,
+                 log_sanitize(r.model).c_str(), r.prompts.size(), (long long)n_prompt, r.n,
                  (long long)r.max_tokens);
     if (!r.last_user.empty())
-        RAD_DEBUG("req %s last user: %s", r.id.c_str(), r.last_user.c_str());
+        RAD_DEBUG("req %s last user: %s", r.id.c_str(), log_sanitize(r.last_user).c_str());
 }
 
 /* ------------------------------------------------------------------ submission */
