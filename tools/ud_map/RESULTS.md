@@ -172,6 +172,40 @@ Tests: `python3 -m unittest tools/ud_map/test_ud_map.py` — 36 tests (2 integra
 `UD_MAP_GGUF`/`UD_MAP_DECLARED`); the two integration tests pass on Tohil against the Flash-Next
 GGUF + declared plan.
 
+## Flash-Next mirror (UD-faithful) plan (L8; plan-only, no container)
+
+The mirror policy keeps every GGUF tensor's own type; it is the 89.0 GiB UD-faithful target, not
+the fast remap. Measured on Tohil (2026-11-15, CPU, ~11 s):
+
+```sh
+python3 tools/ud_map/ud_map.py plan /opt/tohil/models/qwen3.8-flash-next/UD-Q3_K_XL/*.gguf \
+  --declared ~/radiance-test/fn-bf16.plan.json \
+  --source /opt/tohil/models/_safetensors-src/Qwen3.8-Flash-Next \
+  --policy mirror --recipe-out fn-mirror.recipe --json fn-mirror.plan.json
+```
+
+**1044/1044 declared targets, 1224 mapped tensors, 0 fusion problems, 0 unmapped.** Mapped
+83.310 GiB + kept 5.692 GiB = **89.003 GiB** (95,566,087,928 B). By type (GiB): IQ4_NL 38.248,
+IQ3_XXS 22.730, Q5_0 10.742, IQ4_XS 5.295, Q6_K 2.181, IQ2_S 2.002, Q8_0 1.344, Q2_0 0.439,
+F32 0.292, BF16 0.037. Kept: MTP layer `blk.48` 4.795, MTP head `mtp.*` 0.061, vision `v.*`
+0.836, i64 metadata; derived 0. The base build serves 49.758 GiB by format; the rest waits on
+L1/L2/L3.
+
+`rad-convert --plan-only` parses the 511 rules and stops on the first missing format. On the
+base build (before the shared tree picked up L3) that was `blk.0.ffn_gate_up_exps.0.weight`,
+IQ2_S (`u10`, 1024x8 grid, signs, `u5`) — L1 (`acdc63f`). L2 (`ead15cc`) and L3 (`13ab816`)
+were also unmerged. On the current tree (L3's dense wiring) the exact base recipe is refused
+earlier at `output.weight` Q6_K: `logits_gemm` has one operand and no Q6_K row, so L3's
+`ud_map.py` writes the head as the served i8 form (+118 MiB) and the Q8_0 `*_hc_down/up` rows
+as E4M3. The servable post-L3 mirror is therefore ~89.12 GiB, not 89.003.
+
+After L1/L2/L3 the map still has two non-lane blockers: the IQ4_XS routed experts (4.98 GiB)
+have no kernel (L2 only adds the token-embedding gather), and `MoeFP8` serves one encoding per
+layer except the rotated w4/w5 family (the fast path's w3 adds a fourth), while the UD map
+mixes gate/up and down in all 48 layers. The kept bf16 MTP layer (512 experts) is also refused
+(protected-expert cap 8). The fast recipe exists to avoid exactly those two constraints. The
+fit model, levers and lead runbook are in `fork-notes/flashnext-ud-fit-runbook.md`.
+
 ### For the lead: the one arch change this lane needs
 
 `arch/common/rad_block_moe_fp8.h` must declare `w3nl64a8h` (the existing libhalo kernel, W4=5):

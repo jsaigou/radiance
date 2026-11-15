@@ -4,6 +4,7 @@ the declared plan are given: UD_MAP_GGUF (all shards, colon-separated) and UD_MA
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -288,6 +289,62 @@ class FastFlashNext(unittest.TestCase):
         self.assertRegex(text, r"blk\.48\.ffn_down_exps\.\*\.weight.*table=w4nl")
 
 
+class MirrorFlashNext(unittest.TestCase):
+    """The mirror policy is the UD-faithful path: each tensor keeps the GGUF's own format."""
+
+    def test_every_ud_type_gets_its_own_ggml_spelling(self):
+        text = ud_map._mirror_recipe(_rows_4exp(), "m.gguf")
+        expected = {
+            "blk.0.ffn_gate_up_exps.*.weight": "iq3_xxs",   # IQ3_XXS gate/up
+            "blk.0.ffn_down_exps.*.weight": "iq4_nl",       # IQ4_NL down
+            "blk.1.ffn_gate_up_exps.*.weight": "iq4_xs",    # IQ4_XS gate/up
+            "blk.1.ffn_down_exps.*.weight": "q5_0",         # Q5_0 down
+            "blk.2.ffn_gate_up_exps.*.weight": "iq2_s",     # IQ2_S gate/up
+            "blk.2.ffn_down_exps.*.weight": "q2_0",         # TYPE42 down
+            "blk.1.ple_ngram.weight": "iq4_nl",             # PLE n-gram table
+            "token_embd.weight": "iq4_xs",                  # token embedding
+            "output.weight": "q6_k",
+            "blk.0.ssm_out.weight": "q8_0",
+            "blk.0.ffn_gate_up_shexp.weight": "q6_k",
+        }
+        for target, spell in expected.items():
+            self.assertRegex(text, re.escape(target) + r"\s+ggml type=" + re.escape(spell),
+                             f"{target} should keep {spell}")
+
+    def test_mixed_projection_formats_are_preserved(self):
+        # UD mixes gate/up and down within a layer; the mirror recipe must not flatten it.
+        text = ud_map._mirror_recipe(_rows_4exp(), "m.gguf")
+        self.assertRegex(text, r"blk\.0\.ffn_gate_up_exps\.\*\.weight\s+ggml type=iq3_xxs")
+        self.assertRegex(text, r"blk\.0\.ffn_down_exps\.\*\.weight\s+ggml type=iq4_nl")
+        self.assertRegex(text, r"blk\.2\.ffn_gate_up_exps\.\*\.weight\s+ggml type=iq2_s")
+        self.assertRegex(text, r"blk\.2\.ffn_down_exps\.\*\.weight\s+ggml type=q2_0")
+
+    def test_fused_halves_share_one_rule_and_kept_types_get_none(self):
+        text = ud_map._mirror_recipe(_rows_4exp(), "m.gguf")
+        # blk.0 gate and up are both IQ3_XXS and fuse into one declared weight: one rule.
+        self.assertEqual(sum(1 for line in text.splitlines()
+                             if line.startswith("blk.0.ffn_gate_up_exps.*.weight")), 1)
+        # F32/BF16 have no libquant type: they keep the checkpoint.
+        self.assertNotIn("qsa_qk", text)
+        self.assertNotIn("ffn_gate_inp", text)
+        # The mirror recipe is not the fast path.
+        self.assertNotIn("table=", text)
+        self.assertNotIn("rtn ", text)
+        self.assertNotIn("gptq ", text)
+
+    def test_one_rule_per_target_and_type(self):
+        text = ud_map._mirror_recipe(_rows_4exp(), "m.gguf")
+        valid = {(r["target"], r["type"]) for r in _rows_4exp()
+                 if r.get("target") and ud_map.TYPES.get(r["type"], ud_map.UNKNOWN_TYPE)[1]}
+        rules = [line for line in text.splitlines() if line and not line.startswith("#")]
+        self.assertEqual(len(rules), len(valid))
+
+    def test_qwen4exp_defaults_to_mirror_not_fast(self):
+        a = argparse.Namespace(policy="auto")
+        self.assertEqual(ud_map._choose_policy(a, "qwen4exp"), "mirror")
+        self.assertEqual(ud_map._choose_policy(a, "qwen35moe"), "fast")
+
+
 class Build(unittest.TestCase):
     def test_bf16_source_gets_the_fp8_descriptor_and_imatrix(self):
         a = argparse.Namespace(source="/src", rad_convert="/bin/rad-convert", recipe="r",
@@ -381,15 +438,30 @@ class Integration(unittest.TestCase):
         shards = os.environ["UD_MAP_GGUF"].split(":")
         declared = os.environ["UD_MAP_DECLARED"]
         out = "/tmp/ud_map_test.json"
-        a = argparse.Namespace(gguf=shards, declared=declared, source=None, recipe_out=None, json=out)
+        a = argparse.Namespace(gguf=shards, declared=declared, source=None, recipe_out=None,
+                               json=out, policy="mirror")
         self.assertEqual(ud_map.plan(a), 0)
         p = json.load(open(out))
         self.assertEqual(p["arch"], "qwen4exp")
+        self.assertEqual(p["policy"], "mirror")
         self.assertAlmostEqual(p["totals"]["map_bytes"] / 2**30, 83.31, places=2)
+        self.assertAlmostEqual(p["totals"]["kept_bytes"] / 2**30, 5.692, places=2)
+        self.assertAlmostEqual(p["totals"]["total_bytes"] / 2**30, 89.003, places=2)
+        self.assertEqual(p["totals"]["derived_bytes"], 0)
+        self.assertEqual(p["coverage"]["declared"], 1044)
+        self.assertEqual(p["coverage"]["missing"], {})
         self.assertEqual(p["fusion_problems"], [])
         # the PLE n-gram table is the single biggest mapped tensor and maps to one declared weight
         big = max(p["tensors"], key=lambda r: r["bytes"])
         self.assertEqual(big["target"], "blk.1.ple_ngram.weight")
+        # The mirror recipe keeps Unsloth's per-tensor formats, not the fast codebooks.
+        for spell in ("iq4_nl", "iq4_xs", "iq3_xxs", "iq2_s", "q5_0", "q2_0", "q6_k", "q8_0"):
+            self.assertIn(f"ggml type={spell}", p["recipe"], spell)
+        self.assertNotIn("table=", p["recipe"])
+        # blk.48 (the MTP layer) is not in the UD text GGUF: it is kept from bf16, not mapped.
+        self.assertNotIn("blk.48", p["recipe"])
+        kept = {k["name"].split(".")[0] for k in p["kept"]}
+        self.assertEqual(kept, {"blk", "mtp", "v"})
 
     def test_flash_next_fast_plan(self):
         import argparse

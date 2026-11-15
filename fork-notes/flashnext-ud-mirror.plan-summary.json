@@ -1,0 +1,99 @@
+{
+ "tool": "ud_map mirror plan",
+ "command": "python3 tools/ud_map/ud_map.py plan /opt/tohil/models/qwen3.8-flash-next/UD-Q3_K_XL/*.gguf --declared ~/radiance-test/fn-bf16.plan.json --source /opt/tohil/models/_safetensors-src/Qwen3.8-Flash-Next --policy mirror --recipe-out fn-mirror.recipe --json fn-mirror.plan.json",
+ "arch": "qwen4exp",
+ "policy": "mirror",
+ "mapped_tensors": 1224,
+ "map_bytes": 89453923840,
+ "kept_bytes": 6112164088,
+ "derived_bytes": 0,
+ "total_bytes": 95566087928,
+ "map_GiB": 83.310459,
+ "kept_GiB": 5.692396,
+ "derived_GiB": 0.0,
+ "total_GiB": 89.002855,
+ "coverage": {
+  "declared": 1044,
+  "missing": {}
+ },
+ "fusion_problems": [],
+ "unmapped": [],
+ "by_type": {
+  "Q6_K": {
+   "tensors": 213,
+   "bytes": 2342323200,
+   "GiB": 2.181458
+  },
+  "Q8_0": {
+   "tensors": 284,
+   "bytes": 1443471360,
+   "GiB": 1.344337
+  },
+  "F32": {
+   "tensors": 557,
+   "bytes": 313495040,
+   "GiB": 0.291965
+  },
+  "IQ4_XS": {
+   "tensors": 13,
+   "bytes": 5685452800,
+   "GiB": 5.294991
+  },
+  "BF16": {
+   "tensors": 24,
+   "bytes": 39321600,
+   "GiB": 0.036621
+  },
+  "Q5_0": {
+   "tensors": 20,
+   "bytes": 11534336000,
+   "GiB": 10.742188
+  },
+  "IQ2_S": {
+   "tensors": 8,
+   "bytes": 2149580800,
+   "GiB": 2.001953
+  },
+  "IQ3_XXS": {
+   "tensors": 76,
+   "bytes": 24405606400,
+   "GiB": 22.729492
+  },
+  "IQ4_NL": {
+   "tensors": 27,
+   "bytes": 41068477440,
+   "GiB": 38.248
+  },
+  "TYPE42": {
+   "tensors": 2,
+   "bytes": 471859200,
+   "GiB": 0.439453
+  }
+ },
+ "kept": {
+  "blk": {
+   "weights": 1040,
+   "bytes": 5148515096,
+   "GiB": 4.794928
+  },
+  "mtp": {
+   "weights": 15,
+   "bytes": 65786880,
+   "GiB": 0.061269
+  },
+  "v": {
+   "weights": 333,
+   "bytes": 897862112,
+   "GiB": 0.836199
+  }
+ },
+ "mtp_layer": 47,
+ "mtp_kept_layer": 48,
+ "kept_breakdown": {
+  "blk_group_GiB": 4.794928,
+  "mtp_layer_blk48_GiB": 4.794928,
+  "mtp_head_GiB": 0.061269,
+  "vision_GiB": 0.836199,
+  "i64_metadata_bytes": 280
+ }
+}
