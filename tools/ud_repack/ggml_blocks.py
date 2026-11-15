@@ -7,6 +7,7 @@ tests also compare them with the `gguf` python package's independent implementat
 
 A "block array" is uint8 of shape (nb, bytes_per_block). Dequantised output is float32 (nb, qk).
 """
+import re
 import numpy as np
 
 KVALUES_IQ4NL = np.array([-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113], np.int8)
@@ -15,8 +16,19 @@ KVALUES_IQ4NL = np.array([-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 3
 BLOCK = {
     'Q8_0': (32, 34), 'Q4_K': (256, 144), 'Q5_K': (256, 176), 'Q6_K': (256, 210),
     'Q5_0': (32, 22), 'IQ4_NL': (32, 18), 'IQ4_XS': (256, 136),
-    'Q2_0': (64, 18),
+    'Q2_0': (64, 18), 'IQ3_XXS': (256, 98), 'IQ2_S': (256, 82),
 }
+
+# llama.cpp's ksigns_iq2xs, computed: a 7-bit index's eight sign bits, the eighth equal to the
+# index's parity (the grid stores seven sign bits; the eighth is implied).
+KSIGNS_IQ2XS = np.array([i | (((bin(i).count('1')) & 1) << 7) for i in range(128)], np.uint8)
+
+
+def _ksign(v):
+    """ksigns_iq2xs for every 7-bit index in v (n,)."""
+    v = np.asarray(v, np.uint8)
+    return (v | ((np.bitwise_xor.reduce(
+        np.stack([(v >> b) & 1 for b in range(7)], axis=0).astype(np.uint8), axis=0) & 1) << 7)).astype(np.uint8)
 
 
 def _f16(b, lo):
@@ -132,8 +144,51 @@ def split_iq4_xs(b):
                 d=np.ascontiguousarray(b[:, 0:2]).view('<f2').reshape(-1))
 
 
+def split_iq3_xxs(b):
+    # d f16 @0; qs[64] codes @2 (one 8-bit index per four values); scales_and_signs[32] @66:
+    # for each 32 values a uint32 whose low 28 bits are four 7-bit sign indexes and top 4 bits the
+    # scale ls (the scale is 2*ls+1). The sign plane is the expanded ksigns byte, one per 8 values.
+    n = b.shape[0]
+    codes = np.ascontiguousarray(b[:, 2:66])
+    aux = np.ascontiguousarray(b[:, 66:98]).view('<u4').reshape(n, 8)
+    signs = np.empty((n, 32), np.uint8)
+    scales = np.empty((n, 8), np.uint8)
+    for ib in range(8):
+        a = aux[:, ib]
+        for l in range(4):
+            signs[:, 4 * ib + l] = _ksign((a >> (7 * l)) & 127)
+        scales[:, ib] = (2 * (a >> 28) + 1).astype(np.uint8)
+    return dict(codes=codes, signs=signs, scale=scales,
+                d=np.ascontiguousarray(b[:, 0:2]).view('<f2').reshape(-1))
+
+
+def split_iq2_s(b):
+    # d f16 @0; qs[64] @2: the first 32 bytes are four 8-bit code lows per 32 values, the next 32
+    # are the signs (one byte per 8 values); qh[8] @66 the two high code bits per l; scales[8] @74
+    # the two 4-bit ls per 32 values, low nibble first. The codes plane is u10, four per 32.
+    n = b.shape[0]
+    qs = b[:, 2:66]
+    qh = b[:, 66:74]
+    scales_in = b[:, 74:82]
+    bits = np.zeros((n, 32, 10), np.uint8)
+    for ib in range(8):
+        for l in range(4):
+            lo = qs[:, 4 * ib + l].astype(np.uint16)
+            hi = ((qh[:, ib].astype(np.uint16) << (8 - 2 * l)) & 0x300)
+            bits[:, 4 * ib + l, :] = ((lo | hi)[:, None] >> np.arange(10, dtype=np.uint16)) & 1
+    codes = np.packbits(bits.reshape(n, 320), axis=1, bitorder='little')
+    signs = np.ascontiguousarray(qs[:, 32:64])
+    scales = np.empty((n, 16), np.uint8)
+    for ib in range(8):
+        scales[:, 2 * ib] = (2 * (scales_in[:, ib] & 0xf) + 1).astype(np.uint8)
+        scales[:, 2 * ib + 1] = (2 * (scales_in[:, ib] >> 4) + 1).astype(np.uint8)
+    return dict(codes=codes, signs=signs, scale=scales,
+                d=np.ascontiguousarray(b[:, 0:2]).view('<f2').reshape(-1))
+
+
 SPLIT = {'Q8_0': split_q8_0, 'Q4_K': split_q4_K, 'Q5_K': split_q5_K, 'Q6_K': split_q6_K,
-         'Q5_0': split_q5_0, 'IQ4_NL': split_iq4_nl, 'IQ4_XS': split_iq4_xs, 'Q2_0': split_q2_0}
+         'Q5_0': split_q5_0, 'IQ4_NL': split_iq4_nl, 'IQ4_XS': split_iq4_xs, 'Q2_0': split_q2_0,
+         'IQ3_XXS': split_iq3_xxs, 'IQ2_S': split_iq2_s}
 
 
 # ------------------------------------------------------------------ plane decoders (the kernel's arithmetic)
@@ -183,8 +238,67 @@ def decode_iq4_xs(p):
     return (dl[:, :, None] * KVALUES_IQ4NL[p['codes']].astype(f32).reshape(n, 8, 32)).reshape(n, 256)
 
 
+def _grid_rows(n, name):
+    """The grid table's rows as (n, width) uint8, lowest byte first, from libhalo's copy of
+    llama.cpp's tables (halo_moe_grids.h)."""
+    if name == 'iq3xxs':
+        v = np.array([int(x, 0) for x in _grid_values('HALO_IQ3XXS_GRID_VALUES')], np.uint32)
+        return v.view(np.uint8).reshape(-1, 4)
+    v = np.array([int(x, 0) for x in _grid_values('HALO_IQ2S_GRID_VALUES')], np.uint64)
+    return v.view(np.uint8).reshape(-1, 8)
+
+
+def _grid_values(macro):
+    import os
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, '..', '..', 'libhalo', 'halo_moe_grids.h')
+    text = open(path).read()
+    m = re.search(r'#define\s+' + macro + r'\s+(.*?)(?=\n\s*#define|\n\s*(?:static|__|#endif)|\Z)',
+                  text, re.S)
+    if not m:
+        raise RuntimeError('halo_moe_grids.h has no ' + macro)
+    return re.findall(r'0x[0-9a-fA-F]+', m.group(1))
+
+
+GRID_IQ3XXS = _grid_rows(256, 'iq3xxs')
+GRID_IQ2S = _grid_rows(1024, 'iq2s')
+
+
+def decode_iq3_xxs(p):
+    n = p['codes'].shape[0]
+    y = np.empty((n, 256), f32)
+    for ib in range(8):
+        c = p['codes'][:, 8 * ib:8 * ib + 8]               # eight 4-value grid rows
+        sg = p['signs'][:, 4 * ib:4 * ib + 4]              # four sign bytes, one per 8 values
+        s = p['d'].astype(f32)[:, None] * p['scale'][:, ib].astype(f32).astype(f32)[:, None] * f32(0.25)
+        for l in range(4):
+            for half in range(2):
+                g = GRID_IQ3XXS[c[:, 2 * l + half]].astype(f32)
+                bits = (sg[:, l:l + 1] >> np.arange(4 * half, 4 * half + 4, dtype=np.uint8)) & 1
+                g = np.where(bits.astype(bool), -g, g)
+                y[:, 32 * ib + 8 * l + 4 * half:32 * ib + 8 * l + 4 * half + 4] = s * g
+    return y
+
+
+def decode_iq2_s(p):
+    n = p['codes'].shape[0]
+    y = np.empty((n, 256), f32)
+    bits = np.unpackbits(p['codes'], axis=1, bitorder='little')[:, :320].reshape(n, 32, 10)
+    codes = (bits << np.arange(10, dtype=np.uint16)).sum(axis=2)
+    for ib in range(8):
+        for l in range(4):
+            g = GRID_IQ2S[codes[:, 4 * ib + l]].astype(f32)
+            sb = p['signs'][:, 4 * ib + l:4 * ib + l + 1]
+            b = (sb >> np.arange(8, dtype=np.uint8)) & 1
+            g = np.where(b.astype(bool), -g, g)
+            s = (p['d'].astype(f32) * p['scale'][:, 2 * ib + l // 2].astype(f32) * f32(0.125))[:, None]
+            y[:, 32 * ib + 8 * l:32 * ib + 8 * l + 8] = s * g
+    return y
+
+
 DECODE = {'Q8_0': decode_q8_0, 'Q4_K': decode_q4_K, 'Q5_K': decode_q5_K, 'Q6_K': decode_q6_K,
-          'Q5_0': decode_q5_0, 'IQ4_NL': decode_iq4_nl, 'IQ4_XS': decode_iq4_xs, 'Q2_0': decode_q2_0}
+          'Q5_0': decode_q5_0, 'IQ4_NL': decode_iq4_nl, 'IQ4_XS': decode_iq4_xs, 'Q2_0': decode_q2_0,
+          'IQ3_XXS': decode_iq3_xxs, 'IQ2_S': decode_iq2_s}
 
 
 # ------------------------------------------------------------------ reference dequantisers (llama.cpp order, from bytes)
@@ -261,6 +375,34 @@ def dequant_ref(tname, b):
         for j in range(64):
             q = ((qs[:, j // 4] >> ((j % 4) * 2)) & 3).astype(np.int32) - 1
             y[:, j] = d * q.astype(f32)
+        return y
+    if tname == 'IQ3_XXS':
+        d = _f16(b, 0); qs = b[:, 2:66]; aux = np.ascontiguousarray(b[:, 66:98]).view('<u4').reshape(n, 8)
+        y = np.empty((n, 256), f32)
+        for ib in range(8):
+            a = aux[:, ib]
+            db = d * (f32(0.5) + (a >> 28).astype(f32)) * f32(0.5)
+            for l in range(4):
+                sg = KSIGNS_IQ2XS[((a >> (7 * l)) & 127)]
+                for half in range(2):
+                    g = GRID_IQ3XXS[qs[:, 8 * ib + 2 * l + half]].astype(f32)
+                    bmask = ((sg[:, None] >> np.arange(4 * half, 4 * half + 4)) & 1).astype(bool)
+                    v = np.where(bmask, -g, g)
+                    y[:, 32 * ib + 8 * l + 4 * half:32 * ib + 8 * l + 4 * half + 4] = db[:, None] * v
+        return y
+    if tname == 'IQ2_S':
+        d = _f16(b, 0); qs = b[:, 2:66]; qh = b[:, 66:74]; sc = b[:, 74:82]
+        signs = qs[:, 32:64]
+        y = np.empty((n, 256), f32)
+        for ib in range(8):
+            db = [d * (f32(0.5) + (sc[:, ib] & 0xf).astype(f32)) * f32(0.25),
+                  d * (f32(0.5) + (sc[:, ib] >> 4).astype(f32)) * f32(0.25)]
+            for l in range(4):
+                idx = qs[:, 4 * ib + l].astype(np.uint16) | ((qh[:, ib].astype(np.uint16) << (8 - 2 * l)) & 0x300)
+                g = GRID_IQ2S[idx].astype(f32)
+                bmask = ((signs[:, 4 * ib + l:4 * ib + l + 1] >> np.arange(8)) & 1).astype(bool)
+                v = np.where(bmask, -g, g)
+                y[:, 32 * ib + 8 * l:32 * ib + 8 * l + 8] = db[l // 2][:, None] * v
         return y
     raise KeyError(tname)
 
@@ -339,5 +481,37 @@ def merge_iq4_xs(p):
     return np.concatenate([_h(p['d']), sh.view(np.uint8).reshape(-1, 2), sl, qs], axis=1)
 
 
+def merge_iq3_xxs(p):
+    n = p['codes'].shape[0]
+    aux = np.zeros((n, 8), np.uint32)
+    for ib in range(8):
+        for l in range(4):
+            # the sign plane holds ksigns_iq2xs's expanded byte; the 7-bit index is its low bits
+            aux[:, ib] |= (p['signs'][:, 4 * ib + l].astype(np.uint32) & 127) << (7 * l)
+        aux[:, ib] |= ((p['scale'][:, ib].astype(np.uint32) - 1) // 2) << 28
+    return np.concatenate([_h(p['d']), np.ascontiguousarray(p['codes']), aux.view(np.uint8)], axis=1)
+
+
+def merge_iq2_s(p):
+    n = p['codes'].shape[0]
+    bits = np.unpackbits(p['codes'], axis=1, bitorder='little')[:, :320].reshape(n, 32, 10)
+    codes = (bits << np.arange(10, dtype=np.uint16)).sum(axis=2).astype(np.uint32)
+    qs = np.zeros((n, 64), np.uint8)
+    qh = np.zeros((n, 8), np.uint8)
+    for ib in range(8):
+        for l in range(4):
+            c = codes[:, 4 * ib + l]
+            qs[:, 4 * ib + l] = (c & 0xFF).astype(np.uint8)
+            qh[:, ib] |= (((c >> 8) & 3) << (2 * l)).astype(np.uint8)
+    qs[:, 32:64] = p['signs']
+    sc = np.zeros((n, 8), np.uint8)
+    for ib in range(8):
+        lo = (p['scale'][:, 2 * ib].astype(np.uint32) - 1) // 2
+        hi = (p['scale'][:, 2 * ib + 1].astype(np.uint32) - 1) // 2
+        sc[:, ib] = (lo | (hi << 4)).astype(np.uint8)
+    return np.concatenate([_h(p['d']), qs, qh, sc], axis=1)
+
+
 MERGE = {'Q8_0': merge_q8_0, 'Q4_K': merge_q4_K, 'Q5_K': merge_q5_K, 'Q6_K': merge_q6_K,
-         'Q5_0': merge_q5_0, 'IQ4_NL': merge_iq4_nl, 'IQ4_XS': merge_iq4_xs, 'Q2_0': merge_q2_0}
+         'Q5_0': merge_q5_0, 'IQ4_NL': merge_iq4_nl, 'IQ4_XS': merge_iq4_xs, 'Q2_0': merge_q2_0,
+         'IQ3_XXS': merge_iq3_xxs, 'IQ2_S': merge_iq2_s}

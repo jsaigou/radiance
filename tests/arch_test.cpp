@@ -2871,6 +2871,115 @@ TEST(q20_expert_declarations_choose_the_unrotated_bf16_activation_path) {
             CHECK_EQ(w.d.dtype, (uint32_t)RAD_F16);
 }
 
+/* IQ3_XXS and IQ2_S are the two grid forms, served unrotated with bf16 activations. The codes
+ * view joins codes, signs and the grid table (the relayout checks the container's grid); the
+ * scale view joins the u5 sub-scales, f16 d and per-tensor factor. */
+static RadEncoding iq_grid_enc(uint32_t code_dtype, int64_t code_width, int64_t grid_rows,
+                               int64_t group) {
+    RadEncoding e;
+    rad_enc_clear(&e);
+    rad_enc_copy_str(e.scheme, "affine");
+    rad_enc_add_plane(&e, "codes", code_dtype, 1, code_width);
+    rad_enc_add_table(&e, "grid", RAD_U8, grid_rows, code_width);
+    rad_enc_add_plane(&e, "signs", RAD_U1, 1, 1);
+    rad_enc_add_plane(&e, "scale", RAD_U5, 1, group);
+    rad_enc_add_plane(&e, "scale.1", RAD_F16, 1, 256);
+    rad_enc_add_plane(&e, "scale.2", RAD_F32, 0, 0);
+    return e;
+}
+
+TEST(iq3_xxs_expert_declarations_choose_the_unrotated_bf16_activation_path) {
+    using namespace rad::arch;
+    RadModelMeta meta = qwen4exp_meta();
+    RadEncoding iq = iq_grid_enc(RAD_U8, 4, 256, 32);
+    REQUIRE(rad_enc_valid(&iq));
+    CHECK_EQ(MoeFP8::format_of(iq), 13);
+    const RadEncoding row8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 1, 128);
+    RadEncoding u2 = rad_enc_affine(RAD_U2, RAD_F16, 1, 128);
+    rad_enc_add_plane(&u2, "zero", RAD_U8, 1, 128);
+
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok = 2048; c.max_seqs = 8; c.max_spec = 3; c.max_ctx = 200000;
+    RadBuilder b;
+    b.encs = { { "ffn_gate_up_exps", iq }, { "ffn_down_exps", iq },
+               { "_hc_down.weight", row8 }, { "_hc_up.weight", row8 },
+               { "fc_hidden", row8 }, { "fc_embedding", row8 }, { "draft_head", u2 } };
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+    const qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[0];
+    CHECK_EQ(m.moecfg.expert_w4, 1);
+    CHECK_EQ(m.moecfg.expert_rot, 0);
+    CHECK_EQ(m.moecfg.expert_nl, 0);
+    CHECK_EQ(m.moecfg.expert_iq3, 1);
+    CHECK_EQ(m.moecfg.expert_iq2, 0);
+    int iq_ops = 0, hq_ops = 0;
+    for (const RecOp& o : b.ops) {
+        if (o.op.rfind("moe_gemm", 0) == 0)
+            for (const auto& p : o.p)
+                if (p.key == "dtype" && p.sval == "iq3xxs32a16") ++iq_ops;
+        if (o.op == "had_quant_act_fp8") ++hq_ops;
+    }
+    CHECK(iq_ops > 0);
+    CHECK_EQ(hq_ops, 0);
+    for (const RecWeight& w : b.weights) {
+        const std::string n = w.name;
+        if (n.find("_exps.") == std::string::npos || n.size() <= 6) continue;
+        if (n.compare(n.size() - 6, 6, ".scale") == 0) {
+            CHECK(w.d.source != nullptr && w.d.planes &&
+                  std::string(w.d.planes) == "scale,scale.1,scale.2");
+            CHECK_EQ(w.d.dtype, (uint32_t)RAD_U5);
+        } else if (n.compare(n.size() - 7, 7, ".weight") == 0) {
+            CHECK(w.d.planes && std::string(w.d.planes) == "codes,signs,grid");
+            CHECK_EQ(w.d.dtype, (uint32_t)RAD_U8);
+        }
+    }
+}
+
+TEST(iq2_s_expert_declarations_choose_the_unrotated_bf16_activation_path) {
+    using namespace rad::arch;
+    RadModelMeta meta = qwen4exp_meta();
+    RadEncoding iq = iq_grid_enc(RAD_U10, 8, 1024, 16);
+    REQUIRE(rad_enc_valid(&iq));
+    CHECK_EQ(MoeFP8::format_of(iq), 14);
+    const RadEncoding row8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 1, 128);
+    RadEncoding u2 = rad_enc_affine(RAD_U2, RAD_F16, 1, 128);
+    rad_enc_add_plane(&u2, "zero", RAD_U8, 1, 128);
+
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok = 2048; c.max_seqs = 8; c.max_spec = 3; c.max_ctx = 200000;
+    RadBuilder b;
+    b.encs = { { "ffn_gate_up_exps", iq }, { "ffn_down_exps", iq },
+               { "_hc_down.weight", row8 }, { "_hc_up.weight", row8 },
+               { "fc_hidden", row8 }, { "fc_embedding", row8 }, { "draft_head", u2 } };
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+    const qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[0];
+    CHECK_EQ(m.moecfg.expert_w4, 1);
+    CHECK_EQ(m.moecfg.expert_rot, 0);
+    CHECK_EQ(m.moecfg.expert_nl, 0);
+    CHECK_EQ(m.moecfg.expert_iq3, 0);
+    CHECK_EQ(m.moecfg.expert_iq2, 1);
+    int iq_ops = 0, hq_ops = 0;
+    for (const RecOp& o : b.ops) {
+        if (o.op.rfind("moe_gemm", 0) == 0)
+            for (const auto& p : o.p)
+                if (p.key == "dtype" && p.sval == "iq2s32a16") ++iq_ops;
+        if (o.op == "had_quant_act_fp8") ++hq_ops;
+    }
+    CHECK(iq_ops > 0);
+    CHECK_EQ(hq_ops, 0);
+    for (const RecWeight& w : b.weights) {
+        const std::string n = w.name;
+        if (n.find("_exps.") == std::string::npos || n.size() <= 6) continue;
+        if (n.compare(n.size() - 6, 6, ".scale") == 0) {
+            CHECK(w.d.source != nullptr && w.d.planes &&
+                  std::string(w.d.planes) == "scale,scale.1,scale.2");
+            CHECK_EQ(w.d.dtype, (uint32_t)RAD_U5);
+        } else if (n.compare(n.size() - 7, 7, ".weight") == 0) {
+            CHECK(w.d.planes && std::string(w.d.planes) == "codes,signs,grid");
+            CHECK_EQ(w.d.dtype, (uint32_t)RAD_U10);
+        }
+    }
+}
+
 TEST(mxfp4_expert_declarations_preserve_tp4_and_tp8_scale_geometry_and_movement_groups) {
     using namespace rad::arch;
     const RadEncoding mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);
