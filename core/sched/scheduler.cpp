@@ -315,6 +315,13 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
     /* An embedding input runs in one step or not at all (Request::embed); one longer than a step
      * could never be admitted. */
     if (r->embed && (int64_t)r->prompt.size() > cfg_.max_tok) return RAD_E_INVAL;
+    /* The words a request hands the plugin are bounded by the plugin's declaration. The batch
+     * stage refuses a sequence past it, and a refused build restages the step forever -- an
+     * over-cap request admitted here would stall every queue behind it. The server-side route
+     * caps its own words; this is the promise no future route can miss. */
+    if (!r->plugin_words.empty() &&
+        (int64_t)r->plugin_words.size() > builder_.plugin_words_cap())
+        return RAD_E_INVAL;
     /* Every prompt id, tokenised or client-supplied, names a real vocabulary row: an id past the
      * embedding table is refused at admission, never staged into a pass. Raw id arrays reach here
      * straight from the request body, and an op failing mid-step is a device fault (spec §17) --

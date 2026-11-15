@@ -135,6 +135,10 @@ public:
 
     /* The last build's batch for one rank: build()'s result with that rank's slab pointers. */
     const RadBatch* batch_for(int rank) const;
+    /* Program::plugin_words as declared: the most words one request may carry. Admission checks
+     * it -- the build stage refuses an over-cap sequence, and a refused build restages forever,
+     * so a request admitted past the cap stalls every queue behind it. */
+    int64_t plugin_words_cap() const { return pw_cap_; }
 
     /* The last build's slab and offsets on one rank, for the advance. The caller supplies mode,
      * round, slot state and inputs (advance.h). */
