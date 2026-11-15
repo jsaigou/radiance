@@ -550,6 +550,11 @@ def _fast_recipe_4exp(rows, gguf, gptq=False, mtp=None, mtp_layer=None):
         lines.append(ple.ljust(40) + " ggml type=iq4_nl   # IQ4_NL (native, PLE gather)")
         lines.append("")
     lines.append("# dense Q6_K/Q8_0: their own dense formats (qwen4exp wiring: L3)")
+    lines.append("# Q6_K output.weight has no logits_gemm q6k row; the int8 head is served.")
+    lines.append("output.weight".ljust(40) + " " + Q6K_LM_HEAD_RULE + "   # Q6_K -> i8 (L3)")
+    lines.append("# Q8_0 connection mixing matrices are read by hc_read (bf16/E4M3), not Q8_0.")
+    lines.append("*_hc_down.weight".ljust(40) + " " + HC_E4M3_DOWN_RULE + "   # Q8_0 -> E4M3")
+    lines.append("*_hc_up.weight".ljust(40) + " " + HC_E4M3_UP_RULE + "   # Q8_0 -> E4M3")
     written = set()
     for r in rows:
         tgt, ty = r.get("target"), r.get("type")
@@ -557,7 +562,9 @@ def _fast_recipe_4exp(rows, gguf, gptq=False, mtp=None, mtp_layer=None):
             continue
         if r.get("role") == "ple-table" or tgt.endswith("ple_ngram.weight"):
             continue
-        if tgt == "token_embd.weight":
+        if tgt == "token_embd.weight" or tgt == "output.weight":
+            continue
+        if tgt.endswith("_hc_down.weight") or tgt.endswith("_hc_up.weight"):
             continue
         key = (tgt, ty)
         if key in written:
