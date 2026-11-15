@@ -1315,14 +1315,20 @@ def _plane_float(rf, e, role, rows, cols, row0=0, nrows=None):
 
 def decode_entry(rf, e, row0=0, nrows=None):
     """Decode one .rad entry (a chunk of rows) to f32. Handles plain, affine with a scalar table,
-    block FP8 and the fwht128 transform the w4nl/w5nl experts use."""
+    block FP8 and the fwht128 transform the w4nl/w5nl experts use.
+
+    A plugin-private plane (abi/rad_types.h >= RAD_DT_PLUGIN_BASE) is not guessed at: raises
+    radfile.KernelPrivateDtype so verify() can report it as kernel-private rather than FAIL or
+    silently mis-decode it."""
     import numpy as np
-    from radfile import plane_values
+    from radfile import plane_values, KernelPrivateDtype
+    enc = e.enc
+    if enc.kernel_private_planes():
+        raise KernelPrivateDtype([p.dtype for p in enc.kernel_private_planes()])
     rows = int(np.prod(e.shape[:-1])) if len(e.shape) > 1 else 1
     cols = e.shape[-1] if e.shape else 1
     if nrows is None:
         nrows = rows - row0
-    enc = e.enc
     if enc.scheme == "plain":
         return plane_values(rf, e, 0, row0, nrows).astype(np.float32)
     if enc.scheme != "affine":
@@ -1332,8 +1338,24 @@ def decode_entry(rf, e, row0=0, nrows=None):
     q = _plane_float(rf, e, "codes", rows, cols, row0, nrows)
     if q is None:
         raise NotImplementedError(enc.name())
-    if table is not None:
+    if "grid" in roles:
+        # A vector codebook: one u-code a V-element grid entry, then a sign bit a value
+        # (abi/rad_encoding.h: q = grid[code][k], negated when signs says so). The IQ3_XXS and
+        # IQ2_S experts use this; a scalar table does not.
+        gi = roles.index("grid")
+        gp = enc.planes[gi]
+        V = gp.extent[1]
+        grid = np.asarray(plane_values(rf, e, gi)).reshape(gp.extent)
+        code = np.ascontiguousarray(q[:, ::V])
+        if code.size and (int(code.min()) < 0 or int(code.max()) >= grid.shape[0]):
+            raise ValueError(f"{enc.name()}: a code is outside a {grid.shape[0]}-entry grid")
+        q = grid[code.astype(np.int64)].reshape(nrows, cols)
+        table = None
+    elif table is not None:
         q = table[q.astype(np.int64)]
+    if "signs" in roles:
+        sg = _plane_float(rf, e, "signs", rows, cols, row0, nrows)
+        q = np.where(sg != 0, -q, q)
     if "zero" in roles:
         q = q - _plane_float(rf, e, "zero", rows, cols, row0, nrows)
     lv = 0
@@ -1386,6 +1408,13 @@ class Refs:
 
     def __init__(self, rf, src, gg, L):
         self.rf, self.src, self.gg, self.L = rf, src, gg, L
+        # The draft/MTP layer is the last expert-bearing block (blk.40 on Qwen3.6, blk.48 on
+        # Flash-Next). Its source tensors live under mtp.layers.0.*, not model.language_model.*.
+        self.mtp_layer = None
+        for e in rf.entries if rf is not None else []:
+            m = re.match(r"blk\.(\d+)\.ffn_(?:gate_up|gate|up|down)_exps\.", e.name)
+            if m:
+                self.mtp_layer = max(self.mtp_layer or 0, int(m.group(1)))
 
     def _src(self, name, expert=None, row_limit=None):
         if self.src is None:
@@ -1410,6 +1439,16 @@ class Refs:
             rows = min(rows, row_limit)
         return self.gg.rows_f32(name, 0, rows, expert)
 
+    def _ssm(self, key):
+        """An SSM hyperparameter, spelled under the GGUF's own architecture prefix (qwen4exp on
+        Flash-Next, qwen35moe on Qwen3.6)."""
+        arch = (self.gg.kv.get("general.architecture") if self.gg else None)
+        for pre in ([arch] if arch else []) + ["qwen4exp", "qwen35moe"]:
+            k = f"{pre}.ssm.{key}"
+            if k in self.gg.kv:
+                return self.gg.kv[k]
+        raise KeyError(f"{key}: no <arch>.ssm.{key} in the GGUF")
+
     @staticmethod
     def _untile(x, axis, start, span, a, inner):
         import numpy as np
@@ -1420,6 +1459,46 @@ class Refs:
         y = x.copy()
         y[tuple(sl)] = x[tuple(sl)].take(idx, axis=axis)
         return y
+
+    def _mtp_source(self, name, row_limit=None):
+        """The draft head's source names: the MTP layer and head live under mtp.* in the checkpoint."""
+        import numpy as np
+        hc = re.fullmatch(r"mtp\.(attn|ffn|output)_hc_(down|up|inject|norm)\.weight", name)
+        if hc:
+            part = {"down": "input_mix_weight_down.weight",
+                    "up": "input_mix_weight_up.weight",
+                    "inject": "block_inject_weight.weight",
+                    "norm": "hc_norm.weight"}[hc.group(2)]
+            grp = {"attn": "attn_hyper_connection", "ffn": "mlp_hyper_connection",
+                   "output": "hyper_connection_mixer"}[hc.group(1)]
+            pre = "mtp" if hc.group(1) == "output" else "mtp.layers.0"
+            return self._src(f"{pre}.{grp}.{part}")
+        direct = {"mtp.fc_embedding.weight", "mtp.fc_hidden.weight",
+                  "mtp.pre_fc_norm_hidden.weight", "mtp.pre_fc_norm_embedding.weight"}
+        if name in direct:
+            return self._src(name, row_limit=row_limit)
+        return None
+
+    def _ple_ngram(self, pre, row_limit=None):
+        """The PLE n-gram table is 128 checkpoint shards, concatenated in shard order."""
+        import numpy as np
+        if self.src is None:
+            return None
+        stem = pre + "ple.ple_embedding.ngram_embedding.shard_"
+        names = [n for n in getattr(self.src, "idx", {}) if n.startswith(stem)]
+        if not names:
+            return None
+        names.sort(key=lambda n: int(re.fullmatch(re.escape(stem) + r"(\d+)\.weight", n).group(1)))
+        parts, got = [], 0
+        for n in names:
+            rows = self.src.idx[n][4][0]
+            take = rows if row_limit is None else max(0, min(rows, row_limit - got))
+            if take:
+                parts.append(self._src(n, row_limit=take))
+                got += take
+            if row_limit is not None and got >= row_limit:
+                break
+        return np.concatenate(parts, axis=0) if parts else None
 
     def source(self, name, row_limit=None):
         """(source array or None, note)."""
@@ -1445,6 +1524,11 @@ class Refs:
             return self._src("lm_head.weight", row_limit=row_limit), ""
         if name == "output_norm.weight":
             return self._src("model.language_model.norm.weight"), ""
+        if name in ("output_hc_down.weight", "output_hc_up.weight", "output_hc_norm.weight"):
+            part = {"output_hc_down.weight": "input_mix_weight_down.weight",
+                    "output_hc_up.weight": "input_mix_weight_up.weight",
+                    "output_hc_norm.weight": "hc_norm.weight"}[name]
+            return self._src("model.language_model.hyper_connection_mixer." + part), ""
         if name == "mtp.draft_head.weight":
             return self._src("lm_head.weight", row_limit=row_limit), "derived from output.weight"
         mtp_head = {"mtp.fc.weight": "mtp.fc.weight",
@@ -1453,11 +1537,46 @@ class Refs:
                     "mtp.norm.weight": "mtp.norm.weight"}
         if name in mtp_head:
             return self._src(mtp_head[name]), ""
+        if name.startswith("mtp."):
+            return self._mtp_source(name, row_limit), ""
         m = re.fullmatch(r"blk\.(\d+)\.(.+)", name)
         if not m:
             return None, "no source rule"
         l, rest = int(m.group(1)), m.group(2)
-        pre = "mtp.layers.0." if l == 40 else f"model.language_model.layers.{l}."
+        pre = ("mtp.layers.0." if self.mtp_layer is not None and l == self.mtp_layer
+               else f"model.language_model.layers.{l}.")
+        hc = re.fullmatch(r"(attn|ffn)_hc_(down|up|inject|norm)\.weight", rest)
+        if hc:
+            part = {"down": "input_mix_weight_down.weight",
+                    "up": "input_mix_weight_up.weight",
+                    "inject": "block_inject_weight.weight",
+                    "norm": "hc_norm.weight"}[hc.group(2)]
+            grp = {"attn": "attn_hyper_connection", "ffn": "mlp_hyper_connection"}[hc.group(1)]
+            return self._src(pre + f"{grp}.{part}"), ""
+        ple = {"ple_conv.weight": "ple.conv1d.weight",
+               "ple_key.weight": "ple.key_proj.weight",
+               "ple_value.weight": "ple.value_proj.weight",
+               "ple_norm_conv.weight": "ple.norm_conv.weight",
+               "ple_norm_key.weight": "ple.norm_key.weight",
+               "ple_norm_query.weight": "ple.norm_query.weight"}
+        if rest in ple:
+            return self._src(pre + ple[rest], row_limit=row_limit), ""
+        if rest == "ple_ngram.weight":
+            return self._ple_ngram(pre, row_limit), ""
+        qsa = {"qsa_q_norm.weight": "self_attn.indexer.q_layernorm.weight",
+               "qsa_k_norm.weight": "self_attn.indexer.k_layernorm.weight"}
+        if rest in qsa:
+            return self._src(pre + qsa[rest], row_limit=row_limit), ""
+        if rest == "qsa_qk.weight":
+            return self._src(pre + "self_attn.indexer.index_qk_proj.weight",
+                             row_limit=row_limit), ""
+        # Integer metadata the arch declares beside the weights; llama.cpp's UD GGUF does not
+        # carry it, so it is compared bit-exactly with the checkpoint and never with the GGUF.
+        meta = {"ple_mult": "ple.ple_embedding.layer_multipliers",
+                "ple_offsets": "ple.ple_embedding.ngram_heads_offsets",
+                "ple_vocab_sizes": "ple.ple_embedding.ngram_heads_vocab_sizes"}
+        if rest in meta:
+            return self._src(pre + meta[rest]), "integer metadata"
         e = re.fullmatch(r"ffn_(gate_up|down)_exps\.(\d+)\.weight", rest)
         if e:
             kind, ex = e.group(1), int(e.group(2))
@@ -1519,6 +1638,10 @@ class Refs:
                     "mtp.norm.weight": "blk.40.nextn.shared_head_norm.weight"}
         if name in mtp_head:
             return self._gg(mtp_head[name]), ""
+        if name in ("output_hc_down.weight", "output_hc_up.weight", "output_hc_norm.weight"):
+            return self._gg(name), ""
+        if name == "blk.1.ple_ngram.weight":
+            return self._gg("per_layer_token_embd.weight", row_limit=row_limit), ""
         m = re.fullmatch(r"blk\.(\d+)\.(.+)", name)
         if not m:
             return None, "no GGUF rule"
@@ -1532,6 +1655,14 @@ class Refs:
             g = self._gg(b + "ffn_gate_exps.weight", ex)
             u = self._gg(b + "ffn_up_exps.weight", ex)
             return (np.concatenate([g, u], axis=0) if g is not None and u is not None else None), ""
+        if rest == "qsa_qk.weight":
+            q = self._gg(b + "indexer.q_proj.weight")
+            k = self._gg(b + "indexer.k_proj.weight")
+            return (np.concatenate([q, k], axis=0) if q is not None and k is not None else None), ""
+        hc = re.fullmatch(r"(attn|ffn)_hc_(down|up|inject|norm)\.weight", rest)
+        if hc:
+            return self._gg(b + f"hc_{hc.group(1)}_{hc.group(2)}.weight",
+                            row_limit=row_limit), ""
         one = {"attn_norm.weight": "attn_norm.weight", "ffn_norm.weight": "post_attention_norm.weight",
                "attn_qg.weight": "attn_q.weight", "attn_k.weight": "attn_k.weight",
                "attn_v.weight": "attn_v.weight", "attn_output.weight": "attn_output.weight",
@@ -1539,13 +1670,20 @@ class Refs:
                "ssm_norm.weight": "ssm_norm.weight",
                "ffn_gate_inp.weight": "ffn_gate_inp.weight",
                "ffn_gate_shexp.weight": "ffn_gate_inp_shexp.weight",
-               "ffn_down_shexp.weight": "ffn_down_shexp.weight"}
+               "ffn_down_shexp.weight": "ffn_down_shexp.weight",
+               "ple_conv.weight": "ple_conv1d.weight",
+               "ple_key.weight": "ple_key.weight", "ple_value.weight": "ple_value.weight",
+               "ple_norm_conv.weight": "ple_norm_conv.weight",
+               "ple_norm_key.weight": "ple_norm_key.weight",
+               "ple_norm_query.weight": "ple_norm_query.weight",
+               "qsa_q_norm.weight": "indexer.q_norm.weight",
+               "qsa_k_norm.weight": "indexer.k_norm.weight"}
         if rest in one:
-            a = self._gg(b + one[rest])
+            a = self._gg(b + one[rest], row_limit=row_limit)
             return a, ""
         if rest == "ssm_dt.bias":
-            nk = int(self.gg.kv["qwen35moe.ssm.group_count"])
-            nv = int(self.gg.kv["qwen35moe.ssm.time_step_rank"])
+            nk = int(self._ssm("group_count"))
+            nv = int(self._ssm("time_step_rank"))
             a = self._gg(b + "ssm_dt.bias")
             if a is None:
                 return None, ""
@@ -1554,15 +1692,15 @@ class Refs:
             a = self._gg(b + "ssm_a")
             if a is None:
                 return None, ""
-            nk = int(self.gg.kv["qwen35moe.ssm.group_count"])
-            nv = int(self.gg.kv["qwen35moe.ssm.time_step_rank"])
+            nk = int(self._ssm("group_count"))
+            nv = int(self._ssm("time_step_rank"))
             a = self._untile(a.reshape(-1), 0, 0, nv, nv // nk, 1) if a.size >= nv else a
             return np.log(-a.astype(np.float64)).astype(np.float32), "log(-ssm_a)"
         if rest == "ssm_inz.weight":
-            nk = int(self.gg.kv["qwen35moe.ssm.group_count"])
-            nv = int(self.gg.kv["qwen35moe.ssm.time_step_rank"])
-            hk = int(self.gg.kv["qwen35moe.ssm.state_size"])
-            inner = self.gg.kv["qwen35moe.ssm.inner_size"]
+            nk = int(self._ssm("group_count"))
+            nv = int(self._ssm("time_step_rank"))
+            hk = int(self._ssm("state_size"))
+            inner = self._ssm("inner_size")
             hv = int(inner) // nv
             a = int(nv // nk)
             qk, vdim = 2 * nk * hk, nv * hv
@@ -1574,8 +1712,8 @@ class Refs:
             z = self._untile(z, 0, 0, vdim, a, hv)
             return np.concatenate([g, z], axis=0), "value heads regrouped"
         if rest == "ssm_ab.weight":
-            nk = int(self.gg.kv["qwen35moe.ssm.group_count"])
-            nv = int(self.gg.kv["qwen35moe.ssm.time_step_rank"])
+            nk = int(self._ssm("group_count"))
+            nv = int(self._ssm("time_step_rank"))
             a = int(nv // nk)
             al = self._gg(b + "ssm_alpha.weight")
             be = self._gg(b + "ssm_beta.weight")
@@ -1587,16 +1725,16 @@ class Refs:
             g = self._gg(b + "ffn_gate_shexp.weight")
             u = self._gg(b + "ffn_up_shexp.weight")
             return (np.concatenate([g, u], axis=0) if g is not None and u is not None else None), ""
-        if l < 40 and rest in ("ssm_out.weight", "ssm_conv1d.weight"):
-            nk = int(self.gg.kv["qwen35moe.ssm.group_count"])
-            nv = int(self.gg.kv["qwen35moe.ssm.time_step_rank"])
-            hk = int(self.gg.kv["qwen35moe.ssm.state_size"])
-            hv = int(self.gg.kv["qwen35moe.ssm.inner_size"]) // nv
-            a = int(nv // nk)
-            qk, vdim = 2 * nk * hk, nv * hv
+        if rest in ("ssm_out.weight", "ssm_conv1d.weight"):
             x = self._gg(b + rest)
             if x is None:
                 return None, ""
+            nk = int(self._ssm("group_count"))
+            nv = int(self._ssm("time_step_rank"))
+            hk = int(self._ssm("state_size"))
+            hv = int(self._ssm("inner_size")) // nv
+            a = int(nv // nk)
+            qk, vdim = 2 * nk * hk, nv * hv
             start = 0 if rest == "ssm_out.weight" else qk
             return (self._untile(x, 1 if rest == "ssm_out.weight" else 0, start, vdim, a, hv),
                     "value heads regrouped")
@@ -1623,14 +1761,37 @@ def _load_ref_classes():
     return route_b.Safetensors, rad_verify.Gguf
 
 
+def _policy_verdict(passed, kp_weights=0):
+    """PASS / PARTIAL / FAIL. PARTIAL means every plane the Python decoder could read passed, but
+    some weights carry plugin-private planes it honestly cannot decode (checked by the engine)."""
+    if not passed:
+        return "FAIL"
+    return "PARTIAL" if kp_weights else "PASS"
+
+
+def _policy_line(policy, verdict, n_decoded, kp_weights, kp_bytes, kp_dtypes, out=None):
+    base = f"policy {policy}: {verdict}"
+    if verdict == "PARTIAL":
+        names = ', '.join(kp_dtypes) or "plugin-private"
+        base += (f" - kernel-private planes not Python-decoded "
+                 f"({kp_weights} weight(s), {kp_bytes/2**30:.3f} GiB: {names}); "
+                 f"PASS on {n_decoded} Python-decoded weight(s)")
+    if out:
+        base += f"; report {out}"
+    return base
+
+
 def verify(args):
     """rad_verify-style hashes, per-tensor relative RMSE against the bf16 source and the GGUF's
     own dequantisation, a size table by role/type, and the exactness/refusal policy verdict."""
     import numpy as np
-    from radfile import RadFile
+    from radfile import RadFile, KernelPrivateDtype, dt_name, DT, plane_values
     Safetensors, Gguf = _load_ref_classes()
     rf = RadFile(args.rad)
     src = Safetensors(args.source) if args.source else None
+    pos = list(getattr(args, "gguf_pos", None) or [])
+    given = args.gguf if isinstance(args.gguf, list) else ([args.gguf] if args.gguf else [])
+    args.gguf = (given + pos) or None
     if args.gguf:
         paths = args.gguf if isinstance(args.gguf, list) else [args.gguf]
         ggs = [Gguf(p) for p in paths]
@@ -1656,6 +1817,17 @@ def verify(args):
     else:
         gg = None
     refs = Refs(rf, src, gg, 0)
+    # The plan says which weights the UD GGUF does not carry (kept from bf16) or derives; those
+    # legitimately have no GGUF reference and are compared with the source only.
+    planned, kept_set, derived_set = None, set(), set()
+    if args.plan_json and os.path.exists(args.plan_json):
+        try:
+            pj = json.load(open(args.plan_json))
+            planned = [w["target"] for w in pj.get("tensors", []) if w.get("target")]
+            kept_set = {w["name"] for w in pj.get("kept", [])}
+            derived_set = {w["name"] for w in pj.get("derived", [])}
+        except Exception:
+            planned, kept_set, derived_set = None, set(), set()
     names = [e.name for e in rf.entries]
     if args.only:
         names = [n for n in names if re.search(args.only, n)]
@@ -1679,10 +1851,69 @@ def verify(args):
     fails = []
     missing_src = missing_gg = 0
     hash_ok = hash_n = 0
+    kp_weights = kp_bytes = 0
+    kp_dtypes = collections.Counter()
+    meta_weights = meta_equal = meta_bytes = 0
     src_num = src_den = gg_num = gg_den = 0.0
     t0 = time.time()
     for i, name in enumerate(names):
         e = rf.by_name[name]
+        role = _rad_role(name)
+        enc = e.enc.name()
+        tot += e.bytes
+        by_role[role][0] += 1; by_role[role][1] += e.bytes
+        by_enc[enc][0] += 1; by_enc[enc][1] += e.bytes
+        kp_planes = e.enc.kernel_private_planes()
+        if kp_planes:
+            # Not a failure and not a pass: the core cannot interpret these planes, so neither
+            # does this reader. Record the weight and keep the verdict honest.
+            kp_weights += 1
+            kp_bytes += e.bytes
+            for p in kp_planes:
+                kp_dtypes[dt_name(p.dtype)] += 1
+            rec = dict(name=name, role=role, encoding=enc, bytes=e.bytes, shape=list(e.shape),
+                       sampled_rows=None, rmse_source=None, rmse_gguf=None, sha256_rad=None,
+                       sha256_source=None, sha256_gguf=None, hash_equal_source=None,
+                       hash_equal_gguf=None, kernel_private=True,
+                       kernel_private_dtypes=[dt_name(p.dtype) for p in kp_planes],
+                       note="kernel-private plane(s): not Python-decoded",
+                       status="KERNEL-PRIVATE",
+                       why=["kernel-private planes not Python-decoded: " +
+                            ", ".join(dt_name(p.dtype) for p in kp_planes)])
+            rows.append(rec)
+            if (i + 1) % 1000 == 0:
+                print(f"  {i+1}/{len(names)}  {time.time()-t0:.0f}s", flush=True)
+            continue
+        dt0 = e.enc.planes[0].dtype
+        if e.enc.scheme == "plain" and dt0 in DT and not dt_name(dt0).startswith(("f", "bf")):
+            # Integer metadata (the PLE layer multipliers, n-gram head offsets and vocab sizes):
+            # bit-exact, not a float weight and not in llama.cpp's UD GGUF.
+            sa, snote = refs.source(name) if src is not None else (None, "no --source")
+            v = plane_values(rf, e, 0).reshape(-1).astype(np.int64)
+            meta_weights += 1
+            meta_bytes += e.bytes
+            rh = hashlib.sha256(np.ascontiguousarray(v, "<i8").tobytes()).hexdigest()
+            sh = None
+            if sa is None:
+                status, why, eq = "METADATA", ["integer metadata; no source reference"], None
+            else:
+                a = np.asarray(sa).reshape(-1)
+                eq = bool(a.size == v.size and np.array_equal(v, a))
+                sh = hashlib.sha256(np.ascontiguousarray(a, "<i8").tobytes()).hexdigest()
+                status = "ok" if eq else "FAIL"
+                why = [] if eq else ["integer metadata differs from the source"]
+                meta_equal += 1 if eq else 0
+            rec = dict(name=name, role=role, encoding=enc, bytes=e.bytes, shape=list(e.shape),
+                       sampled_rows=None, rmse_source=None, rmse_gguf=None, sha256_rad=rh,
+                       sha256_source=sh, sha256_gguf=None, hash_equal_source=eq,
+                       hash_equal_gguf=None, kind="metadata", note=snote,
+                       status=status, why=why)
+            if status == "FAIL":
+                fails.append(rec)
+            rows.append(rec)
+            if (i + 1) % 1000 == 0:
+                print(f"  {i+1}/{len(names)}  {time.time()-t0:.0f}s", flush=True)
+            continue
         nrows_full = int(np.prod(e.shape[:-1])) if len(e.shape) > 1 else 1
         ncols = e.shape[-1] if e.shape else 1
         # A 248K x 2048 head as f32 is 2 GB on each side; compare the first 4096 rows of such
@@ -1760,11 +1991,6 @@ def verify(args):
         eq_gg = (rh.hexdigest() == gh.hexdigest()) if ga is not None else None
         if sa is not None:
             hash_n += 1; hash_ok += 1 if eq_src else 0
-        role = _rad_role(name)
-        enc = e.enc.name()
-        tot += e.bytes
-        by_role[role][0] += 1; by_role[role][1] += e.bytes
-        by_enc[enc][0] += 1; by_enc[enc][1] += e.bytes
         draft = name == "mtp.draft_head.weight"
         tol = args.draft_tol if draft else args.tol
         bad = []
@@ -1773,6 +1999,7 @@ def verify(args):
         elif e_rmse is not None and e_rmse > tol:
             bad.append(f"source RMSE {e_rmse:.3f} > {tol:.3f}")
         if (ga is None and gg is not None and not draft and not name.startswith("v.")
+                and name not in kept_set and name not in derived_set
                 and not getattr(args, "skip_gguf", False)):
             bad.append("no GGUF reference")
         elif g_rmse is not None and g_rmse > tol:
@@ -1792,13 +2019,6 @@ def verify(args):
             print(f"  {i+1}/{len(names)}  {time.time()-t0:.0f}s", flush=True)
 
     # coverage against the plan, and the finality policy
-    planned = None
-    if args.plan_json and os.path.exists(args.plan_json):
-        try:
-            pj = json.load(open(args.plan_json))
-            planned = [w["target"] for w in pj.get("tensors", []) if w.get("target")]
-        except Exception:
-            planned = None
     missing_plan = []
     if planned:
         have = set(names)
@@ -1823,6 +2043,8 @@ def verify(args):
         passed = not fails and not missing_plan
     if getattr(args, "skip_gguf", False):
         passed = not any(r["status"] == "FAIL" for r in rows) and not missing_plan
+    verdict = _policy_verdict(passed, kp_weights)
+    kp_names = [d for d, _ in kp_dtypes.most_common()]
     report = dict(tool="ud_map verify", rad=args.rad, source=args.source,
                   gguf=(args.gguf if isinstance(args.gguf, list) else [args.gguf]) if args.gguf else None,
                   policy=policy, tol=args.tol, draft_tol=args.draft_tol,
@@ -1831,9 +2053,17 @@ def verify(args):
                   expert_sample_per_layer=(expert_sample or None),
                   rmse_source=src_rmse, rmse_gguf=gg_rmse,
                   hash_equal_source=f"{hash_ok}/{hash_n}",
+                  python_decoded_weights=len(rows) - kp_weights,
+                  metadata=dict(weights=meta_weights, equal=meta_equal, bytes=meta_bytes,
+                                note=("integer metadata, compared bit-exactly with the source"
+                                      if meta_weights else None)),
+                  kernel_private=dict(weights=kp_weights, bytes=kp_bytes,
+                                      dtypes=kp_names,
+                                      note=("kernel-private planes not Python-decoded; "
+                                            "checked by the engine" if kp_weights else None)),
                   missing_source=missing_src, missing_gguf=missing_gg,
                   missing_plan=missing_plan,
-                  failures=[r["name"] for r in fails], pass_=passed,
+                  failures=[r["name"] for r in fails], pass_=passed, verdict=verdict,
                   by_role={k: dict(n=v[0], bytes=v[1]) for k, v in sorted(by_role.items())},
                   by_encoding={k: dict(n=v[0], bytes=v[1]) for k, v in sorted(by_enc.items())},
                   tensors=rows, seconds=round(time.time() - t0, 1))
@@ -1857,8 +2087,14 @@ def verify(args):
         for r in fails[:12]:
             print("  FAIL", r["name"], "; ".join(r["why"]),
                   f"src={r['rmse_source']} gguf={r['rmse_gguf']}")
-    print(f"policy {policy}: {'PASS' if passed else 'FAIL'}"
-          + (f"; report {args.out}" if args.out else ""))
+    if kp_weights:
+        print(f"kernel-private: {kp_weights} weight(s), {kp_bytes/2**30:.3f} GiB, "
+              f"dtypes {', '.join(kp_names)}; not Python-decoded, checked by the engine")
+    if meta_weights:
+        print(f"integer metadata: {meta_weights} tensor(s), {meta_bytes} B, "
+              f"bit-equal to the source {meta_equal}/{meta_weights} (not in the GGUF)")
+    print(_policy_line(policy, verdict, len(rows) - kp_weights, kp_weights, kp_bytes,
+                       kp_names, args.out))
     return passed
 
 
@@ -2388,6 +2624,8 @@ def main():
     c.set_defaults(fn=calibrate)
 
     v = sp.add_parser("verify", help="hashes, per-tensor RMSE, size table and policy verdict")
+    v.add_argument("gguf_pos", nargs="*",
+                   help="the GGUF shards (also accepted as --gguf, as the runbook writes it)")
     v.add_argument("--gguf", nargs="+")
     v.add_argument("--rad", required=True)
     v.add_argument("--source")
@@ -2396,6 +2634,8 @@ def main():
     v.add_argument("--out")
     v.add_argument("--only")
     v.add_argument("--workers", type=int, default=8)
+    v.add_argument("--home")
+    v.add_argument("--kernels")
     v.add_argument("--tol", type=float, default=0.20)
     v.add_argument("--draft-tol", type=float, default=0.75)
     v.add_argument("--policy", choices=["auto", "lossless", "quantised"], default="auto")
