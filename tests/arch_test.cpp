@@ -2833,6 +2833,63 @@ TEST(q50_expert_declarations_choose_the_unrotated_bf16_activation_path) {
             CHECK_EQ(w.d.dtype, (uint32_t)RAD_F16);
 }
 
+/* IQ4_XS is IQ4_NL's codes and table with two stored scale levels: a signed 6-bit scale per 32
+ * and an f16 d per 256. It must pick the unrotated bf16 activation path, declare the `s2` op (three
+ * weight tables a class) and its `scale`/`scale.1` views with their own dtypes. */
+TEST(iq4_xs_expert_declarations_use_the_s2_op_and_both_scales) {
+    using namespace rad::arch;
+    RadModelMeta meta = qwen4exp_meta();
+    RadEncoding iq = rad_enc_affine(RAD_U4, RAD_I6, 1, 32);
+    rad_enc_add_table(&iq, "table", RAD_I8, 1, 16);
+    rad_enc_add_plane(&iq, "scale.1", RAD_F16, 1, 256);
+    REQUIRE(rad_enc_valid(&iq));
+    CHECK_EQ(MoeFP8::format_of(iq), 16);
+    const RadEncoding row8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 1, 128);
+    RadEncoding u2 = rad_enc_affine(RAD_U2, RAD_F16, 1, 128);
+    rad_enc_add_plane(&u2, "zero", RAD_U8, 1, 128);
+
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok = 2048; c.max_seqs = 8; c.max_spec = 3; c.max_ctx = 200000;
+    RadBuilder b;
+    b.encs = { { "ffn_gate_up_exps", iq }, { "ffn_down_exps", iq },
+               { "_hc_down.weight", row8 }, { "_hc_up.weight", row8 },
+               { "fc_hidden", row8 }, { "fc_embedding", row8 }, { "draft_head", u2 } };
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+    const qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[0];
+    CHECK_EQ(m.moecfg.expert_w4, 1);
+    CHECK_EQ(m.moecfg.expert_rot, 0);
+    CHECK_EQ(m.moecfg.expert_nl, 1);
+    CHECK_EQ(m.moecfg.expert_iq4xs, 1);
+    CHECK_EQ(m.moecfg.expert_iq4, 0);
+    CHECK_EQ(m.moecfg.expert_g64, 0);
+    int s2_ops = 0, base_ops = 0, hq_ops = 0;
+    for (const RecOp& o : b.ops) {
+        if (o.op == "moe_gemm_q_s2")
+            for (const auto& p : o.p)
+                if (p.key == "dtype" && p.sval == "iq4xs32a16") ++s2_ops;
+        if (o.op == "moe_gemm_q") ++base_ops;
+        if (o.op == "had_quant_act_fp8") ++hq_ops;
+    }
+    CHECK(s2_ops > 0);         /* both projections take the three-table op */
+    CHECK_EQ(base_ops, 0);
+    CHECK_EQ(hq_ops, 0);
+    int scale_i6 = 0, scale1_f16 = 0;
+    for (const RecWeight& w : b.weights) {
+        if (w.name.find("_exps.") == std::string::npos) continue;
+        if (w.name.find(".scale1") != std::string::npos) {
+            CHECK(w.d.planes && std::string(w.d.planes) == "scale.1");
+            CHECK_EQ(w.d.dtype, (uint32_t)RAD_F16);
+            ++scale1_f16;
+        } else if (w.name.find(".scale") != std::string::npos) {
+            CHECK(w.d.planes && std::string(w.d.planes) == "scale");
+            CHECK_EQ(w.d.dtype, (uint32_t)RAD_I6);
+            ++scale_i6;
+        }
+    }
+    CHECK(scale_i6 > 0);
+    CHECK(scale1_f16 > 0);
+}
+
 /* Q2_0 is the third unrotated form: u2 codes at an f16 scale per 64, bf16 activations. */
 TEST(q20_expert_declarations_choose_the_unrotated_bf16_activation_path) {
     using namespace rad::arch;
