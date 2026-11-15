@@ -2862,6 +2862,78 @@ TEST(iq2_s_expert_declarations_choose_the_unrotated_bf16_activation_path) {
     }
 }
 
+/* w3nl64a8h is the rotated codebook at three bits: u3 codes into an eight-entry f32 table, an
+ * E4M3 scale per 64 of K under the fixed second level, and fwht128. It is the w4nl64a8h family's
+ * smallest form, so the arch must resolve the same rotated activation path (the preceding
+ * HyperConn read writes `moe_hr`, and the gate_up GEMM reads it), the codebook views and the
+ * fixed scale pair. */
+static RadEncoding w3nl64_enc() {
+    RadEncoding e = rad_enc_affine(RAD_U3, RAD_F8E4M3, 1, 64);
+    rad_enc_add_plane(&e, "scale.1", RAD_F32, 0, 0);
+    rad_enc_add_table(&e, "table", RAD_F32, 1, 8);
+    rad_enc_copy_str(e.transform, "fwht128");
+    return e;
+}
+
+TEST(w3nl64a8h_expert_declarations_choose_the_rotated_codebook_path) {
+    using namespace rad::arch;
+    RadModelMeta meta = qwen4exp_meta();
+    RadEncoding w3 = w3nl64_enc();
+    REQUIRE(rad_enc_valid(&w3));
+    CHECK_EQ(MoeFP8::format_of(w3), 15);
+    const RadEncoding row8 = rad_enc_affine(RAD_F8E4M3, RAD_F32, 1, 128);
+    RadEncoding u2 = rad_enc_affine(RAD_U2, RAD_F16, 1, 128);
+    rad_enc_add_plane(&u2, "zero", RAD_U8, 1, 128);
+
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok = 2048; c.max_seqs = 8; c.max_spec = 3; c.max_ctx = 200000;
+    RadBuilder b;
+    b.encs = { { "ffn_gate_up_exps", w3 }, { "ffn_down_exps", w3 },
+               { "_hc_down.weight", row8 }, { "_hc_up.weight", row8 },
+               { "fc_hidden", row8 }, { "fc_embedding", row8 }, { "draft_head", u2 } };
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+    const qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[0];
+    CHECK_EQ(m.moecfg.expert_w4, 1);
+    CHECK_EQ(m.moecfg.expert_rot, 1);
+    CHECK_EQ(m.moecfg.expert_nl, 1);
+    CHECK_EQ(m.moecfg.expert_g64, 2);
+    CHECK_EQ(m.moecfg.expert_w3, 1);
+    CHECK_EQ(m.moecfg.expert_w5, 0);
+
+    rad_buf hr = 0;
+    for (size_t i = 0; i < b.bufs.size(); ++i)
+        if (b.bufs[i].name == "moe_hr.q") hr = (rad_buf)i + 1;
+    CHECK(hr != 0);
+    int w3_ops = 0, rot_reads = 0;
+    for (const RecOp& o : b.ops) {
+        if (o.op == "hc_read" && pint(&o, "rotate") == 1 &&
+            std::find(o.writes.begin(), o.writes.end(), hr) != o.writes.end())
+            ++rot_reads;
+        if (o.op.rfind("moe_gemm", 0) != 0) continue;
+        bool w3_op = false;
+        for (const auto& p : o.p)
+            if (p.key == "dtype" && p.sval == "w3nl64a8h") w3_op = true;
+        if (!w3_op) continue;
+        ++w3_ops;
+        if (pstr(&o, "a_order") == "token")
+            CHECK(std::find(o.reads.begin(), o.reads.end(), hr) != o.reads.end());
+    }
+    CHECK(w3_ops > 0);
+    CHECK(rot_reads > 0);
+    for (const RecWeight& w : b.weights) {
+        const std::string n = w.name;
+        if (n.find("_exps.") == std::string::npos || n.size() <= 6) continue;
+        if (n.compare(n.size() - 6, 6, ".scale") == 0) {
+            CHECK(w.d.source != nullptr && w.d.planes &&
+                  std::string(w.d.planes) == "scale,scale.1");
+            CHECK_EQ(w.d.dtype, (uint32_t)RAD_F8E4M3);
+        } else if (n.compare(n.size() - 7, 7, ".weight") == 0) {
+            CHECK(w.d.planes && std::string(w.d.planes) == "codes,table");
+            CHECK_EQ(w.d.dtype, (uint32_t)RAD_U3);
+        }
+    }
+}
+
 TEST(mxfp4_expert_declarations_preserve_tp4_and_tp8_scale_geometry_and_movement_groups) {
     using namespace rad::arch;
     const RadEncoding mx = rad_enc_affine(RAD_FP4E2M1, RAD_E8M0, 1, 32);

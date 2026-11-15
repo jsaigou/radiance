@@ -280,6 +280,11 @@ struct MoeFP8 {
          * layer's; the 64-group codebook forms may differ by layer and projection, and declare()
          * resolves each layer's (MoeFP8::fmt). */
         int     expert_w5    = 0;
+        /* 3-bit codes: libquant's 8-level `table=w3nl` (a sign over four magnitudes) at
+         * w4nl64a8h's scales (dtype `w3nl64a8h`), rotated like the 4-bit codebook. Only with
+         * `expert_nl`, `expert_rot`, `expert_w4` and `expert_g64` 2. Resolved per layer and
+         * projection like `expert_w5`. */
+        int     expert_w3    = 0;
         /* Plain bf16 experts (no quantising recipe). Both GEMMs are `moe_gemm` over one table of
          * whole experts with `silu_mul` between, and the shared arm follows the trunk
          * (Geom::w_bf16). Not sliced by parity: each expert is served whole on its rank, which
@@ -492,13 +497,14 @@ struct MoeFP8 {
      * rotated w4nl codebook, 5 and 6 that codebook at E4M3 scales per 64 and 32 of K, 7 its
      * five-bit form per 64, 8 OCP MXFP4, 9 block fp8 at f32 scales, 10 unrotated IQ4_NL at f16
      * scales per 32 with bf16 activations, 11 Q5_0, 12 Q2_0, 13 IQ3_XXS and 14 IQ2_S (the grid
-     * formats, with their signs and u5 sub-scales); RAD_E_DTYPE otherwise. */
+     * formats, with their signs and u5 sub-scales), 15 the w4nl codebook's three-bit form at
+     * E4M3 scales per 64 (w3nl64a8h); RAD_E_DTYPE otherwise. */
     static int format_of(const RadEncoding& e);
     /* format_of's numbers as the grouped GEMMs' dtype strings. */
-    static constexpr const char* kServed[15] = { "fp8a8", "w4a8", "w4a8h", "bf16", "w4nla8h",
+    static constexpr const char* kServed[16] = { "fp8a8", "w4a8", "w4a8h", "bf16", "w4nla8h",
                                                 "w4nl64a8h", "w4nl32a8h", "w5nl64a8h", "mxfp4a8", "fp8a8f32",
                                                 "iq4nl32a16", "q50a16", "q20a16",
-                                                "iq3xxs32a16", "iq2s32a16" };
+                                                "iq3xxs32a16", "iq2s32a16", "w3nl64a8h" };
 
     int  declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                  const Wire& wire, const Src& src, bool fold = false, bool add_out = true,
@@ -578,7 +584,7 @@ inline int MoeFP8::format_of(const RadEncoding& e) {
         return RAD_E_DTYPE;
     }
     /* The codebook at E4M3 scales per 64 or 32 of K under one fixed f32 (w4nl64a8h, w4nl32a8h),
-     * and its five-bit form per 64 (w5nl64a8h). */
+     * and its five- and three-bit forms per 64 (w5nl64a8h, w3nl64a8h). */
     if (e.n_planes == 4 && sc && sc->dtype == RAD_F8E4M3) {
         const RadEncPlane* s2 = rad_enc_plane(&e, "scale.1");
         const RadEncPlane* t  = rad_enc_plane(&e, "table");
@@ -591,6 +597,8 @@ inline int MoeFP8::format_of(const RadEncoding& e) {
             return sc->block[1] == RAD_FP8_BLOCK / 2 ? 5 : 6;
         if (t->extent[1] == 32 && e.plane[0].dtype == RAD_U5 && sc->block[1] == RAD_FP8_BLOCK / 2)
             return 7;
+        if (t->extent[1] == 8 && e.plane[0].dtype == RAD_U3 && sc->block[1] == RAD_FP8_BLOCK / 2)
+            return 15;
         return RAD_E_DTYPE;
     }
     if (!sc) return RAD_E_DTYPE;
@@ -693,19 +701,20 @@ inline int MoeFP8::probe(RadBuilder* b, Names& nm, int l, const Src& src, Config
                             "(fp8_e4m3*bf16[128x128]), four-bit (i4*bf16[1x128], optionally "
                             "/fwht128; or u4 codes into a 16-entry f32 table, /fwht128) or plain "
                             "bf16; or the codebook at E4M3 scales a 64 or 32 of K under a fixed "
-                            "f32, or its 32-entry five-bit form at a 64, or OCP MXFP4 "
-                            "(fp4_e2m1*e8m0[1x32]). "
+                            "f32, or its 32-entry five-bit form a 64 or 8-entry three-bit form a "
+                            "64, or OCP MXFP4 (fp4_e2m1*e8m0[1x32]). "
                             "Convert it with a recipe that makes one of them.\n", guw, en);
             return RAD_E_DTYPE;
         }
         if (f != 3) break;
     }
     cfg->expert_w4   = (f == 1 || f == 2 || f == 4 || f == 5 || f == 6 || f == 7 || f == 10 ||
-                          f == 11 || f == 12 || f == 13 || f == 14) ? 1 : 0;
-    cfg->expert_rot  = (f == 2 || f == 4 || f == 5 || f == 6 || f == 7) ? 1 : 0;
-    cfg->expert_nl   = (f == 4 || f == 5 || f == 6 || f == 7 || f == 10) ? 1 : 0;
-    cfg->expert_g64  = (f == 5 || f == 7) ? 2 : f == 6 ? 4 : 0;
+                          f == 11 || f == 12 || f == 13 || f == 14 || f == 15) ? 1 : 0;
+    cfg->expert_rot  = (f == 2 || f == 4 || f == 5 || f == 6 || f == 7 || f == 15) ? 1 : 0;
+    cfg->expert_nl   = (f == 4 || f == 5 || f == 6 || f == 7 || f == 10 || f == 15) ? 1 : 0;
+    cfg->expert_g64  = (f == 5 || f == 7 || f == 15) ? 2 : f == 6 ? 4 : 0;
     cfg->expert_w5   = f == 7 ? 1 : 0;
+    cfg->expert_w3   = f == 15 ? 1 : 0;
     cfg->expert_bf16 = f == 3 ? 1 : 0;
     cfg->expert_mx   = f == 8 ? 1 : 0;
     cfg->expert_f32_scale = f == 9 ? 1 : 0;
@@ -795,7 +804,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         const int want = c.expert_f32_scale ? 9 : c.expert_mx ? 8 : c.expert_bf16 ? 3
                        : c.expert_iq4 ? 10 : c.expert_q50 ? 11 : c.expert_q20 ? 12
                        : c.expert_iq3 ? 13 : c.expert_iq2 ? 14
-                       : c.expert_w5 ? 7 : c.expert_g64 == 4 ? 6
+                       : c.expert_w3 ? 15 : c.expert_w5 ? 7 : c.expert_g64 == 4 ? 6
                        : c.expert_g64 ? 5 : c.expert_nl ? 4
                        : c.expert_w4 ? (c.expert_rot ? 2 : 1) : 0;
         auto fmt_of = [&](int64_t e, RadEncoding (&enc)[2], int (&fe)[2], const char* (&nmv)[2]) {
@@ -811,7 +820,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
          * scale views, fixed second level, accumulators), so each layer and projection may use any
          * of them. The layer's first non-bf16 expert decides both; every other must match. Outside
          * that family a layer uses the probed layer's form. */
-        auto family = [](int f) { return f == 5 || f == 6 || f == 7; };
+        auto family = [](int f) { return f == 5 || f == 6 || f == 7 || f == 15; };
         fmt[0] = fmt[1] = want;
         if (family(want))
             for (int64_t e = 0; e < ne; ++e) {
@@ -1034,6 +1043,7 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
     auto edt_of = [&](int f) {
         return f == 8 ? (uint32_t)RAD_FP4E2M1 : f == 7 ? (uint32_t)RAD_U5
              : f == 13 ? (uint32_t)RAD_U8 : f == 14 ? (uint32_t)RAD_U10
+             : f == 15 ? (uint32_t)RAD_U3
              : c.expert_q50 ? (uint32_t)RAD_I5 : c.expert_q20 ? (uint32_t)RAD_U2
          : c.expert_nl ? (uint32_t)RAD_U4
              : c.expert_w4 ? (uint32_t)RAD_I4 : (uint32_t)RAD_F8E4M3;
@@ -1064,11 +1074,14 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
         (c.expert_q50 && (c.expert_nl || c.expert_rot || !c.expert_w4)) ||
         (c.expert_q20 && (c.expert_nl || c.expert_rot || !c.expert_w4)) ||
         (c.expert_iq3 && (c.expert_nl || c.expert_rot || !c.expert_w4)) ||
-        (c.expert_iq2 && (c.expert_nl || c.expert_rot || !c.expert_w4))) {
+        (c.expert_iq2 && (c.expert_nl || c.expert_rot || !c.expert_w4)) ||
+        (c.expert_w3 && (!c.expert_nl || !c.expert_rot || !c.expert_w4 || c.expert_g64 != 2 ||
+                         c.expert_w5))) {
         fprintf(stderr, "radiance: rotated experts (expert_rot) require the 4-bit expert format, "
                         "a codebook (expert_nl) the rotated one, and IQ4_NL/IQ3_XXS/IQ2_S "
-                        "(expert_iq4/expert_iq3/expert_iq2) the unrotated 4-bit plane; there is "
-                        "no rotated E4M3 expert plane\n");
+                        "(expert_iq4/expert_iq3/expert_iq2) the unrotated 4-bit plane; the "
+                        "three-bit codebook (expert_w3) needs that codebook's 64-groups; there "
+                        "is no rotated E4M3 expert plane\n");
         return RAD_E_INVAL;
     }
     const int  sh_row = ep ? RAD_SHARD_NONE : RAD_SHARD_ROW;
