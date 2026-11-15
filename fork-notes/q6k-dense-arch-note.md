@@ -58,3 +58,61 @@ At M = 1..8 the WMMA row is often faster than the matvec on these shapes (lm_hea
 2.94 ms vs 5.01 ms), because one wave still reads a 48-byte row and the activation is reused.
 The planner is free to pick `gemm_q6ka16_nt_wmma` for M <= 8; the matvec row remains the
 bit-exact-reference form.
+
+## Dense wiring landed (branch `kernel-dense-wire`, 2026-11-15)
+
+`LinearFP8` (arch/common/rad_fp8.h) now reads both ggml dense forms from the weight's encoding,
+so a Flash-Next container keeps the UD map's Q6_K/Q8_0 trunk planes:
+
+- **Q6_K** (`i6*i8[1x16]*f16[1x256]`): `gemm_nt_q`, `dtype=q6k`, `group=256`, over the input's
+  bf16 plane. Views are `codes` -> `b`, `scale` -> `b_scale`, `scale.1` -> `b_ref` (operand 6);
+  no activation quantiser. Row parts stay whole 16-row tiles; a column shard must be whole
+  256-value blocks. Covers the 70 source tensors fused into 35 `ssm_inz`, 12 each of
+  `attn_qg`/`attn_k`/`attn_v`/`attn_output`, the shared expert's 47 `ffn_gate_up_shexp`, and
+  `output.weight` (mapped, below).
+- **Q8_0** (`i8*f16[1x32]`): `gemm_nt_q`, `dtype=q80a16`, `group=32`, the two planes as `b` and
+  `b_scale`. Covers the 36 `ssm_out`, the 48 `ffn_down_shexp`, the PLE layer's
+  `ple_key`/`ple_value` projections, and layer 2's whole block (the map's only Q8_0
+  `ssm_inz` + `ffn_gate_up_shexp`). `PleLayer` also declares those projections at Q6_K (or bf16)
+  when the container holds those planes. The 96 + 1 connection `*_hc_down/up` matrices stay on
+  `hc_read`, which does not read Q8_0 (mapped, below).
+- The grouped MoE declarations are unchanged: `format_of`/`kServed` still name only the grouped
+  kernels. Q6_K/Q8_0 *expert* planes remain unserved.
+
+### lm_head: mapped, not a new logits row
+
+`logits_gemm` carries one weight operand, so Q6_K's three planes cannot be bound there (and the
+MTP head reads the same `w_lm_head` through `logits_gemm`/`logit_rerank`). The arch now refuses a
+Q6_K/Q8_0 `output.weight` at declare instead of loading an unservable op. `tools/ud_map`'s mirror
+recipe maps it to the served int8 head (`rtn codes=i8 group=128 scale=bf16`), the same form the
+production `qwen4exp-w4nl64-i8-hc8m.recipe` uses:
+
+- output.weight Q6_K 497 MiB -> i8 615 MiB, **+118 MiB** (+0.115 GiB on the 89.00 GiB container);
+- the head is then exact at its int8 plane values, but not UD's Q6_K codes. A faithful Q6_K head
+  needs a new `logits_gemm` layout that packs the three planes into one row (or f32-output
+  `gemm_nt_q` rows plus a logits op); not built here because the map's head would cost the MTP
+  path the same work.
+
+### Q8_0 connection mixing is mapped, not wired
+
+`hc_read` serves bf16 or E4M3 rows, not Q8_0; the 96 + 1 connection's `*_hc_down/up` Q8_0 planes
+are mapped by `ud_map` to the served `fp8_e4m3` + f32-per-group rows (down group 128, up group 80)
+— the production recipe's form, essentially the same bytes. Q8_0 stays exact for the dense GEMMs;
+the connection rows lose their 8-bit codes to E4M3.
+
+### Out of scope (not in this map)
+
+Q8_0 `token_embd` does not occur (the map's embedding is IQ4_XS, L2) and the MTP layer is kept from
+bf16, not Q8_0, so no Q8_0 embedding gather or grouped Q8_0 MTP kernel is needed here. The 2-bit
+`mtp.draft_head` and the MTP layer's formats are the recipe's, not this lane's.
+
+### Verification (Tohil, `~/radiance-test/src-dense-wire`)
+
+- arch_test **316,183 checks / 223 cases**, 0 fail (adds the two Q6_K/Q8_0 declaration tests);
+  ref_test **155,196 / 303**; host_experts_test **216 / 1**; relayout_parity **1,173 / 22**.
+- Q6_K bench: layout **22/0**, check **142/0**, real **30/0**; Q8_0: layout **24/0**, check
+  **148/0**, real **40/0** (matvec bitwise vs ggml dequantisation, WMMA within ulp).
+- `rad-convert --plan-only` on the bf16 Flash-Next source with a recipe that keeps the map's dense
+  planes: `ssm_inz`/`attn_qg` land on `i6*i8[1x16]*f16[1x256]`, `ssm_out`/`ffn_down_shexp`/the PLE
+  projections on `i8*f16[1x32]`, and `output.weight` on `i8*bf16[1x128]`; 51,488 weights planned,
+  nothing written.

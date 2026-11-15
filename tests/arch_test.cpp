@@ -2630,6 +2630,77 @@ TEST(the_encodings_the_model_holds_choose_the_flash_next_kernels) {
     CHECK(!p.layers[0].hc_mix.mix_e4m3);
 }
 
+/* The ggml dense forms read the bf16 plane directly, so the plugin must not announce an int8
+ * trunk (which would declare and issue quantisers) and must hand gemm_nt_q the three Q6_K planes
+ * (codes, scale, scale.1) or Q8_0's two. */
+TEST(q6k_and_q80_dense_weights_take_the_ggml_gemm_rows) {
+    using namespace rad::arch;
+    RadModelMeta meta = qwen4exp_meta();
+    RadEncoding q6k = rad_enc_affine(RAD_I6, RAD_I8, 1, 16);
+    rad_enc_add_plane(&q6k, "scale.1", RAD_F16, 1, 256);
+    RadEncoding q80 = rad_enc_affine(RAD_I8, RAD_F16, 1, 32);
+    REQUIRE(rad_enc_valid(&q6k) && rad_enc_valid(&q80));
+
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok = 2048; c.max_seqs = 8; c.max_spec = 3; c.max_ctx = 200000;
+    RadBuilder b;
+    b.encs = { { "ssm_inz", q6k },  { "attn_qg", q6k }, { "ffn_gate_up_shexp", q6k },
+               { "ssm_out", q80 },  { "ffn_down_shexp", q80 },
+               { "ple_key.weight", q80 }, { "ple_value.weight", q80 } };
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_OK);
+    const qwen4exp_fp8::Model& m = qwen4exp_fp8::g_model[0];
+    CHECK_EQ(m.trunk_i8, 0);
+
+    int q6k_ops = 0, q80_ops = 0;
+    for (const RecOp& o : b.ops) {
+        if (o.op != "gemm_nt_q") continue;
+        for (const auto& p : o.p) {
+            if (p.key == "dtype" && p.sval == "q6k") ++q6k_ops;
+            if (p.key == "dtype" && p.sval == "q80a16") ++q80_ops;
+        }
+    }
+    CHECK(q6k_ops > 0);   /* delta-net inz, full attention q, the shared gate/up */
+    CHECK(q80_ops > 0);   /* ssm_out, the shared down, the two PLE projections */
+
+    int code_i6 = 0, scale_i8 = 0, ref_f16 = 0, codes_i8 = 0, scale_f16 = 0;
+    for (const RecWeight& w : b.weights) {
+        const std::string n = w.name;
+        const std::string pl = w.d.planes ? w.d.planes : "";
+        if (n == "blk.0.ssm_inz.weight" && pl == "codes" && w.d.dtype == RAD_I6) ++code_i6;
+        if (n == "blk.0.ssm_inz.scale" && pl == "scale" && w.d.dtype == RAD_I8) ++scale_i8;
+        if (n == "blk.0.ssm_inz.scale1" && pl == "scale.1" && w.d.dtype == RAD_F16) ++ref_f16;
+        if (n == "blk.0.ssm_out.weight" && pl == "codes" && w.d.dtype == RAD_I8) ++codes_i8;
+        if (n == "blk.0.ssm_out.scale" && pl == "scale" && w.d.dtype == RAD_F16) ++scale_f16;
+    }
+    CHECK_EQ(code_i6, 1);
+    CHECK_EQ(scale_i8, 1);
+    CHECK_EQ(ref_f16, 1);
+    CHECK_EQ(codes_i8, 1);
+    CHECK_EQ(scale_f16, 1);
+
+    /* The same planes at two ranks: ssm_out and the shared down are column slices, the trunk
+     * in/out row slices. Both must be whole Q6_K/Q8_0 blocks. */
+    RadBuildCtx c2 = build_ctx(0, 2);
+    c2.max_tok = 2048; c2.max_seqs = 8; c2.max_spec = 3; c2.max_ctx = 200000;
+    RadBuilder b2;
+    b2.encs = b.encs;
+    REQUIRE_EQ(qwen4exp_fp8::declare(&b2, &meta, &c2), RAD_OK);
+}
+
+/* The lm_head's logits_gemm rows read one weight operand, so a Q6_K head (three planes) cannot be
+ * served there. The plugin must refuse it at declare rather than load an unservable op. */
+TEST(qwen4exp_refuses_a_q6k_lm_head_without_a_logits_row) {
+    RadModelMeta meta = qwen4exp_meta();
+    RadEncoding q6k = rad_enc_affine(RAD_I6, RAD_I8, 1, 16);
+    rad_enc_add_plane(&q6k, "scale.1", RAD_F16, 1, 256);
+    REQUIRE(rad_enc_valid(&q6k));
+    RadBuildCtx c = build_ctx(0, 1);
+    c.max_tok = 64; c.max_seqs = 1; c.max_spec = 0; c.max_ctx = 4096;
+    RadBuilder b;
+    b.encs = { { "output.weight", q6k } };
+    CHECK_EQ(qwen4exp_fp8::declare(&b, &meta, &c), RAD_E_DTYPE);
+}
+
 /* IQ4_NL is the one codebook form served unrotated: u4 codes into a sixteen-entry i8 table, an
  * f16 scale per 32 of K, and bf16 activations. The arch must not declare the rotated activation
  * (`op_hq`) or the `hr` pair, and the down projection's gated quantiser must write bf16 (the GEMM

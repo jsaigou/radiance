@@ -149,6 +149,31 @@ class FastRecipe(unittest.TestCase):
         self.assertRegex(text, r"blk\.40\.ffn_down_exps\.\*\.weight.*table=w4nl")
 
 
+class MirrorRecipe(unittest.TestCase):
+    def test_q6k_lm_head_and_q8_0_connections_take_the_served_encodings(self):
+        rows = [
+            dict(name="output.weight", type="Q6_K", shape=[2560, 248320],
+                 target="output.weight"),
+            dict(name="blk.0.hc_attn_down.weight", type="Q8_0", shape=[10240, 320],
+                 target="blk.0.attn_hc_down.weight"),
+            dict(name="blk.0.hc_attn_up.weight", type="Q8_0", shape=[320, 10240],
+                 target="blk.0.attn_hc_up.weight"),
+            dict(name="blk.0.ssm_out.weight", type="Q8_0", shape=[2560, 6144],
+                 target="blk.0.ssm_out.weight"),
+        ]
+        text = ud_map._mirror_recipe(rows, "m.gguf")
+        # The Q6_K head has no logits row; it is mapped to the int8 head, not mirrored as q6_K.
+        self.assertRegex(text, r"output\.weight\s+rtn\s+codes=i8")
+        self.assertNotRegex(text, r"output\.weight\s+ggml type=q6_K")
+        # hc_read serves bf16/E4M3 rows, so the Q8_0 connection planes are not mirrored.
+        self.assertIn("*_hc_down.weight", text)
+        self.assertIn("*_hc_up.weight", text)
+        self.assertNotIn("blk.0.attn_hc_down.weight", text)
+        self.assertNotIn("blk.0.attn_hc_up.weight", text)
+        # The dense Q8_0 trunk is served natively, so its plane rule stays exact.
+        self.assertRegex(text, r"blk\.0\.ssm_out\.weight\s+ggml type=q8_0")
+
+
 class Build(unittest.TestCase):
     def test_bf16_source_gets_the_fp8_descriptor_and_imatrix(self):
         a = argparse.Namespace(source="/src", rad_convert="/bin/rad-convert", recipe="r",

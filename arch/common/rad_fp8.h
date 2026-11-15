@@ -778,6 +778,12 @@ struct LinearFP8 {
      * reference, so the scale plane is passed twice, as `b_scale` and as `b_ref` (`wref`, a second
      * view whose layout hook reduces it). Read from the weight's encoding. */
     bool       mx = false;
+    /* ggml Q6_K: i6 codes and the two scale planes, read by gemm_nt_q at q6k over the bf16
+     * activation. `wref` is the per-256 f16 super-scale (the schema's b_ref). */
+    bool       q6k = false;
+    /* ggml Q8_0: i8 codes and an f16 scale per 32, read by gemm_nt_q at q80a16 over the bf16
+     * activation. */
+    bool       q80 = false;
     rad_weight wref = 0;
     /* Or M2XFP4 (libquant `m2xfp4`): the MXFP4 views, the meta plane riding the weight operand,
      * read by `gemm_nt_q` at dtype m2xfp4. */
@@ -931,6 +937,36 @@ inline bool linear_is_w8(const RadEncoding& e) {
     const RadEncPlane* sc = rad_enc_plane(&e, "scale");
     return e.plane[0].dtype == RAD_I8 && e.plane[0].block[1] == 1 && sc && sc->dtype == RAD_BF16 &&
            sc->block[0] == 1 && sc->block[1] == RAD_FP8_BLOCK;
+}
+
+/* ggml K-quant dense formats served by the libhalo dense GEMMs: Q6_K (i6 codes, i8 per 16,
+ * f16 per 256) and Q8_0 (i8 codes, f16 per 32). Their planes are the GGUF block fields, so the
+ * container is exact; both read the bf16 activation directly and take no quantiser. */
+inline bool linear_is_q6k(const RadEncoding& e) {
+    if (!rad_enc_is(&e, "affine") || e.n_planes != 3 || e.transform[0]) return false;
+    const RadEncPlane *sc = rad_enc_plane(&e, "scale"), *d = rad_enc_plane(&e, "scale.1");
+    return e.plane[0].dtype == RAD_I6 && e.plane[0].block[0] == 1 && e.plane[0].block[1] == 1 &&
+           sc && sc->dtype == RAD_I8 && sc->block[0] == 1 && sc->block[1] == 16 && d &&
+           d->dtype == RAD_F16 && d->block[0] == 1 && d->block[1] == 256;
+}
+inline bool linear_is_q80(const RadEncoding& e) {
+    if (!rad_enc_is(&e, "affine") || e.n_planes != 2 || e.transform[0]) return false;
+    const RadEncPlane* sc = rad_enc_plane(&e, "scale");
+    return e.plane[0].dtype == RAD_I8 && e.plane[0].block[0] == 1 && e.plane[0].block[1] == 1 &&
+           sc && sc->dtype == RAD_F16 && sc->block[0] == 1 && sc->block[1] == 32;
+}
+
+/* What a dense `logits_gemm` row reads: plain bf16, block fp8 (bf16 or f32 scale), or int8 with a
+ * bf16 scale per row per 128. Q6_K and Q8_0 have no logits row yet (the lm_head decision in
+ * fork-notes/q6k-dense-arch-note.md), so a container must map them to i8 or block fp8. */
+inline bool linear_is_logits_head(const RadEncoding& e) {
+    if (rad_enc_is(&e, "plain") && e.n_planes == 1 && e.plane[0].dtype == RAD_BF16) return true;
+    if (linear_is_w8(e)) return true;
+    if (!rad_enc_is(&e, "affine") || e.n_planes != 2 || e.transform[0]) return false;
+    const RadEncPlane* sc = rad_enc_plane(&e, "scale");
+    return e.plane[0].dtype == RAD_F8E4M3 && sc &&
+           (sc->dtype == RAD_BF16 || sc->dtype == RAD_F32) && sc->block[0] == RAD_FP8_BLOCK &&
+           sc->block[1] == RAD_FP8_BLOCK;
 }
 
 /* The same planes rotated by the unnormalised 128-wide Hadamard along K, the 1/128 in the scale
@@ -1123,10 +1159,12 @@ inline int LinearFP8::probe(RadBuilder* b, Names& nm, const Geom& g, const char*
                        enc.plane[0].dtype == RAD_BF16;
     probed_i8 = known && (linear_is_w8(enc) || linear_is_w8h(enc) || linear_is_wnh(enc));
     /* A rotated weight rotates and quantises the bf16 plane itself; a 4-bit one casts or
-     * quantises it. */
+     * quantises it; the two ggml dense forms read it directly. */
     const bool rotated = known && (linear_is_paro_mxfp4(enc) || linear_is_paro_w5(enc) ||
                                    linear_is_paro_m2xfp4(enc));
-    reads_x = g.w_bf16 || plain || probed_i8 || rotated || (known && linear_is_w4(enc));
+    const bool ggml_dense = known && (linear_is_q6k(enc) || linear_is_q80(enc));
+    reads_x = g.w_bf16 || plain || probed_i8 || rotated || ggml_dense ||
+              (known && linear_is_w4(enc));
     return RAD_OK;
 }
 
@@ -1281,6 +1319,69 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
                               RAD_INT("N", N), RAD_INT("K", K), RAD_STR("dtype", g.dtype)),
                    RAD_WEIGHTS(w)),
                { a.x }, { y });
+        return op ? RAD_OK : RAD_E_INVAL;
+    }
+
+    /* ---- ggml Q6_K or Q8_0, `gemm_nt_q` at q6k / q80a16 over the input's bf16 plane. These
+     * planes are the GGUF block fields, so the stored weight is exact. Row slices are 16-row
+     * tiles; a column slice must be whole 256-value Q6_K blocks (whole 32-value Q8_0 blocks),
+     * which is also the scale plane's K block. */
+    const bool q6k = known && linear_is_q6k(enc);
+    const bool q80 = known && linear_is_q80(enc);
+    if (q6k || q80) {
+        if (stored) {
+            fprintf(stderr, "radiance: '%s' views '%s', which only a block-fp8 linear "
+                            "may\n", wn, stored);
+            return RAD_E_INVAL;
+        }
+        if (!a.x) {
+            fprintf(stderr, "radiance: '%s' is a ggml %s weight, read from its input's bf16 "
+                            "plane, and its input has none\n", wn, q6k ? "Q6_K" : "Q8_0");
+            return RAD_E_DTYPE;
+        }
+        const int64_t kb = q6k ? 256 : 32;
+        if (N % 16 || K % kb) {
+            fprintf(stderr, "radiance: '%s' is %lldx%lld per rank; a ggml %s weight takes rows "
+                            "in 16s and K in whole %lld-value blocks\n",
+                    base, (long long)N, (long long)K, q6k ? "Q6_K" : "Q8_0",
+                    (long long)kb);
+            return RAD_E_INVAL;
+        }
+        RowParts rp;
+        RAD_ARCH_TRY(rp.set(row_parts, 16, 1, base, "rows"));
+        w = decl_view(b, wn, nullptr, "codes", q6k ? RAD_I6 : RAD_I8, { N, K }, access, shard,
+                      grp, rp.w, rp.n);
+        if (q6k) {
+            ws = decl_view(b, nm.f("%s.scale", base), wn, "scale", RAD_I8, { N, K / 16 },
+                           access, shard, grp, rp.w, rp.n);
+            wref = decl_view(b, nm.f("%s.scale1", base), wn, "scale.1", RAD_F16,
+                             { N, K / 256 }, access, shard, grp, rp.w, rp.n);
+        } else {
+            ws = decl_view(b, nm.f("%s.scale", base), wn, "scale", RAD_F16, { N, K / 32 },
+                           access, shard, grp, rp.w, rp.n);
+        }
+        if (!w || !ws || (q6k && !wref)) return RAD_E_INVAL;
+        if (span_hi > 0) {
+            const bool col = shard == RAD_SHARD_COL;
+            if (col && (span_lo % kb || span_hi % kb)) {
+                fprintf(stderr, "radiance: '%s' is sliced [%lld, %lld) on this rank, which cuts "
+                                "a %lld-value %s block\n", base, (long long)span_lo,
+                        (long long)span_hi, (long long)kb, q6k ? "Q6_K" : "Q8_0");
+                return RAD_E_INVAL;
+            }
+            RAD_ARCH_TRY(rad_weight_shard_span(b, w, span_lo, span_hi));
+            RAD_ARCH_TRY(rad_weight_shard_span(b, ws, col ? span_lo / (q6k ? 16 : 32) : span_lo,
+                                               col ? span_hi / (q6k ? 16 : 32) : span_hi));
+            if (q6k)
+                RAD_ARCH_TRY(rad_weight_shard_span(b, wref,
+                                                   col ? span_lo / 256 : span_lo,
+                                                   col ? span_hi / 256 : span_hi));
+        }
+        const int64_t hi = max_rows > 0 ? max_rows : g.max_tok;
+        if (q6k)
+            op = decl_gemm_q(b, 1, hi, 256, "q6k", 0, 0, { w, ws, wref }, { a.x }, y);
+        else
+            op = decl_gemm_q(b, 1, hi, 32, "q80a16", 0, 0, { w, ws }, { a.x }, y);
         return op ? RAD_OK : RAD_E_INVAL;
     }
 
@@ -1638,6 +1739,7 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
             rad_enc_format(&enc, en, sizeof en);
             fprintf(stderr, "radiance: '%s' is %s, which this model's linears do not read; they "
                             "read bf16, fp8_e4m3*bf16[128x128] or *f32[128x128], i8*bf16[1x128], "
+                            "ggml q6_K (i6, i8[1x16], f16[1x256]) or q8_0 (i8, f16[1x32]), "
                             "fp4_e2m1*e8m0[1x32], u4*f16[1x128]-u4[1x128] (or a u8 zero) and the "
                             "ParoQuant forms. A recipe rule stores the weight in one of them "
                             "(docs/TOOLS.md, the import rule for a shipped int4 grid)\n", wn, en);
@@ -1707,6 +1809,12 @@ inline void LinearFP8::step(RadCtx* c, const ActFP8& a, rad_buf y, int64_t T, in
     const int64_t yr = y0 < 0 ? r0 : y0;
     if (bf16) {
         RAD_ISSUE_N(c, op, rows, brow_slice(a.x, r0, rows, K), RAD_W(w), brow_slice(y, yr, rows, N));
+        return;
+    }
+    if (q6k || q80) {
+        /* Q6_K's third plane rides the schema's b_ref operand (6); Q8_0 has none. */
+        RAD_ISSUE_N(c, op, rows, brow_slice(a.x, r0, rows, K), RAD_NONE, RAD_W(w), RAD_W(ws),
+                    brow_slice(y, yr, rows, N), RAD_NONE, q6k ? RAD_W(wref) : RAD_NONE);
         return;
     }
     if (i8) {
