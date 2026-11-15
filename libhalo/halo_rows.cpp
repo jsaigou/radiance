@@ -1056,6 +1056,43 @@ static const RadOperandSpec oMoeGemmQMod4[] = {
     { "w_3_scale",     RAD_OPD_WTAB, 0 },
     { "y",             RAD_OPD_OUT,  0 },
 };
+/* `moe_gemm_q_s2`: `moe_gemm_q` with a THIRD weight table a class, IQ4_XS's f16 `d` a 256 values
+ * (`w_scale1`). The tables divide by count, so the runs are codes, signed 6-bit scale, d, class
+ * by class; everything else (params, the zero fill, `parts`, `a_order`) is `moe_gemm_q`'s. A
+ * separate op because a table op's weights divide over its table operands by count alone, and an
+ * operand count must not depend on a dtype string. */
+static const RadOperandSpec oMoeGemmQS2[] = {
+    { "a",             RAD_OPD_IN,   0 },
+    { "a_scale",       RAD_OPD_IN,   1 },
+    { "w",             RAD_OPD_WTAB, 0 },
+    { "w_scale",       RAD_OPD_WTAB, 0 },
+    { "w_scale1",      RAD_OPD_WTAB, 0 },
+    { "sorted_tok",    RAD_OPD_IN,   0 },
+    { "expert_offset", RAD_OPD_IN,   0 },
+    { "w_odd",         RAD_OPD_WTAB, 0 },
+    { "w_odd_scale",   RAD_OPD_WTAB, 0 },
+    { "w_odd_scale1",  RAD_OPD_WTAB, 0 },
+    { "y",             RAD_OPD_OUT,  0 },
+};
+static const RadOperandSpec oMoeGemmQS2Mod4[] = {
+    { "a",             RAD_OPD_IN,   0 },
+    { "a_scale",       RAD_OPD_IN,   1 },
+    { "w",             RAD_OPD_WTAB, 0 },
+    { "w_scale",       RAD_OPD_WTAB, 0 },
+    { "w_scale1",      RAD_OPD_WTAB, 0 },
+    { "sorted_tok",    RAD_OPD_IN,   0 },
+    { "expert_offset", RAD_OPD_IN,   0 },
+    { "w_1",           RAD_OPD_WTAB, 0 },
+    { "w_1_scale",     RAD_OPD_WTAB, 0 },
+    { "w_1_scale1",    RAD_OPD_WTAB, 0 },
+    { "w_2",           RAD_OPD_WTAB, 0 },
+    { "w_2_scale",     RAD_OPD_WTAB, 0 },
+    { "w_2_scale1",    RAD_OPD_WTAB, 0 },
+    { "w_3",           RAD_OPD_WTAB, 0 },
+    { "w_3_scale",     RAD_OPD_WTAB, 0 },
+    { "w_3_scale1",    RAD_OPD_WTAB, 0 },
+    { "y",             RAD_OPD_OUT,  0 },
+};
 static const RadParamSpec pMoeGather[] = {
     P_INT("M"), P_INT("n"), P_INT("top_k"), P_STR("dtype"),
     /* The shared arm's gate, present exactly when `shared` and `shared_gate` are: "sigmoid" or
@@ -3349,6 +3386,16 @@ static const RadOpSchema kSchemas[] = {
            "hold class 0 at [N, K] and `w_q`/`w_q_scale` class q at [N_q, K_q], expert e at entry "
            "e/4 of class e%4. The output is as wide as the widest class in `parts` stacked parts, "
            "and a narrower class fills each part's leading columns and zeros the rest."),
+    SCHEMA("moe_gemm_q_s2", pMoeGemmQ, oMoeGemmQS2,
+           "moe_gemm_q with a THIRD weight table a class, IQ4_XS's f16 `d` a 256 values "
+           "(`w_scale1` beside `w`/`w_scale`, and `w_odd_scale1` for the odd class): the signed "
+           "6-bit scale a 32 and the f16 d a 256 are the two levels the kernel folds together. "
+           "The tables divide over the operands by count, so each class's run is codes, scale, d. "
+           "Everything else -- `parts`, the zero fill, `a_order` -- is `moe_gemm_q`'s."),
+    SCHEMA("moe_gemm_q_s2_mod4", pMoeGemmQMod4, oMoeGemmQS2Mod4,
+           "moe_gemm_q_s2 over FOUR classes by the expert's number mod 4: `w`/`w_scale`/`w_scale1` "
+           "hold class 0 and `w_q`/`w_q_scale`/`w_q_scale1` class q, expert e at entry e/4 of "
+           "class e%4."),
     SCHEMA("moe_gather", pMoeGather, oMoeGather,
            "scatters the sorted expert output back to token order and weights it. The sum over a "
            "token's slots runs in ASCENDING SLOT order, which is what makes it reproducible -- "
@@ -4661,6 +4708,12 @@ static const RadConstraint cMoeGemmW4[] = {
     C_GE("top_k", 1), C_EQ("group", 128),
     C_IN("dtype", "w4a8 w4a8h w4nla8h w4nl64a8h w4nl32a8h w5nl64a8h w3nl64a8h iq4nl32a16 "
                   "iq3xxs32a16 iq2s32a16 q50a16 q20a16"),
+};
+/* `moe_gemm_q_s2`: IQ4_XS's two unrotated scale levels, three tables a class. K is whole
+ * 256-value blocks (the f16 d's group) on top of the w4a8 GEMM's checks. */
+static const RadConstraint cMoeGemmW4s2[] = {
+    C_GE("M", 1), C_DIV("N", 64), C_DIV("K", 256), C_GE("n_expert", 1), C_LE("n_expert", 65536),
+    C_GE("top_k", 1), C_EQ("group", 128), C_IN("dtype", "iq4xs32a16"),
 };
 /* The bf16 expert GEMM: 64-wide column tiles and 64-deep K passes, one table, no group. */
 static const RadConstraint cMoeGemmBf16[] = {
@@ -8226,6 +8279,30 @@ HALO_WIN_PAIR(512, 1) HALO_WIN_PAIR(512, 2) HALO_WIN_PAIR(512, 4) HALO_WIN_PAIR(
   nullptr, nullptr, halo_rad_moe_gemm_w4a8_mod4, halo_rad_moe_gemm_w4a8_scratch,
   halo_rad_layout_moe_w4_mod4, halo_rad_relayout_moe_w4_mod4, nullptr,
   halo_rad_unrelayout_moe_w4_mod4 },
+
+{ "moe_gemm_w4a8_s2", "moe_gemm_q_s2", "moe",
+  "moe_gemm_w4a8 with IQ4_XS's second scale level: the same kernel, the signed 6-bit scale a 32 "
+  "read from `w_scale` and the f16 d a 256 from `w_scale1`, their product the group's scale",
+  "K a multiple of 256, N a multiple of 64, group 128; the same decode band and three prefill "
+  "forms as moe_gemm_w4a8",
+  "bf16 activation, u4 codes into the sixteen-entry kvalues_iq4nl table, a signed 6-bit scale a "
+  "32 and an f16 d a 256, bf16 out; dtype iq4xs32a16",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cMoeGemmW4s2), NOTUNE,
+  nullptr, nullptr, halo_rad_moe_gemm_w4a8_s2, halo_rad_moe_gemm_w4a8_scratch,
+  halo_rad_layout_moe_w4_s2, halo_rad_relayout_moe_w4_s2, nullptr,
+  halo_rad_unrelayout_moe_w4_s2 },
+
+{ "moe_gemm_w4a8_s2_mod4", "moe_gemm_q_s2_mod4", "moe",
+  "moe_gemm_w4a8_s2 over four classes of experts by number mod 4: the same kernel, each run "
+  "reading its class's codes, scale and d tables",
+  "as moe_gemm_w4a8_s2, every class",
+  "as moe_gemm_w4a8_s2",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cMoeGemmW4s2), NOTUNE,
+  nullptr, nullptr, halo_rad_moe_gemm_w4a8_s2_mod4, halo_rad_moe_gemm_w4a8_scratch,
+  halo_rad_layout_moe_w4_s2_mod4, halo_rad_relayout_moe_w4_s2_mod4, nullptr,
+  halo_rad_unrelayout_moe_w4_s2_mod4 },
 
 { "moe_gemm_bf16", "moe_gemm", "moe",
   "the grouped GEMM with unquantised experts: one run of expert-sorted rows a block, bf16 WMMA over "

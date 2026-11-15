@@ -122,6 +122,11 @@ struct Model {
     Geom           g{};
     GdnFP8::Config gcfg{};
     MoeFP8::Config moecfg{};
+    /* The MTP head's own expert format, probed like the trunk's. A mirror map may store the kept
+     * MTP layer in another form than the trunk (the fast and mirror recipes write `blk.48` at
+     * w4nl64 while the UD trunk is unrotated), and the head's connection rotator and the block's
+     * format must follow the head's experts, not the trunk's. */
+    MoeFP8::Config mtpcfg{};
     /* The trunk's linears are int8 (LinearFP8::i8), as read from the first delta-net layer's input
      * projection before the activation buffers are declared. */
     bool           trunk_i8 = false;
@@ -414,6 +419,10 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * n_ff is `moe_intermediate_size`, divided by world_size when the world divides it and whole
      * otherwise (geom_from's `arch_splits_ff`). At more than one rank the split below sets the
      * rank's width, by whole fp8 blocks and parity (see the file header). */
+    /* The kept MTP layer's count; read here because the head's own expert format is probed with
+     * the trunk's, below. */
+    const int64_t nextn = meta_int2(meta, "qwen4exp.mtp_num_hidden_layers",
+                                    "mtp_num_hidden_layers", 0);
     {
         MoeFP8::Config& mc = m.moecfg;
         mc.n_expert    = meta_int2(meta, "qwen4exp.expert_count",      "num_experts", 0);
@@ -893,7 +902,29 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * would make it `top_k` times too short and the gated quantiser would overrun it (see
      * ActFP8::declare_qs). */
     RAD_ARCH_TRY(m.a_eff.declare_qs(b, nm, g, "moe_eff", m.moecfg.n_ff_exp, ER));
-    if (m.moecfg.expert_rot)
+    /* The kept MTP layer's experts, when the checkpoint carries the head and the deployment
+     * speculates: its own probe, so a head written in another form than the trunk (a rotated
+     * w4nl64 beside an unrotated UD trunk) rotates its own input and declares the stored form it
+     * actually holds. Copied after the split, so the head follows the same rank slice as the
+     * trunk. The probed expert is skipped by the head's declare, as on the trunk. */
+    m.mtpcfg = m.moecfg;
+    /* Only an UNROTATED trunk can meet a head in another form (the UD mirror writes `blk.48` at
+     * the rotated w4nl64 beside an IQ2_S/IQ3_XXS/IQ4_NL/IQ4_XS trunk). A rotated or plain trunk
+     * keeps the head on its own form, and probing it there would only add name maps and a probe
+     * map to every such graph. */
+    const bool mtp_own_form = nextn > 0 && g.max_spec > 0 && !m.moecfg.expert_rot &&
+                              !m.moecfg.expert_bf16 &&
+                              (m.moecfg.expert_iq4 || m.moecfg.expert_iq4xs ||
+                               m.moecfg.expert_q50 || m.moecfg.expert_q20 ||
+                               m.moecfg.expert_iq3 || m.moecfg.expert_iq2);
+    if (mtp_own_form) {
+        MoeFP8::Src ps{};
+        RAD_ARCH_TRY(moe_expert_sources(b, nm, "mtp-format", "mtp.layers.0.mlp.experts", &ps));
+        RAD_ARCH_TRY(MoeFP8::probe(b, nm, (int)g.n_layer, ps, &m.mtpcfg));
+    }
+    /* Either arm's rotated experts read this pair: the trunk's, or a kept MTP layer stored in a
+     * rotated form beside an unrotated trunk. */
+    if (m.moecfg.expert_rot || m.mtpcfg.expert_rot)
         RAD_ARCH_TRY(m.a_hr.declare_qs(b, nm, g, "moe_hr", g.n_embd));
     m.b_edn     = decl_b(b, nm.f("moe_edn"),    g.act_dtype, {ER, g.n_embd});
     m.b_emoe    = decl_b(b, nm.f("moe_out"),    g.act_dtype, {T, g.n_embd});
@@ -1306,9 +1337,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      *
      * Declared only when the checkpoint carries a head and the deployment speculates; at
      * max_spec 0 the weights stay off the card (the container still carries them, since
-     * rad-convert declares at a non-zero max_spec). */
-    const int64_t nextn = meta_int2(meta, "qwen4exp.mtp_num_hidden_layers",
-                                    "mtp_num_hidden_layers", 0);
+     * rad-convert declares at a non-zero max_spec). `nextn` and the head's expert format were
+     * read with the trunk's (see `mtpcfg`). */
     if (nextn > 0 && g.max_spec > 0) {
         const char* mpre = "mtp";
         /* Sized at max_tok, not max_logit_rows: the history pass that fills the head's own K and V
@@ -1418,7 +1448,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         ts.attn.k_norm = nm.ckpt("%s.layers.0.self_attn.k_norm.weight", mpre);
         ts.attn.o      = nm.ckpt("%s.layers.0.self_attn.o_proj.weight", mpre);
 
-        ts.mlp.cfg             = m.moecfg;
+        ts.mlp.cfg             = m.mtpcfg;
         ts.mlp.router          = nm.ckpt("%s.layers.0.mlp.gate.weight", mpre);
         RAD_ARCH_TRY(moe_expert_sources(b, nm, "mtp", nm.ckpt("%s.layers.0.mlp.experts", mpre),
                                         &ts.mlp));

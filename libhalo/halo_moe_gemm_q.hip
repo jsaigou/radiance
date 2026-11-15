@@ -176,14 +176,19 @@ constexpr long long kPrefillCols = 128;
  * and fold per element, so the bytes are unchanged. */
 constexpr long long kAlignRows = 64;
 
-/* One class of experts (libr4d's MoeCls, unchanged): `n` rows and K `k`, the packed weight row
- * pitch `w_ld` in BYTES and the scale plane's row pitch `s_ld` in elements (dwords at W4 3, whose
- * plane packs four E4M3 group scales into one word). `w_s0`/`s_s0` are a stacked plane's entry
- * stride in bytes, 0 marking a pointer table. */
+/* One class of experts (libr4d's MoeCls, plus IQ4_XS's second scale): `n` rows and K `k`, the
+ * packed weight row pitch `w_ld` in BYTES and the scale plane's row pitch `s_ld` in elements
+ * (dwords at W4 3, whose plane packs four E4M3 group scales into one word). `w_s0`/`s_s0` are a
+ * stacked plane's entry stride in bytes, 0 marking a pointer table.
+ *
+ * `s1` is W4 11's f16 `d` a 256 values (an IQ4_XS container stores it beside the signed 6-bit
+ * scale a 32). It has its own row pitch `s1_ld` in elements and entry stride `s1_s0`; every other
+ * form leaves it null and unread. */
 struct MoeCls {
     const void* const* w;
     const void* const* s;
-    uint32_t w_s0, s_s0, n, k, w_ld, s_ld;
+    const void* const* s1;
+    uint32_t w_s0, s_s0, s1_s0, n, k, w_ld, s_ld, s1_ld;
 };
 
 /* The code table, shared by all classes (halo_args.h's kW4IntPerm / kW4nlPerm / kW5nlMagPerm).
@@ -582,7 +587,9 @@ __device__ __forceinline__ v16hf moeq_frag(const uint16_t* __restrict__ lds, uin
  * 6 IQ4_NL: u4 codes into llama.cpp's sixteen-level table at an f16 scale per 32 of K, unrotated,
  * with bf16 activations; 7 Q5_0; 8 Q2_0; 9 IQ3_XXS (u8 codes into the 256-row grid, sign bytes,
  * a u5 sub-scale a 32 and an f16 d a 256 under 1/4); 10 IQ2_S (u10 codes into the 1024-row grid,
- * the same signs, a u5 sub-scale a 16 and d under 1/8). At 2-6 and 9 a staged 128-wide pass holds
+ * the same signs, a u5 sub-scale a 16 and d under 1/8); 11 IQ4_XS (the IQ4_NL codes and table, a
+ * signed 6-bit scale a 32 from `s` and an f16 d a 256 from `s1`, their product the group's scale,
+ * unrotated, bf16 activations). At 2-6 and 9 a staged 128-wide pass holds
  * kSub scale groups, each in its own accumulator; at 10 a 16-wide group is one WMMA step and is
  * folded at once, because eight live accumulators would spill. 7 and 8 are the earlier ports and
  * share this list's scale fold.
@@ -634,7 +641,7 @@ void moe_gemm_q_kernel(
      * 256, which only the forms whose fold already sums scale groups take). */
     constexpr bool     kA16  = W4 >= 6;
     /* IQ3_XXS has one u5 sub-scale per 32 of K (four a 128 block); IQ2_S one per 16 (eight). */
-    constexpr uint32_t kSub  = (W4 == 3 || W4 == 6 || W4 == 7 || W4 == 9) ? 4u
+    constexpr uint32_t kSub  = (W4 == 3 || W4 == 6 || W4 == 7 || W4 == 9 || W4 == 11) ? 4u
                              : (W4 == 10) ? 8u
                              : (W4 == 2 || W4 >= 4) ? 2u : 1u;
     constexpr uint32_t kBpS  = FKP / kBlock;
@@ -932,12 +939,15 @@ void moe_gemm_q_kernel(
             }
             const uint32_t wn0 = part * fc + j0;      /* the weight row of the block's column 0 */
             const uint32_t K = C.k, w_ld = C.w_ld;
-            const uint32_t ws_ld = C.s_ld;
+            const uint32_t ws_ld = C.s_ld, ws1_ld = C.s1_ld;
             const uint32_t kb_n = wn0 / kBlock;       /* the weight scale's N row (fp8 only) */
             if (W4) (void)kb_n;                       /* w4 scales vary per ROW, not per N block */
 
             const uint8_t*  Wp  = moeq_wtab_at(C.w, C.w_s0, e >> cshift);
             const uint16_t* Wsp = (const uint16_t*)moeq_wtab_at(C.s, C.s_s0, e >> cshift);
+            /* W4 11's f16 d a 256 values: the second scale level, read from its own plane. */
+            const uint16_t* Ws1 = W4 == 11 ? (const uint16_t*)moeq_wtab_at(C.s1, C.s1_s0,
+                                                                          e >> cshift) : nullptr;
 
             /* The K loop's passes start at block `rot` and wrap (the file header's K rotation):
              * pass ps stages the 128-wide blocks from kpos(ps), consecutive within a pass. */
@@ -1274,6 +1284,7 @@ void moe_gemm_q_kernel(
             bool sok;
             const float* asp;
             const uint8_t* wsp;
+            const uint8_t* wsp1 = nullptr;
             {
                 const int32_t tok = s_tok[tid < FM ? tid : 0u];
                 const bool aw = tok >= 0 && (r0 + tid) >= rs && (r0 + tid) < re;
@@ -1281,7 +1292,10 @@ void moe_gemm_q_kernel(
                 sok = tid < FM ? aw : ww;
                 asp = As + (size_t)(tid < FM && aw ? tok : 0) * as_ld;
                 const size_t wrow = W4 ? (size_t)(wn0 + (ww ? nn : 0u)) : (size_t)kb_n;
-                wsp = (const uint8_t*)Wsp + wrow * ws_ld * (W4 == 3 ? 4u : 2u);
+                /* Bytes a row: 2 an element, but IQ4_XS's signed 6-bit plane is 6 bits a value. */
+                wsp = (const uint8_t*)Wsp +
+                      wrow * (W4 == 3 ? ws_ld * 4u : W4 == 11 ? ws_ld * 3u / 4u : ws_ld * 2u);
+                if constexpr (W4 == 11) wsp1 = (const uint8_t*)Ws1 + wrow * ws1_ld * 2u;
             }
 
             /* Pass `cc`'s loads into ring slot `sl`. */
@@ -1294,6 +1308,14 @@ void moe_gemm_q_kernel(
                         uint32_t lo;
                         __builtin_memcpy(&lo, p, 4);
                         pws[sl][b] = lo;
+                    } else if constexpr (W4 == 11) {
+                        /* Four signed 6-bit scales a 32 of K, three bytes, then the f16 d that
+                         * covers this 128 block's 256-value group. */
+                        uint32_t lo = 0;
+                        __builtin_memcpy(&lo, wsp + 3u * (kbk + b), 3);
+                        uint16_t db = 0;
+                        __builtin_memcpy(&db, wsp1 + 2u * ((kbk + b) >> 1), 2);
+                        pws[sl][b] = (uint64_t)lo | ((uint64_t)db << 32);
                     } else if constexpr (kA16) {
                         const uint8_t* p = wsp + 8u * (kbk + b);
                         uint32_t lo, hi;
@@ -1409,7 +1431,7 @@ void moe_gemm_q_kernel(
                             moeq_stage_iq2<kPitch>(s_b, r, sk, x, bok[p] ? spre[sl][p] : 0u);
                             continue;
                         }
-                        if constexpr (W4 == 6) {
+                        if constexpr (W4 == 6 || W4 == 11) {
                             moeq_stage_iq4<kPitch>(s_b, r, sk, w, tab.v);
                             continue;
                         }
@@ -1463,6 +1485,22 @@ void moe_gemm_q_kernel(
                                 const uint32_t ls = (uint32_t)((w >> (16u + 4u * q)) & 0xFu);
                                 s_ws[(b * kSub + q) * FN + nn] =
                                     (float)(2u * ls + 1u) * d * kFac;
+                            }
+                        }
+                    } else if constexpr (W4 == 11) {
+                        /* IQ4_XS: the signed 6-bit scale a 32 times the f16 d a 256. Twenty-four
+                         * bits of i6 (four groups) in the low half of `pws`, the d's bits above;
+                         * `level * i6 * d` is exact in f32 (a 7-bit level, a 6-bit scale, an
+                         * 11-bit d), so only the store rounds. */
+#pragma unroll
+                        for (uint32_t b = 0; b < kBpS; ++b) {
+                            const uint64_t w = sok ? pws[sl][b] : 0u;
+                            const float d = moeq_f16_to_f32((uint16_t)((w >> 32) & 0xFFFFu));
+#pragma unroll
+                            for (uint32_t q = 0; q < 4; ++q) {
+                                const int32_t i6 = (int32_t)(((uint32_t)(w >> (6u * q)) & 63u) ^
+                                                             32u) - 32;
+                                s_ws[(b * 4 + q) * FN + nn] = (float)i6 * d;
                             }
                         }
                     } else if constexpr (kA16) {
@@ -1898,25 +1936,42 @@ static inline uint16_t moeq_iq4_f16_bits(int v) {
 
 /* One body for the fp8 and w4 launchers, which differ only in the weight dtype and its pitches, so
  * their shape checks cannot drift apart. `ncls` is 2 for the two-class op (the odd class at N_odd /
- * K_odd) or 4 for the four-class one (classes 1..3 at N_1/K_1..N_3/K_3, `y` at operand 12). */
-template <int W4>
+ * K_odd) or 4 for the four-class one (classes 1..3 at N_1/K_1..N_3/K_3, `y` at operand 12).
+ *
+ * `S2` is `moe_gemm_q_s2`, IQ4_XS's form: each class declares a THIRD weight table, the f16 `d` a
+ * 256 values beside its codes and signed 6-bit scale, so the operand list carries one more table
+ * an class and the sorted/offset/output operands move up. Everything else is the two-class or
+ * four-class op's. */
+template <int W4, bool S2 = false>
 int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
     if (ncls != 2 && ncls != 4) return HALO_NO(RAD_E_INVAL);
     constexpr bool kA16 = W4 >= 6;
+    static_assert(W4 != 11 || S2, "IQ4_XS's second scale is `moe_gemm_q_s2`'s third table");
+    /* Class q's codes table: 2, then 4 + 2q at the two-class/four-class op, or 4 + 3q with the
+     * second scale table inserted after each class's scale. */
+    auto wi_of = [&](int q) {
+        if (!S2) return q == 0 ? 2 : 4 + 2 * q;
+        return q == 0 ? 2 : 4 + 3 * q;
+    };
+    const int i_sorted = S2 ? 5 : 4, i_off = S2 ? 6 : 5;
+    const int i_y = S2 ? (ncls == 4 ? 16 : 10) : (ncls == 4 ? 12 : 8);
     const RadTensor* Aq     = halo_opt(a, 0);
     const RadTensor* As     = halo_opt(a, 1);
-    const RadTensor* sorted = halo_opt(a, 4);
-    const RadTensor* off    = halo_opt(a, 5);
-    const RadTensor* Wc[4]  = { halo_opt(a, 2), halo_opt(a, 6),
-                                ncls == 4 ? halo_opt(a, 8) : nullptr,
-                                ncls == 4 ? halo_opt(a, 10) : nullptr };
-    const RadTensor* Wsc[4] = { halo_opt(a, 3), halo_opt(a, 7),
-                                ncls == 4 ? halo_opt(a, 9) : nullptr,
-                                ncls == 4 ? halo_opt(a, 11) : nullptr };
-    const RadTensor* Y      = halo_opt(a, ncls == 4 ? 12 : 8);
+    const RadTensor* sorted = halo_opt(a, i_sorted);
+    const RadTensor* off    = halo_opt(a, i_off);
+    const RadTensor* Wc[4]  = { nullptr, nullptr, nullptr, nullptr };
+    const RadTensor* Wsc[4] = { nullptr, nullptr, nullptr, nullptr };
+    const RadTensor* Ws1[4] = { nullptr, nullptr, nullptr, nullptr };
+    for (int q = 0; q < ncls; ++q) {
+        const int w = wi_of(q);
+        Wc[q]  = halo_opt(a, w);
+        Wsc[q] = halo_opt(a, w + 1);
+        if (S2) Ws1[q] = halo_opt(a, w + 2);
+    }
+    const RadTensor* Y      = halo_opt(a, i_y);
     if (!Aq || (!kA16 && !As) || !sorted || !off || !Y) return HALO_NO(RAD_E_INVAL);
     for (int q = 0; q < ncls; ++q)
-        if (!Wc[q] || !Wsc[q]) return HALO_NO(RAD_E_INVAL);
+        if (!Wc[q] || !Wsc[q] || (S2 && !Ws1[q])) return HALO_NO(RAD_E_INVAL);
     if (!Aq->data || (!kA16 && !As->data) || !sorted->data || !off->data || !Y->data)
         return HALO_NO(RAD_E_INVAL);
 
@@ -1978,7 +2033,7 @@ int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
     /* The code table, from the dtype the layout hook accepted: w4nla8h's levels, w5nl64a8h's
      * magnitudes, or two's complement for w4a8 and w4a8h. */
     const char* wdt = halo_gets(a, "dtype");
-    const uint32_t* tab = (W4 == 6 || W4 == 7 || W4 == 8) ? kW4IntPerm
+    const uint32_t* tab = (W4 == 6 || W4 == 7 || W4 == 8 || W4 == 11) ? kW4IntPerm
                         : W4 == 5 ? kW3nlMagPerm
                         : W4 == 4 ? kW5nlMagPerm
                         : (W4 && wdt && (!std::strcmp(wdt, "w4nla8h") ||
@@ -2008,10 +2063,10 @@ int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
         *ld      = t->stride[1];
         return RAD_OK;
     };
-    auto cls_of = [&](const RadTensor* w, const RadTensor* ws, long long cnt, long long n,
-                      long long k, MoeCls* c) -> int {
-        long long w_ld = 0, ws_ld = 0;
-        size_t w_s0 = 0, s_s0 = 0;
+    auto cls_of = [&](const RadTensor* w, const RadTensor* ws, const RadTensor* wd,
+                      long long cnt, long long n, long long k, MoeCls* c) -> int {
+        long long w_ld = 0, ws_ld = 0, ws1_ld = 0;
+        size_t w_s0 = 0, s_s0 = 0, s1_s0 = 0;
         int rc = wtab_of(w, W4 == 8 ? (uint32_t)RAD_U2
                             : W4 == 9 ? (uint32_t)HALO_DT_MOEIQ3
                             : W4 == 10 ? (uint32_t)HALO_DT_MOEIQ2
@@ -2042,6 +2097,19 @@ int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
             if (w_ld % 8 || k % 64) return HALO_NO(RAD_E_STRIDE);
             w_ld = w_ld / 8 * 2;
             ws_ld = k / 64;
+        } else if constexpr (W4 == 11) {
+            /* IQ4_XS: the codes are IQ4_NL's, the scale is a signed 6-bit `ls - 32` a 32 of K
+             * (three bytes a 128 block) and the second level an f16 `d` a 256. Both scale views
+             * arrive at their planes' own extents; the kernel's pitches are those in elements. */
+            if (k % 256) return HALO_NO(RAD_E_STRIDE);
+            rc = wtab_of(ws, RAD_I6, 6, cnt, n, k / 32, &c->s, &s_s0, &ws_ld);
+            if (rc != RAD_OK) return rc;
+            if (w_ld % 2) return HALO_NO(RAD_E_STRIDE);
+            w_ld /= 2;
+            ws_ld = k / 32;
+            rc = wtab_of(wd, RAD_F16, 16, cnt, n, k / 256, &c->s1, &s1_s0, &ws1_ld);
+            if (rc != RAD_OK) return rc;
+            ws1_ld = k / 256;
         } else if constexpr (W4 == 6 || W4 == 7) {
             /* The unrotated forms: one f16 per (row, 32 of K). The scale view arrives at the weight's logical
              * [n, k/32]; the kernel's pitch is that many elements (two bytes each). */
@@ -2080,9 +2148,12 @@ int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
             if (rc != RAD_OK) return rc;
         }
         /* A stacked entry is one expert's plane, far below 4 GiB; a pointer table is 0. */
-        if (w_s0 > 0xFFFFFFFFull || s_s0 > 0xFFFFFFFFull) return HALO_NO(RAD_E_STRIDE);
-        c->w_s0 = (uint32_t)w_s0;
-        c->s_s0 = (uint32_t)s_s0;
+        if (w_s0 > 0xFFFFFFFFull || s_s0 > 0xFFFFFFFFull || s1_s0 > 0xFFFFFFFFull)
+            return HALO_NO(RAD_E_STRIDE);
+        c->w_s0  = (uint32_t)w_s0;
+        c->s_s0  = (uint32_t)s_s0;
+        c->s1_s0 = (uint32_t)s1_s0;
+        c->s1_ld = (uint32_t)ws1_ld;
         c->n    = (uint32_t)n;
         c->k    = (uint32_t)k;
         c->w_ld = (uint32_t)w_ld;
@@ -2093,7 +2164,8 @@ int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
      * At two classes the last two stay zero and unread. */
     MoeCls cl[4]{};
     for (int q = 0; q < ncls; ++q) {
-        const int rc = cls_of(Wc[q], Wsc[q], (n_expert + ncls - 1 - q) / ncls, Nc[q], Kc[q], &cl[q]);
+        const int rc = cls_of(Wc[q], Wsc[q], Ws1[q], (n_expert + ncls - 1 - q) / ncls, Nc[q], Kc[q],
+                              &cl[q]);
         if (rc != RAD_OK) return rc;
     }
     const MoeCls& ce = cl[0];
@@ -2104,9 +2176,9 @@ int moe_gemm_launch(const RadArgs* a, RadStream stream, int ncls = 2) {
     if (parts > 0xFFFFFF) return HALO_NO(RAD_E_SHAPE);
     MoeTab tabv{};
     uint32_t mode_nl = 0;
-    if constexpr (W4 == 6 || W4 == 7) {
+    if constexpr (W4 == 6 || W4 == 7 || W4 == 11) {
         /* The unrotated forms' levels as f16 bytes: low bytes in v[0..3], high bytes in v[4..7], entry i at
-         * byte i % 4 of v[i / 4]. */
+         * byte i % 4 of v[i / 4]. IQ4_XS shares IQ4_NL's sixteen-level table. */
         if constexpr (W4 == 7) {
             for (int i = 0; i < 32; ++i) {
                 const uint16_t h = moeq_iq4_f16_bits(i < 16 ? i : i - 32);
@@ -2748,6 +2820,22 @@ extern "C" int halo_rad_moe_gemm_w4a8_mod4(const RadArgs* a, RadStream stream) {
     if (wdt && !std::strcmp(wdt, "q50a16")) return moe_gemm_launch<7>(a, stream, 4);
     if (wdt && !std::strcmp(wdt, "q20a16")) return moe_gemm_launch<8>(a, stream, 4);
     return moe_gemm_launch<1>(a, stream, 4);
+}
+
+/* `moe_gemm_q_s2`: the grouped GEMM over six weight tables a layer (codes, signed 6-bit scale and
+ * f16 d a class), which only IQ4_XS uses. The kernel is `moe_gemm_w4a8`'s with the second scale
+ * read from `MoeCls::s1`; every other dtype is refused so a caller cannot pair the wider operand
+ * list with a form that leaves the third table unread. */
+extern "C" int halo_rad_moe_gemm_w4a8_s2(const RadArgs* a, RadStream stream) {
+    const char* wdt = halo_gets(a, "dtype");
+    if (wdt && !std::strcmp(wdt, "iq4xs32a16")) return moe_gemm_launch<11, true>(a, stream);
+    return HALO_NO(RAD_E_UNSUPPORTED);
+}
+
+extern "C" int halo_rad_moe_gemm_w4a8_s2_mod4(const RadArgs* a, RadStream stream) {
+    const char* wdt = halo_gets(a, "dtype");
+    if (wdt && !std::strcmp(wdt, "iq4xs32a16")) return moe_gemm_launch<11, true>(a, stream, 4);
+    return HALO_NO(RAD_E_UNSUPPORTED);
 }
 
 /* The run map's bytes outside the decode band (zero inside it: the (tile, run) grid indexes runs off

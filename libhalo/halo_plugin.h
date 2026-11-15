@@ -520,6 +520,11 @@ int     halo_rad_moe_gemm_w4a8      (const RadArgs*, RadStream);
  * mod 4. The scratch hooks are the two-class ones. */
 int     halo_rad_moe_gemm_q_mod4    (const RadArgs*, RadStream);
 int     halo_rad_moe_gemm_w4a8_mod4 (const RadArgs*, RadStream);
+/* `moe_gemm_q_s2` / `_s2_mod4`: IQ4_XS's form, each class a third weight table (the f16 d a
+ * 256), so the operand list carries one more table a class. Scratch hooks are the two-class
+ * ones. */
+int     halo_rad_moe_gemm_w4a8_s2      (const RadArgs*, RadStream);
+int     halo_rad_moe_gemm_w4a8_s2_mod4 (const RadArgs*, RadStream);
 /* `moe_gemm` at bf16: one weight table of the checkpoint's row-major planes, no scales. Same
  * grouping and three forms; its scratch hook sizes the same run map. */
 int     halo_rad_moe_gemm_bf16      (const RadArgs*, RadStream);
@@ -625,6 +630,10 @@ HALO_HOOKS(q80)
 HALO_HOOKS(q6k)
 HALO_HOOKS(moe_w4)
 HALO_HOOKS(moe_w4_mod4)
+/* IQ4_XS's second scale table (`moe_gemm_q_s2`): the same w4 views with the f16 d a 256 at
+ * operand 4. */
+HALO_HOOKS(moe_w4_s2)
+HALO_HOOKS(moe_w4_s2_mod4)
 #undef HALO_HOOKS
 int halo_rad_layout_fp8_rowmajor(const RadParam*, int, int, const RadEncoding*, const int*,
                                 const RadTensor*, int, RadLayout*);

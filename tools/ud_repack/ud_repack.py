@@ -191,17 +191,18 @@ def fingerprint(args):
 
 
 def dump(args):
-    """Write one real expert's IQ3_XXS / IQ2_S planes and the reference's f32 dequantisation.
+    """Write one real expert's IQ3_XXS / IQ2_S / IQ4_XS planes and the reference's f32 dequantisation.
 
-    The sample is what halo_selftest's real-block cases read: canonical plane bytes per row
-    (codes, signs, the u5 sub-scales, the f16 super-scale), the per-tensor second level, and
-    expected.bin, dequant_ref's f32 words in row-major [N, K] order. Nothing is requantised."""
+    The sample is what halo_selftest's real-block cases read: canonical plane bytes per row (codes,
+    signs, the u5 sub-scales, the f16 super-scale; or IQ4_XS's u4 codes, signed 6-bit scale and f16
+    d), the per-tensor second level where the format has one, and expected.bin, dequant_ref's f32
+    words in row-major [N, K] order. Nothing is requantised."""
     kv, ts = load_all(args.gguf)
     sel = re.compile(args.tensors)
     os.makedirs(args.out, exist_ok=True)
     for t in ts:
         ty = t['type']
-        if ty not in ('IQ3_XXS', 'IQ2_S') or not sel.search(t['name']):
+        if ty not in ('IQ3_XXS', 'IQ2_S', 'IQ4_XS') or not sel.search(t['name']):
             continue
         K = t['shape'][0]; N = t['shape'][1]; E = t['shape'][2] if len(t['shape']) > 2 else 1
         nb = K // 256
@@ -212,13 +213,26 @@ def dump(args):
         blocks = np.ascontiguousarray(raw[e]).reshape(N * nb, -1)
         pl = SPLIT[ty](blocks)
         ref = dequant_ref(ty, blocks).reshape(N, K)
-        gname = 'iq3xxs' if ty == 'IQ3_XXS' else 'iq2s'
+        gname = {'IQ3_XXS': 'iq3xxs', 'IQ2_S': 'iq2s', 'IQ4_XS': 'iq4xs'}[ty]
         out = os.path.join(args.out, gname)
         os.makedirs(out, exist_ok=True)
         codes = pl['codes'].reshape(N, -1)
+        d = pl['d'].reshape(N, nb)
+        if ty == 'IQ4_XS':
+            # u4 codes packed two a byte, the signed 6-bit `ls - 32` a 32 (two's complement) and
+            # the f16 d a 256. The table is fixed (libhalo's kvalues_iq4nl copy).
+            kq.pack_bits(codes, 4).tofile(os.path.join(out, 'codes.bin'))
+            kq.pack_bits((pl['ls'].reshape(N, -1).astype(np.int32) - 32) & 63, 6).tofile(
+                os.path.join(out, 'scale.bin'))
+            np.ascontiguousarray(d.astype('<f2')).tofile(os.path.join(out, 'scale1.bin'))
+            np.ascontiguousarray(ref, '<f4').tofile(os.path.join(out, 'expected.bin'))
+            with open(os.path.join(out, 'meta.json'), 'w') as f:
+                json.dump(dict(tensor=t['name'], type=ty, expert=e, N=int(N), K=int(K),
+                               groups=int(K // 32), codes_row=int(K // 2)), f)
+            print(ty, t['name'], 'expert', e, 'N', N, 'K', K, '->', out, flush=True)
+            continue
         signs = pl['signs'].reshape(N, -1)
         scales = pl['scale'].reshape(N, -1)
-        d = pl['d'].reshape(N, nb)
         codes.tofile(os.path.join(out, 'codes.bin'))
         signs.tofile(os.path.join(out, 'signs.bin'))
         kq.pack_bits(scales, 5).tofile(os.path.join(out, 'scale.bin'))

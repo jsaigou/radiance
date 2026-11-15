@@ -2215,6 +2215,8 @@ at every size.
 |---|---|---|
 | `moe_gemm_q` | `M`(range) `N` `K` `n_expert` `top_k` `group` `a_order` `dtype` `N_odd`/opt `K_odd`/opt `parts`/opt | `a`, `a_scale`?, `w`wt, `w_scale`wt, `sorted_tok`, `expert_offset`, `w_odd`wt, `w_odd_scale`wt → `y` |
 | `moe_gemm_q_mod4` | `M`(range) `N` `K` `n_expert` `top_k` `group` `a_order` `dtype` `N_1`/opt `K_1`/opt `N_2`/opt `K_2`/opt `N_3`/opt `K_3`/opt `parts`/opt | `a`, `a_scale`?, `w`wt, `w_scale`wt, `sorted_tok`, `expert_offset`, `w_1`wt, `w_1_scale`wt, `w_2`wt, `w_2_scale`wt, `w_3`wt, `w_3_scale`wt → `y` |
+| `moe_gemm_q_s2` | `moe_gemm_q`'s params | `a`, `a_scale`?, `w`wt, `w_scale`wt, `w_scale1`wt, `sorted_tok`, `expert_offset`, `w_odd`wt, `w_odd_scale`wt, `w_odd_scale1`wt → `y` |
+| `moe_gemm_q_s2_mod4` | `moe_gemm_q_mod4`'s params | `a`, `a_scale`?, `w`wt, `w_scale`wt, `w_scale1`wt, `sorted_tok`, `expert_offset`, `w_1`wt, `w_1_scale`wt, `w_1_scale1`wt, `w_2`wt, `w_2_scale`wt, `w_2_scale1`wt, `w_3`wt, `w_3_scale`wt, `w_3_scale1`wt → `y` |
 | `scale_rows` | `M`(range) `n` `act` `dtype` | `x`, `s`, `add`? → `y` |
 
 The arithmetic is the same whether a kernel is handed the tables or the stacked form
@@ -2229,6 +2231,14 @@ the other's, which is how a five-block expert splits evenly across two ranks on 
 gate/up); the output is `max(N, N_odd)` wide, and a narrower class fills the leading columns of each
 output part and writes zeros after them, so the gated quantiser behind it reads one layout for every
 row. The weight list is the even class's codes, its scales, then the odd class's codes and scales.
+
+**`moe_gemm_q_s2` is `moe_gemm_q` with a third table a class**, for IQ4_XS (`dtype
+iq4xs32a16`): the GGUF IQ4_NL codes and table, a signed 6-bit scale per 32 of K (`w_scale`, stored
+as `ls - 32`) and an f16 `d` per 256 of K (`w_scale1`). The tables divide over the table operands by
+count, so each class's run is codes, scale, d. The kernel folds the two levels per 32-value group
+(`level * i6 * d`, exact in f32) and stages the codes through the same sixteen-entry codebook as
+IQ4_NL. It is a separate op because an operand count must not depend on a dtype string, and a plain
+`moe_gemm_q` declares two tables a class.
 
 **`router_sigmoid_topk`** is single-group correction-bias routing, all in f32. The scores are
 `p = sigmoid(logits)`; the selection takes the `top_k` largest `p + bias`, ties to the lower
