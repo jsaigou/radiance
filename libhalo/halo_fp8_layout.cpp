@@ -602,3 +602,39 @@ extern "C" int halo_rad_layout_embed_q(const RadParam* p, int n_p, int operand,
         return RAD_E_SHAPE;
     return RAD_E_UNSUPPORTED;
 }
+
+/* ================================================================= the token embedding's IQ4_XS table
+ *
+ * The main `token_embd` of the UD map: u4 codes, the fixed 16-entry codebook as a TABLE plane, a
+ * signed 6-bit scale per 32 values and an f16 `d` per 256. The three stored planes are the gather's
+ * three weight operands, read where they lie, so this hook only validates. libavx's
+ * avx_layout_embed_xs accepts the same four planes with the same checks. */
+extern "C" int halo_rad_layout_embed_xs(const RadParam* p, int n_p, int operand,
+                                        const RadEncoding* enc, const int* sel,
+                                        const RadTensor* pl, int n, RadLayout* out) {
+    (void)out;
+    enum { EX_TOKENS = 0, EX_CODES, EX_SCALE, EX_SCALE1, EX_X };
+    if (operand != EX_CODES && operand != EX_SCALE && operand != EX_SCALE1)
+        return RAD_E_UNSUPPORTED;
+    const long long rows = rad_param_geti(p, n_p, "n_vocab", 0);
+    const long long dim  = rad_param_geti(p, n_p, "n_embd", 0);
+    if (rows <= 0 || dim <= 0 || dim % 256) return RAD_E_SHAPE;
+    const RadEncPlane* tb  = rad_enc_plane(enc, "table");
+    const RadEncPlane* s6  = rad_enc_plane(enc, "scale");
+    const RadEncPlane* s16 = rad_enc_plane(enc, "scale.1");
+    if (!(rad_enc_is(enc, "affine") && enc->n_planes == 4 && !enc->transform[0] &&
+          enc->plane[0].dtype == RAD_U4 && enc->plane[0].block[0] == 1 &&
+          enc->plane[0].block[1] == 1 && tb && tb->kind == RAD_PLANE_TABLE &&
+          tb->dtype == RAD_I8 && tb->extent[0] == 1 && tb->extent[1] == 16 && s6 &&
+          s6->kind == RAD_PLANE_TILED && s6->dtype == RAD_I6 && s6->block[0] == 1 &&
+          s6->block[1] == 32 && s16 && s16->kind == RAD_PLANE_TILED && s16->dtype == RAD_F16 &&
+          s16->block[0] == 1 && s16->block[1] == 256))
+        return RAD_E_DTYPE;
+    if (n != 1 || !pl || !sel) return RAD_E_SHAPE;
+    const char* want = operand == EX_CODES ? "codes"
+                     : operand == EX_SCALE ? "scale" : "scale.1";
+    if (!halo_enc::selects(enc, sel, n, want)) return RAD_E_SHAPE;
+    const long long c = operand == EX_CODES ? dim : operand == EX_SCALE ? dim / 32 : dim / 256;
+    if (!halo_enc::dims(pl[0], rows, c)) return RAD_E_SHAPE;
+    return RAD_E_UNSUPPORTED;
+}

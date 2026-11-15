@@ -17,20 +17,23 @@ namespace avx {
 
 /* dst[i][0, n) = lut[src[i][0, n)] for every i < count: E4M3 codes through a table of all 256
  * codes already scaled and rounded to bf16. `sc[i]`, when the call's table carries a per-32 scale
- * (IQ4_NL), is row i's scale plane; the E4M3 and bf16 decoders ignore it.
+ * (IQ4_NL, IQ4_XS), is row i's scale plane; `sc1[i]`, for IQ4_XS only, is the per-256 f16 `d`
+ * plane. The E4M3 and bf16 decoders ignore both.
  *
  * `lut` is the call's decode context: the 256-entry bf16 table for E4M3, or the 16-entry i8
- * codebook for IQ4_NL. */
+ * codebook for IQ4_NL and IQ4_XS. */
 typedef void (*RowDecode)(const uint8_t* const* src, const uint16_t* const* sc,
-                          uint16_t* const* dst, int64_t count, int64_t n, const void* lut);
+                          const uint16_t* const* sc1, uint16_t* const* dst, int64_t count,
+                          int64_t n, const void* lut);
 
 /* One call's gather, validated by the caller: `ids` holds M row ids, `tab` n_vocab rows of n_embd
- * elements -- E4M3 codes, bf16 as stored, or u4 IQ4_NL codes -- `row_bytes` apart, `out` M rows of
- * n_embd bf16 `x_ld` elements apart. The row cache and the reads deal in `row_bytes`; the decode in
- * elements. For IQ4_NL `scales` is the [n_vocab, n_embd / 32] f16 plane, `scale_row_bytes` apart,
- * read as memory rather than through the row cache (it is a tenth of the codes' bytes).
- * `ahead` holds n_ahead ids a later call will gather, or is null. rank and world_size are the
- * call's. */
+ * elements -- E4M3 codes, bf16 as stored, or u4 IQ4_NL/IQ4_XS codes -- `row_bytes` apart, `out` M
+ * rows of n_embd bf16 `x_ld` elements apart. The row cache and the reads deal in `row_bytes`; the
+ * decode in elements. For IQ4_NL `scales` is the [n_vocab, n_embd / 32] f16 plane,
+ * `scale_row_bytes` apart, read as memory rather than through the row cache (it is a tenth of the
+ * codes' bytes); for IQ4_XS it is the [n_vocab, n_embd / 32] i6 plane and `scales1` the
+ * [n_vocab, n_embd / 256] f16 plane, `scale1_row_bytes` apart. `ahead` holds n_ahead ids a later
+ * call will gather, or is null. rank and world_size are the call's. */
 struct RowGather {
     const int32_t* ids;
     int64_t        M;
@@ -38,8 +41,10 @@ struct RowGather {
     int64_t        n_vocab, n_embd, voff;
     int64_t        row_bytes;
     float          scale;
-    const uint8_t* scales;          /* IQ4_NL: f16 per 32 values, or null */
+    const uint8_t* scales;          /* IQ4_NL / IQ4_XS: a per-32 scale plane, or null */
     int64_t        scale_row_bytes;
+    const uint8_t* scales1;         /* IQ4_XS: the per-256 f16 `d` plane, or null */
+    int64_t        scale1_row_bytes;
     uint16_t*      out;
     int64_t        x_ld;
     const int32_t* ahead;
@@ -56,6 +61,11 @@ int row_gather(const RowGather& g, RowDecode decode);
 /* The table must be an E4M3 plane with one scale, or plain bf16, stored as is (avx_ngram.cpp). */
 extern "C" int avx_layout_ngram(const RadParam*, int, int, const RadEncoding*, const int*,
                                 const RadTensor*, int, RadLayout*);
+
+/* The IQ4_XS table the main token embedding ships as: u4 codes, a signed 6-bit scale per 32 and an
+ * f16 `d` per 256, all stored as they are (avx_ngram.cpp). */
+extern "C" int avx_layout_embed_xs(const RadParam*, int, int, const RadEncoding*, const int*,
+                                   const RadTensor*, int, RadLayout*);
 
 /* Refuses, with the reason on stderr, when this process may not create an io_uring ring and so
  * cannot read the table's rows (avx_ngram.cpp). */

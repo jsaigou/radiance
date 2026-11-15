@@ -2619,6 +2619,7 @@ whole form elsewhere (the host mailbox included), which keeps every promise `sp`
 |---|---|---|
 | `embed_lookup` | `M`(range) `n_embd` `n_vocab` `dtype` `vocab_offset`/opt `wscale`:f64/opt `mult`:f64/opt | `tokens`, `wte`w → `x` |
 | `embed_lookup_q` | `M`(range) `n_embd` `n_vocab` `dtype` `vocab_offset`/opt `wscale`:f64/opt `wform`/opt | `tokens`, `wte`w, `scale`w? → `x`, `ahead`? |
+| `embed_lookup_iq4xs` | `M`(range) `n_embd` `n_vocab` `dtype` `vocab_offset`/opt | `tokens`, `codes`w, `scale`w, `scale1`w → `x`, `ahead`? |
 | `logits_gemm` | `M`(range) `n_vocab` `n_embd` `dtype` | `x`, `lm_head`w → `logits` |
 | `ngram_ids` | `M`(range) `heads` `ngram` `eos` | `tok`, `state`:inout, `cu`, `mult`w, `vocab_sizes`w, `offsets`w, `cache_idx`?, `has_init`?, `num_accepted`? → `ids`, `ahead_ids`? |
 | `ple_gate` | `M`(range) `n` `hc` `eps`:f64 `dtype` `wadd`:f64/opt `gate_eps`:f64/opt | `k`, `q`, `v`, `w_key`w, `w_query`w, `w_conv`w → `gv`, `gvn` |
@@ -2710,6 +2711,14 @@ ids before it runs.
 One scale suffices because E4M3 carries its own exponent: on Qwen3.8-Flash-Next's table a row's
 dynamic range is 2.3x and a per-row scale would improve the error by only 2.9%. The FP8 checkpoint
 ships it this way, E4M3 rows with a single bf16 `weight_scale`.
+
+`embed_lookup_iq4xs` is the main token embedding's UD form, llama.cpp's IQ4_XS: `codes` is u4
+(element 2k in bits 0-3, 2k+1 in bits 4-7), `scale` is a signed six-bit `ls - 32` per 32 values
+(a [n_vocab, n_embd/32] i6 bit stream, each row starting on a byte) and `scale1` is the f16 `d`
+per 256. A row decodes as `x = out(kvalues[code] * (ls - 32) * d)`; every product is exact in f32
+(7 + 6 + 11 significant bits at the widest), so the single rounding is the store. `n_embd` must be
+whole 256s. The op is separate from `embed_lookup_q` because the operand list has one more scale;
+the row cache, direct reads and read-ahead are the same, and the table is read where it lies.
 
 `wform=iq4_nl` declares the other served form, llama.cpp's IQ4_NL: `wte` is u4 codes (element 2k in
 bits 0-3 of byte k, 2k+1 in bits 4-7), `scale` is an f16 per 32 values (a [n_vocab, n_embd/32]

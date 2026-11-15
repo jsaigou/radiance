@@ -908,6 +908,9 @@ static const RadParamSpec pEmbedM[]   = { P_INT("M"), P_INT("n_embd"), P_INT("n_
 static const RadOperandSpec oEmbed[]  = { OPD("tokens"), WGT("wte"), OUT("x") };
 static const RadOperandSpec oEmbedQ[] = { OPD("tokens"), WGT("wte"), WGT_O("scale"), OUT("x"),
                                           OPD_O("ahead") };
+/* IQ4_XS: the codes, the signed 6-bit per-32 scale, and the f16 per-256 `d`; `x` moves to slot 4. */
+static const RadOperandSpec oEmbedXs[] = { OPD("tokens"), WGT("codes"), WGT("scale"),
+                                           WGT("scale1"), OUT("x"), OPD_O("ahead") };
 
 static const RadParamSpec pLogits[]   = { P_INT("M"), P_INT("n_vocab"), P_INT("n_embd"),
                                           P_STR("dtype") };
@@ -1494,6 +1497,9 @@ static const RadOpSchema kSchemas[] = {
   "embedding gather, vocab-parallel with an offset; `mult` multiplies every row (rounded once)." },
 { "embed_lookup_q", ARR(pEmbed), ARR(oEmbedQ),
   "embedding gather, one scale for the table; without a scale the table is read as it is." },
+{ "embed_lookup_iq4xs", ARR(pEmbed), ARR(oEmbedXs),
+  "embedding gather from an IQ4_XS table: u4 codes, a signed 6-bit scale per 32 values and an f16 "
+  "`d` per 256, the main token embedding's UD form." },
 { "logits_gemm", ARR(pLogits), ARR(oLogits), "the lm_head projection." },
 { "sample_penalties", ARR(pPenal), ARR(oPenalties),
   "repetition, frequency and presence penalties." },
@@ -2141,6 +2147,13 @@ SIMPLE("avx_embed_lookup", "embed_lookup", "vocab", "embedding gather", DT_FLOAT
   /* init, fini, launch, scratch, layout, relayout, opd_shape, unrelayout, replaces */
   avx_init_ngram, nullptr, L(embed_lookup_q), nullptr, avx_layout_ngram, nullptr, nullptr, nullptr,
   nullptr },
+{ "avx_embed_lookup_iq4xs", "embed_lookup_iq4xs", "vocab",
+  "embedding gather from an IQ4_XS table through the same row cache and read-ahead as the n-gram "
+  "gather",
+  SHAPE_ANY, DT_ANY, RAD_DOMAIN_HOST, 0,
+  nullptr, 0, nullptr, 0, nullptr,
+  avx_init_ngram, nullptr, L(embed_lookup_iq4xs), nullptr, avx_layout_embed_xs, nullptr, nullptr,
+  nullptr, nullptr },
 ROWL("avx_logits_gemm", "logits_gemm", "vocab", "the lm_head projection",
      DT_FLOAT ", or a head of E4M3 / int8 codes with a scale plane, joined", L(logits_gemm),
      avx_layout_head),

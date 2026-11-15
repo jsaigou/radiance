@@ -2173,6 +2173,15 @@ static const RadOperandSpec oEmbedQ[] = {
     { "x",      RAD_OPD_OUT,    0 },
     { "ahead",  RAD_OPD_IN,     1 },
 };
+/* The IQ4_XS gather's: u4 codes, the signed 6-bit per-32 scale and the f16 per-256 `d`. */
+static const RadOperandSpec oEmbedXs[] = {
+    { "tokens", RAD_OPD_IN,     0 },
+    { "codes",  RAD_OPD_WEIGHT, 0 },
+    { "scale",  RAD_OPD_WEIGHT, 0 },
+    { "scale1", RAD_OPD_WEIGHT, 0 },
+    { "x",      RAD_OPD_OUT,    0 },
+    { "ahead",  RAD_OPD_IN,     1 },
+};
 static const RadParamSpec pPleGate[] = {
     { "M",        RAD_P_INT, RAD_REQUIRED },
     { "n",        RAD_P_INT, RAD_REQUIRED },
@@ -3043,6 +3052,11 @@ static const RadOpSchema kSchemas[] = {
            "wte[id] * scale[0], an absent scale being one. Padding and bounds behave exactly as "
            "embed_lookup's. `ahead` is the next prompt's ids, for a reader that fetches rows ahead "
            "of the step; a kernel that reads its table in place ignores it."),
+    SCHEMA("embed_lookup_iq4xs", pEmbed, oEmbedXs,
+           "the same gather from an IQ4_XS table: u4 codes into kvalues_iq4nl, a signed 6-bit scale "
+           "per 32 values (`scale`, the plane holding ls - 32) and an f16 `d` per 256 (`scale1`). "
+           "Qwen3.8-Flash-Next's main token embedding ships as this. Padding and bounds behave as "
+           "embed_lookup_q's; `ahead` is the next prompt's ids for a host reader."),
     SCHEMA("ple_gate", pPleGate, oPleGate,
            "PLE's gate. K = grouped_rmsnorm(k) * (w_key + wadd) and Q likewise over `q`, one rsqrt "
            "per n-wide stream and one gain across all hc*n; s[c] = sum_d K[c][d]*Q[c][d] / sqrt(n); "
@@ -5504,6 +5518,15 @@ static const RadKernelInfo kKernels[] = {
   ROW(cBf16Row), NOTUNE,
   nullptr, nullptr, halo_rad_embed_lookup_q, nullptr, halo_rad_layout_embed_q, nullptr,
   halo_shape_embed_lookup_q },
+
+{ "embed_lookup_iq4xs_bf16", "embed_lookup_iq4xs", "vocab",
+  "IQ4_XS embedding gather, one entry a thread",
+  "n_embd whole 256s; a negative or out-of-range id writes a zero row",
+  "i32 tokens, u4 codes, an i6 scale per 32, an f16 d per 256, bf16 or f16 output",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, halo_rad_embed_lookup_iq4xs, nullptr, halo_rad_layout_embed_xs, nullptr,
+  halo_shape_embed_lookup_iq4xs },
 
 { "ple_gate_bf16", "ple_gate", "norm",
   "PLE's dot-product gate, one workgroup a (row, stream) pair",

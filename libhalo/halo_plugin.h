@@ -630,6 +630,8 @@ int halo_rad_layout_fp8_rowmajor(const RadParam*, int, int, const RadEncoding*, 
                                 const RadTensor*, int, RadLayout*);
 int halo_rad_layout_embed_q(const RadParam*, int, int, const RadEncoding*, const int*,
                            const RadTensor*, int, RadLayout*);
+int halo_rad_layout_embed_xs(const RadParam*, int, int, const RadEncoding*, const int*,
+                            const RadTensor*, int, RadLayout*);
 int halo_rad_layout_moe_fp8(const RadParam*, int, int, const RadEncoding*, const int*,
                            const RadTensor*, int, RadLayout*);
 int halo_rad_layout_moe_fp8_mod4(const RadParam*, int, int, const RadEncoding*, const int*,
@@ -719,6 +721,9 @@ int halo_rad_embed_lookup    (const RadArgs*, RadStream);
 /* The quantised gather (embed_lookup_q) for the n-gram table, read from VRAM or from pinned host
  * memory over the link. */
 int halo_rad_embed_lookup_q  (const RadArgs*, RadStream);
+/* The main token embedding's IQ4_XS gather: u4 codes, a signed 6-bit scale per 32 values and an
+ * f16 `d` per 256. */
+int halo_rad_embed_lookup_iq4xs(const RadArgs*, RadStream);
 int halo_rad_ngram_ids       (const RadArgs*, RadStream);
 int halo_rad_ple_gate        (const RadArgs*, RadStream);
 int halo_rad_ple_conv        (const RadArgs*, RadStream);
@@ -836,6 +841,7 @@ int halo_rad_sample_merge_topk(const RadArgs*, RadStream);
  * neither halo.h nor <hip/hip_runtime.h>. */
 int halo_shape_embed_lookup   (const RadParam*, int, int operand, RadOpdDesc*);
 int halo_shape_embed_lookup_q (const RadParam*, int, int operand, RadOpdDesc*);
+int halo_shape_embed_lookup_iq4xs(const RadParam*, int, int operand, RadOpdDesc*);
 int halo_shape_gather_rows    (const RadParam*, int, int operand, RadOpdDesc*);
 int halo_shape_gather_rows_u8 (const RadParam*, int, int operand, RadOpdDesc*);
 int halo_shape_scatter_rows_u8(const RadParam*, int, int operand, RadOpdDesc*);

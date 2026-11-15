@@ -2777,6 +2777,24 @@ int ref_embed_lookup_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc
     return o.finish("embed_lookup_q", operand, out);
 }
 
+/* The IQ4_XS gather: u4 codes, a signed 6-bit scale per 32 values, an f16 `d` per 256. */
+int ref_embed_lookup_iq4xs_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M  = gi(p, n_p, "M", 0);
+    const int64_t ne = gi(p, n_p, "n_embd", 0);
+    const int64_t nv = gi(p, n_p, "n_vocab", 0);
+    const int64_t vo = gi(p, n_p, "vocab_offset", 0);
+    if (M <= 0 || ne <= 0 || nv <= 0 || vo < 0 || ne % 256) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    Opd o;
+    o.t_idx({ M }, vo + nv, -1, 0);              /* tokens */
+    o.t((uint32_t)RAD_U4, { nv, ne });           /* codes */
+    o.t((uint32_t)RAD_I6, { nv, ne / 32 });      /* scale */
+    o.t((uint32_t)RAD_F16, { nv, ne / 256 });    /* scale.1 = d */
+    o.t(D, { M, ne });                           /* x */
+    o.skip();                                    /* ahead */
+    return o.finish("embed_lookup_iq4xs", operand, out);
+}
+
 int ref_logits_gemm_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M  = gi(p, n_p, "M", 0);
     const int64_t nv = gi(p, n_p, "n_vocab", 0);

@@ -798,6 +798,9 @@ static const RadOperandSpec oEmbed[] = { OPD("tokens"), WGT("wte"), OUT("x") };
 /* The quantised table, one scale for all of it; a separate op since it adds an operand. */
 static const RadOperandSpec oEmbedQ[] = { OPD("tokens"), WGT("wte"), WGT_O("scale"), OUT("x"),
                                           OPD_O("ahead") };
+/* IQ4_XS: the codes, the signed 6-bit per-32 scale, the f16 per-256 `d`; x is operand 4. */
+static const RadOperandSpec oEmbedXs[] = { OPD("tokens"), WGT("codes"), WGT("scale"),
+                                           WGT("scale1"), OUT("x"), OPD_O("ahead") };
 
 static const RadParamSpec pLogits[] = { P_INT("M"), P_INT("n_vocab"), P_INT("n_embd"),
                                         P_STR("dtype") };
@@ -1818,6 +1821,10 @@ static const RadOpSchema kSchemas[] = {
   "A gather from wte[n_vocab, n_embd]. A negative token id writes a zero row (padding); an id at "
   "or above n_vocab fails the launch. `mult`, when given, multiplies every gathered row and the "
   "product is rounded once to x's dtype (Gemma's sqrt(hidden)); absent it is a plain copy." },
+{ "embed_lookup_iq4xs", ARR(pEmbed), ARR(oEmbedXs),
+  "A gather from an IQ4_XS table: u4 codes into kvalues_iq4nl, a signed 6-bit scale per 32 values "
+  "(the plane stores ls - 32) and an f16 `d` per 256. Qwen3.8-Flash-Next's main token embedding "
+  "ships in this format. Padding and bounds behave as embed_lookup's." },
 { "embed_lookup_q", ARR(pEmbed), ARR(oEmbedQ),
   "The same gather from a table quantised with ONE scale for all of it: x[m] = wte[id] * scale[0]. "
   "Qwen3.8-Flash-Next-FP8's 320-million-row n-gram embedding is stored that way -- E4M3 codes and a "
@@ -2265,9 +2272,13 @@ static int ref_check_dtypes(const char* op, const RadArgs* a) {
         /* IQ4_NL's codes: a u4 weight operand libref reads in ref_embed_lookup_q itself (through
          * rad_load_f32), not through ld_dt, which deliberately has no u4 case (cast refuses it). */
         const bool iq4_codes = t.dtype == RAD_U4 && role == RAD_OPD_WEIGHT &&
-                               std::strcmp(op, "embed_lookup_q") == 0;
+                               (std::strcmp(op, "embed_lookup_q") == 0 ||
+                                std::strcmp(op, "embed_lookup_iq4xs") == 0);
+        /* IQ4_XS's 6-bit scale: read in ref_embed_lookup_iq4xs through rad_load_f32, not ld_dt. */
+        const bool iq4xs_scale = t.dtype == RAD_I6 && role == RAD_OPD_WEIGHT &&
+                                 std::strcmp(op, "embed_lookup_iq4xs") == 0;
         if (role != RAD_OPD_OUT && !ref_readable(t.dtype) && !ref_joined_weight(t, role) &&
-            !iq4_codes)
+            !iq4_codes && !iq4xs_scale)
             return RAD_E_DTYPE;
         if ((role == RAD_OPD_OUT || role == RAD_OPD_INOUT) && !ref_storable(t.dtype))
             return RAD_E_DTYPE;
@@ -2701,6 +2712,9 @@ SIMPLE("ref_embed_lookup", "embed_lookup", "vocab", "embedding gather", DT_FLOAT
        ref_embed_lookup),
 SIMPLE("ref_embed_lookup_q", "embed_lookup_q", "vocab", "embedding gather, one scale for the table",
        DT_ANY, ref_embed_lookup_q),
+SIMPLE("ref_embed_lookup_iq4xs", "embed_lookup_iq4xs", "vocab",
+       "embedding gather from IQ4_XS (u4 codes, a signed 6-bit per-32 scale, an f16 per-256 d)",
+       DT_ANY, ref_embed_lookup_iq4xs),
 ROWL("ref_logits_gemm", "logits_gemm", "vocab", "the lm_head projection",
      DT_FLOAT ", or a head of E4M3 / int8 codes with a scale plane, joined",
      ref_check_dtypes, ref_logits_gemm, ref::ref_layout_head),

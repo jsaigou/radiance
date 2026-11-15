@@ -378,6 +378,12 @@ std::vector<Case> build_cases() {
     add("embed_lookup_q", { HI("M", 9), HI("n_embd", 128), HI("n_vocab", 64),
                             HS("dtype", "f16"), HI("vocab_offset", 0),
                             HS("wform", "iq4_nl") });
+    /* The main token embedding's IQ4_XS form: u4 codes, a signed 6-bit scale per 32 and an f16
+     * `d` per 256. n_embd 512 leaves two `d` values a row and a partial `d` draw. */
+    add("embed_lookup_iq4xs", { HI("M", 9), HI("n_embd", 512), HI("n_vocab", 64),
+                                HS("dtype", "bf16"), HI("vocab_offset", 0) });
+    add("embed_lookup_iq4xs", { HI("M", 9), HI("n_embd", 512), HI("n_vocab", 64),
+                                HS("dtype", "f16"), HI("vocab_offset", 0) });
 
     /* Attention. q_len 1 is decode, 17 a ragged verify window, 64 the prefill panel form
      * (q_len >= 32, uniform). `window` 0 is unbounded, 8 sliding (a different loop bound). */

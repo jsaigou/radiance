@@ -272,6 +272,27 @@ extern "C" int halo_shape_embed_lookup_q(const RadParam* p, int n_p, int operand
     HALO_PICK(l);
 }
 
+/* The IQ4_XS gather, as libref describes it (ref_embed_lookup_iq4xs_shape): u4 codes, a signed
+ * 6-bit scale per 32 values, and an f16 `d` per 256. */
+extern "C" int halo_shape_embed_lookup_iq4xs(const RadParam* p, int n_p, int operand,
+                                            RadOpdDesc* out) {
+    const int64_t M  = pi(p, n_p, "M");
+    const int64_t ne = pi(p, n_p, "n_embd");
+    const int64_t nv = pi(p, n_p, "n_vocab");
+    const int64_t vo = pi(p, n_p, "vocab_offset", 0);
+    const uint32_t D = dt_act(p, n_p, "dtype");
+    if (ne % 256) return -1;
+    const RadOpdDesc xs[] = {
+        opd_idx(M, 0, vo + nv),
+        opd((uint32_t)RAD_U4, nv, ne),
+        opd((uint32_t)RAD_I6, nv, ne / 32),
+        opd((uint32_t)RAD_F16, nv, ne / 256),
+        opd(D, M, ne),
+        opd_none(),
+    };
+    HALO_PICK(xs);
+}
+
 extern "C" int halo_shape_gather_rows(const RadParam* p, int n_p, int operand,
                                      RadOpdDesc* out) {
 

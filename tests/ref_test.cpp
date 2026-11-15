@@ -1235,7 +1235,7 @@ TEST(op_vocabulary) {
         "gather_rows", "scatter_rows", "ngram_ids", "ple_gate", "ple_conv", "causal_conv1d",
         /* Mamba-2's conv1d (Nemotron-3.5-Bolt): ple_conv with a bias inside the silu. */
         "ple_conv_bias",
-        "embed_lookup_q", "cast",
+        "embed_lookup_q", "embed_lookup_iq4xs", "cast",
         "scale_rows",
         "softmax",
         "quant_act_i8", "quant_act_i8g", "quant_act_fp8", "quant_cols_fp8", "had_quant_act_fp8", "givens_dense_quant", "givens_rotate", "had_quant_act_i8",
@@ -1825,6 +1825,62 @@ TEST(op_embed_lookup_q) {
     CHECK_OK(run("embed_lookup_q", c, 0, 2));
     CHECK_EQ(y0.at(0), 0.0f);
     CHECK_EQ(y0.at(1), 0.0f);
+}
+
+/* The IQ4_XS gather: u4 codes into kvalues_iq4nl, a signed 6-bit scale per 32 values stored as
+ * `ls - 32`, and an f16 `d` per 256. With ls = 1 (stored 33) everywhere, row 0's code i%16 and
+ * d = 0.5, and row 1 all code 15 with d = 2, every product is a literal. */
+TEST(op_embed_lookup_iq4xs) {
+    const int64_t NE = 256;
+    std::vector<uint8_t> codes((size_t)(2 * NE / 2), 0);
+    for (int64_t i = 0; i < NE; ++i) {
+        const uint8_t c = (uint8_t)(i % 16);
+        codes[(size_t)(i >> 1)] |= (uint8_t)(c << (4 * (i & 1)));
+        codes[(size_t)(NE / 2 + (i >> 1))] |= (uint8_t)(15u << (4 * (i & 1)));
+    }
+    /* Eight 6-bit values of 1 (the plane holds `ls - 32`, so this is ls = 33) a row: 48 bits = the
+     * six bytes 0x41 0x10 0x04 twice. */
+    const uint8_t s6row[6] = { 0x41, 0x10, 0x04, 0x41, 0x10, 0x04 };
+    std::vector<uint8_t> sc;
+    for (int r = 0; r < 2; ++r) sc.insert(sc.end(), s6row, s6row + 6);
+    std::vector<uint8_t> d = { 0x00, 0x38,   /* 0.5 */
+                               0x00, 0x40 };  /* 2.0 */
+    T wte(RAD_U4, { 2, NE }); wte.raw(codes);
+    T scale(RAD_I6, { 2, NE / 32 }); scale.raw(sc);
+    T dd(RAD_F16, { 2, 1 }); dd.raw(d);
+    T tok(RAD_I32, { 3 }); tok.n({ 0, 1, -1 });
+    T x(RAD_BF16, { 3, NE });
+
+    A a; a.t(tok).t(wte).t(scale).t(dd).t(x)
+         .i("M", 3).i("n_embd", NE).i("n_vocab", 2).s("dtype", "bf16");
+    CHECK_OK(run("embed_lookup_iq4xs", a));
+
+    CHECK_EQ(x.at(0), -63.5f);        /* code 0: -127 * 1 * 0.5 */
+    CHECK_EQ(x.at(15), 56.5f);        /* code 15: 113 * 1 * 0.5 */
+    CHECK_EQ(x.at(256), 226.0f);      /* row 1: code 15, d = 2 */
+    CHECK_EQ(x.at(512), 0.0f);        /* padding writes a zero row */
+    CHECK_EQ(x.at(513), 0.0f);
+
+    /* The second scale is the f16 `d` and the first the i6 plane; either swap is a different
+     * reading of the same bytes and is refused. */
+    T badscale(RAD_U6, { 2, NE / 32 }); badscale.raw(sc);
+    T y(RAD_BF16, { 3, NE });
+    A b; b.t(tok).t(wte).t(badscale).t(dd).t(y)
+         .i("M", 3).i("n_embd", NE).i("n_vocab", 2).s("dtype", "bf16");
+    CHECK_EQ(run("embed_lookup_iq4xs", b), RAD_E_DTYPE);
+
+    /* n_embd must be whole 256s: a `d` covers a 256-value block. */
+    T y2(RAD_BF16, { 1, 128 });
+    T tok1(RAD_I32, { 1 }); tok1.n({ 0 });
+    T wte128(RAD_U4, { 2, 128 });
+    T sc128(RAD_I6, { 2, 4 }); sc128.raw({ 0x41, 0x10, 0x04,
+                                           0x41, 0x10, 0x04,
+                                           0x41, 0x10, 0x04,
+                                           0x41, 0x10, 0x04 });
+    T d128(RAD_F16, { 2, 1 }); d128.raw(d);
+    A c; c.t(tok1).t(wte128).t(sc128).t(d128).t(y2)
+         .i("M", 1).i("n_embd", 128).i("n_vocab", 2).s("dtype", "bf16");
+    CHECK_EQ(run("embed_lookup_iq4xs", c), RAD_E_SHAPE);
 }
 
 /* PLE's gate, on paper. n = 2 and hc = 2, the smallest shape showing both asymmetries of the op:
@@ -10515,6 +10571,8 @@ std::vector<Geo> geometries() {
         G("embed_lookup", "M", 3, a.i("M", R).i("n_embd", 8).i("n_vocab", 20).s("dtype", "f32")),
         G("embed_lookup_q", "M", 3, a.i("M", R).i("n_embd", 8).i("n_vocab", 20)
                                     .s("dtype", "fp8_e4m3")),
+        G("embed_lookup_iq4xs", "M", 3, a.i("M", R).i("n_embd", 256).i("n_vocab", 20)
+                                         .s("dtype", "bf16")),
         G("logits_gemm", "M", 3, a.i("M", R).i("n_vocab", 20).i("n_embd", 8).s("dtype", "f32")),
         G("sample_penalties", "M", 2, a.i("M", R).i("n_vocab", 64)),
         G("sample_dry", "M", 2, a.i("M", R).i("n_vocab", 64)),

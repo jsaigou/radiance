@@ -638,3 +638,51 @@ int ref_embed_lookup_q(const RadArgs* a, RadStream) {
     const float scale = sc->data && numel(sc) >= 1 ? ldt(sc, 0) : 1.0f;
     return embed_gather(a, &a->t[0], wte, x, scale);
 }
+
+/* IQ4_XS: u4 codes into kvalues_iq4nl, a signed 6-bit scale per 32 values (`ls - 32`, the plane
+ * stores a two's-complement i6) and an f16 `d` per 256. The product is exact in f32 -- level (7
+ * bits) * sub-scale (6) * d (11) is at most 24 -- so the single rounding is the store, as on the
+ * device and in libavx. Operands: tokens, codes, scale, scale1, x, ahead?. */
+int ref_embed_lookup_iq4xs(const RadArgs* a, RadStream) {
+    if (a->n_t < 5 || !rad_arg_in(a, 0) || !rad_arg_in(a, 1) || !rad_arg_in(a, 2) ||
+        !rad_arg_in(a, 3) || !rad_arg_in(a, 4))
+        return RAD_E_INVAL;
+    const RadTensor* tok = &a->t[0];
+    const RadTensor* wte = &a->t[1];
+    const RadTensor* sc  = &a->t[2];
+    const RadTensor* sc1 = &a->t[3];
+    const RadTensor* x   = &a->t[4];
+    if (wte->dtype != RAD_U4 || sc->dtype != RAD_I6 || sc1->dtype != RAD_F16)
+        return RAD_E_DTYPE;
+    const int64_t n_embd = p_int(a, "n_embd", wte->rank >= 2 ? wte->shape[wte->rank - 1] : 0);
+    const int64_t n_vocab = p_int(a, "n_vocab", wte->rank >= 2 ? wte->shape[wte->rank - 2] : 0);
+    const int64_t voff = p_int(a, "vocab_offset", 0);
+    if (n_embd <= 0 || n_vocab <= 0 || voff < 0 || n_embd % 256) return RAD_E_SHAPE;
+    if (numel(sc) < n_vocab * (n_embd / 32) || numel(sc1) < n_vocab * (n_embd / 256))
+        return RAD_E_SHAPE;
+    const int64_t M = numel(x) / n_embd;
+    if (M <= 0 || numel(tok) < M || numel(wte) < n_vocab * n_embd) return RAD_E_SHAPE;
+    if (voff == 0 && a->world_size <= 1)
+        for (int64_t m = 0; m < M; ++m)
+            if (ld_int(tok->dtype, tok->data, offlin(tok, m)) >= n_vocab) return RAD_E_INVAL;
+    const int64_t ws  = wte->rank >= 2 ? wte->stride[wte->rank - 2] : n_embd;
+    const int64_t s6  = sc->rank >= 2 ? sc->stride[sc->rank - 2] : n_embd / 32;
+    const int64_t s16 = sc1->rank >= 2 ? sc1->stride[sc1->rank - 2] : n_embd / 256;
+    if (ws % 2 || (s6 * 6) % 8) return RAD_E_SHAPE;
+    for (int64_t m = 0; m < M; ++m) {
+        const int64_t id = ld_int(tok->dtype, tok->data, offlin(tok, m)) - voff;
+        const int64_t xb = rowoff(x, m, n_embd), xs = laststride(x);
+        const bool have_row = id >= 0 && id < n_vocab;
+        const uint8_t* code_row = (const uint8_t*)wte->data + id * (ws / 2);
+        const uint8_t* s6_row   = (const uint8_t*)sc->data + id * (s6 * 6 / 8);
+        const int64_t  s16_row  = id * s16;
+        for (int64_t i = 0; i < n_embd; ++i) {
+            const float v = have_row
+                ? iq4_nl_level((int)rad_load_f32(code_row, RAD_U4, i)) *
+                      rad_load_f32(s6_row, RAD_I6, i / 32) * ldt(sc1, s16_row + i / 256)
+                : 0.0f;
+            stt(x, xb + i * xs, v);
+        }
+    }
+    return RAD_OK;
+}
