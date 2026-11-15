@@ -427,7 +427,7 @@ json Server::capabilities() const {
  * state, plus the engine's, pre-rendered because the server knows nothing about devices,
  * containers or placement (ServerOptions::engine_info). `endpoints` is the router's own table, so
  * it cannot go stale. */
-HttpResponse Server::handle_server_info(const HttpRequest&) {
+HttpResponse Server::handle_server_info(const HttpRequest& req) {
     json srv;
     srv["model"]              = opt_.model_id;
     srv["version"]            = opt_.version;
@@ -494,8 +494,16 @@ HttpResponse Server::handle_server_info(const HttpRequest&) {
         json e = json::parse(opt_.engine_info, nullptr, false);
         if (e.is_discarded() || !e.is_object())
             RAD_WARN("server: engine_info is not a JSON object; /server_info omits it");
-        else
+        else {
+            /* One member names a file on this machine -- expert_stats.file, the xstats output,
+             * the same path the model card strips for strangers (server.cpp). /server_info
+             * answers keyless by the dashboard-data posture, but a filesystem path is not
+             * dashboard data: a stranger gets the interval, never the path. */
+            if (opt_.api_key.empty() && !local_operator(req) && e.contains("expert_stats") &&
+                e["expert_stats"].is_object())
+                e["expert_stats"].erase("file");
             o["engine"] = std::move(e);
+        }
     }
     metrics_.observe_http(200);
     return HttpResponse::json_body(200, json_dump(o));

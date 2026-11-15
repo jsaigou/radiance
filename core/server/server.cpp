@@ -2296,6 +2296,9 @@ HttpResponse Server::handle_models(const HttpRequest& req) {
      * belongs to the operator alone, the rule /diagnostics and the LoRA admin follow; with a
      * key, everyone who can pay the key already owns this model's card. */
     if (!opt_.api_key.empty() || local_operator(req)) c.root = opt_.model_path;
+    /* No capabilities member to strip here: capabilities() carries no expert_stats. The engine
+     * reports that path in its own info blob, and the splice at /server_info screens it for
+     * keyless strangers (admin.cpp, handle_server_info) -- the live guard, this is the map. */
     c.capabilities = capabilities().dump();
     metrics_.observe_http(200);
     std::vector<ModelCard> cards{ c };
