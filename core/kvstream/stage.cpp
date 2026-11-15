@@ -6,6 +6,7 @@
 #include "runtime/wtab.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 
 namespace rad {
@@ -202,8 +203,10 @@ bool stage_src(Ctx* ctx, int group, const RadKVGroupBatch* kvb, int layer, Stage
     if (end <= 0 || end > st->host_layer_stride) end = st->host_layer_stride;
     o->src.clear(); o->dst.clear(); o->len.clear();
     o->bytes = 0;
+    bool clamped = false;
     auto add = [&](int64_t off, int64_t n) {
-        if (off >= end) return;
+        if (off >= end) { clamped = true; return; }
+        if (n > end - off) clamped = true;
         n = std::min(n, end - off);
         if (n <= 0) return;
         o->src.push_back((uint64_t)(uintptr_t)(row + off));
@@ -214,6 +217,19 @@ bool stage_src(Ctx* ctx, int group, const RadKVGroupBatch* kvb, int layer, Stage
     /* Only the step's ranges (stage.h, "Volume"); none set copies the row. */
     if (b->stage_runs.empty()) add(0, end);
     for (const KVStageRun& r : b->stage_runs) add(r.off, r.bytes);
+    if (clamped) {
+        /* Once, not per step: a run naming a block past the mirror row means pool and host
+         * layer disagree on the layout, and the bytes past the clamp silently never stage --
+         * attention then reads a row that is part copy and part stale. The clamp is the
+         * memory-safe answer; this is the promise that it is never a silent one. */
+        static std::atomic<bool> said{false};
+        bool expected = false;
+        if (said.compare_exchange_strong(expected, true))
+            RAD_WARN("kvstream: group %d stage runs reach past the host layer's end (%lld of "
+                     "%lld bytes): the stage drops what lies past it, and staged attention "
+                     "reads stale bytes there (first of possibly many)",
+                     group, (long long)end, (long long)st->host_layer_stride);
+    }
     return o->bytes > 0;
 }
 
