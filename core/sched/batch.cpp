@@ -1136,7 +1136,12 @@ const RadBatch* BatchBuilder::build(const StepPlan& plan, const IKVManager& kv, 
         s.h_q[i]   = e.n_tokens;
         s.h_ctx[i] = e.ctx_len;
         s.h_acc[i] = e.n_accepted;
-        s.h_arow[i] = -1;
+        /* Row 0, not -1: the query pass gathers the context state by these values, and the
+         * gather's index plane is validated in shape only -- a row that reaches the correlator
+         * without having advanced would gather one row BEFORE the context buffer (device OOB).
+         * Row 0 is always in range; a row that skipped its advance reads a wrong anchor, which
+         * the acceptance path discards, instead of faulting or reading a neighbour's state. */
+        s.h_arow[i] = 0;
         if (e.is_prefill) { if (e.n_tokens > max_q_pf) max_q_pf = e.n_tokens; }
         else               { if (e.n_tokens > max_q_dec) max_q_dec = e.n_tokens; }
     }
