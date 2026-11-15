@@ -1326,8 +1326,8 @@ inline int LinearFP8::declare(RadBuilder* b, Names& nm, const Geom& g, const cha
      * planes are the GGUF block fields, so the stored weight is exact. Row slices are 16-row
      * tiles; a column slice must be whole 256-value Q6_K blocks (whole 32-value Q8_0 blocks),
      * which is also the scale plane's K block. */
-    const bool q6k = known && linear_is_q6k(enc);
-    const bool q80 = known && linear_is_q80(enc);
+    q6k = known && linear_is_q6k(enc);
+    q80 = known && linear_is_q80(enc);
     if (q6k || q80) {
         if (stored) {
             fprintf(stderr, "radiance: '%s' views '%s', which only a block-fp8 linear "
