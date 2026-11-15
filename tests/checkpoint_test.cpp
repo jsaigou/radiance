@@ -136,6 +136,32 @@ TEST(the_metadata_names_the_architecture_and_the_quantisation) {
     CHECK_EQ(ck.dir(), dir);
 }
 
+/* The index is checkpoint-supplied data like the tensors, and its weight_map values are paths:
+ * a poisoned one must not lead the loader to open files outside the model dir as the serving
+ * user. hfget screens the listing's names; nothing screened the index's until here. */
+TEST(a_poisoned_index_cannot_lead_the_shard_list_out_of_the_model_dir) {
+    auto dir_with_index = [](const char* shard) -> std::string {
+        const std::string dir = write_checkpoint({ bf16("x", { 2, 2 }, 0) }, kConfig);
+        const std::string idx = std::string("{\"metadata\":{\"total_size\":8},\"weight_map\":"
+                                            "{\"x\":\"") + shard + "\"}}";
+        /* No REQUIRE in here: its failure spelling returns void, and this lambda returns a
+         * directory. A null FILE* just fails to write, and every caller checks the open. */
+        std::FILE* f = std::fopen((dir + "/model.safetensors.index.json").c_str(), "wb");
+        if (f != nullptr) {
+            std::fwrite(idx.data(), 1, idx.size(), f);
+            std::fclose(f);
+        }
+        return dir;
+    };
+    /* The honest index still reads: the name is the real shard's own. */
+    Checkpoint ok;
+    CHECK_EQ(ok.open(dir_with_index("model.safetensors")), RAD_OK);
+    for (const char* bad : { "../../../../etc/passwd", "/etc/passwd", "..", "a/..", "./x", "" }) {
+        Checkpoint ck;
+        CHECK(ck.open(dir_with_index(bad)) < 0);
+    }
+}
+
 TEST(routed_expert_metadata_accepts_the_deepseek_and_glm_config_spellings) {
     const std::string dir = write_checkpoint({ bf16("x", {2, 2}, 0) },
         "{\"model_type\":\"glm5_next\",\"text_config\":{\"hidden_size\":4096,"
