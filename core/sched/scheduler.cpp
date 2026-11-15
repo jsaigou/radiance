@@ -1658,31 +1658,58 @@ void Scheduler::undo_hit(SchedReq& s) {
 bool Scheduler::preempted_can_prefill(const SchedReq& s) const {
     const Request& r = *s.req;
     const int64_t target = s.seq_len();
-    /* What the recompute adopts from the cache (its own prefix, published at the preemption) needs
-     * no new block. */
-    const int64_t hit = (cfg_.prefix_cache && pc_) ? pc_->lookup(r, nullptr, nullptr).n_attn_tokens : 0;
-
-    for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
-        const KVGeom::G& gg = kvgeom_.g[g];
-        /* A group the manager gives no blocks (the sentinel at index 0) asks nothing. Counting it
-         * wanted the whole prompt from a pool of none and kept a preempted request out for good. */
-        if (!gg.paged || kv_->total_blocks((int32_t)g) <= 0) continue;
-        int64_t need = (target + gg.block_size - 1) / gg.block_size -
-                       (int64_t)kv_->block_table(r.id, (int32_t)g).size() - hit / gg.block_size;
-        if (need < 0) need = 0;
-        for (int32_t slot : running_) {
-            const SchedReq& rs = *reqs_[(size_t)slot];
-            if (!rs.req) continue;
-            const Request& rr = *rs.req;
-            int64_t goal = rr.n_computed + 1;
-            if (rr.n_computed < (int64_t)rr.prompt.size())
-                goal = std::max(goal, (int64_t)rr.prompt.size());
-            const int64_t rows = (goal + gg.block_size - 1) / gg.block_size;
-            const int64_t held = (int64_t)kv_->block_table(rr.id, (int32_t)g).size();
-            if (rows > held) need += rows - held;
-            need += 1;                       /* one block past that, so the next step is not the victim */
+    /* Whether the pools hold the recompute plus every runner's remaining need, given `hit` tokens
+     * of prefix the recompute adopts without new blocks. */
+    auto enough = [&](int64_t hit) {
+        for (size_t g = 0; g < kvgeom_.g.size(); ++g) {
+            const KVGeom::G& gg = kvgeom_.g[g];
+            /* A group the manager gives no blocks (the sentinel at index 0) asks nothing. Counting
+             * it wanted the whole prompt from a pool of none and kept a preempted request out for
+             * good. */
+            if (!gg.paged || kv_->total_blocks((int32_t)g) <= 0) continue;
+            int64_t need = (target + gg.block_size - 1) / gg.block_size -
+                           (int64_t)kv_->block_table(r.id, (int32_t)g).size() - hit / gg.block_size;
+            if (need < 0) need = 0;
+            for (int32_t slot : running_) {
+                const SchedReq& rs = *reqs_[(size_t)slot];
+                if (!rs.req) continue;
+                const Request& rr = *rs.req;
+                int64_t goal = rr.n_computed + 1;
+                if (rr.n_computed < (int64_t)rr.prompt.size())
+                    goal = std::max(goal, (int64_t)rr.prompt.size());
+                const int64_t rows = (goal + gg.block_size - 1) / gg.block_size;
+                const int64_t held = (int64_t)kv_->block_table(rr.id, (int32_t)g).size();
+                if (rows > held) need += rows - held;
+                need += 1;               /* one block past that, so the next step is not the victim */
+            }
+            if (need > kv_->available_blocks((int32_t)g)) return false;
         }
-        if (need > kv_->available_blocks((int32_t)g)) return false;
+        return true;
+    };
+
+    /* The hash-chain lookup costs the request's length in CPU, and this gate runs per waiting
+     * slot per scheduling round, under mu_. The zero-credit count answers "yes" without it
+     * whenever the pools plainly hold the recompute; the lookup is consulted only when the
+     * credit decides, which is precisely when the gate is about to deny anyway. */
+    if (!enough(0)) {
+        if (!cfg_.prefix_cache || !pc_) return false;
+        /* Credit what the recompute ADOPTS, not the raw attention hit: admit_one clamps the
+         * attention hit to the linear hit under checkpoints -- the linear layers replay from the
+         * checkpoint regardless of how deep the attention matched -- and never adopts the whole
+         * prompt, one token staying for the logits. Crediting deeper than admission adopts
+         * subtracts blocks the recompute will really need: the preempted request is admitted
+         * against a loan it cannot repay, the next ensure preempts it again, and that is the
+         * loop this gate exists to stop. The exact-mode grid floor is folded in as a bound too
+         * -- crediting less than admission adopts only delays a re-admission by one round,
+         * crediting more reopens the loop. */
+        const CacheHit h = pc_->lookup(r, nullptr, nullptr);
+        int64_t hit = h.n_attn_tokens;
+        if (geo_.checkpoints() && h.n_linear_tokens < hit) hit = h.n_linear_tokens;
+        if (geo_.exact && hit > 0) hit = geo_.grid_floor(hit);
+        const int64_t last = target - 1;
+        if (hit > last) hit = last;
+        if (hit < 0) hit = 0;
+        if (!enough(hit)) return false;
     }
 
     /* Stateful groups: the recompute needs its state slots back, and every running sequence must
