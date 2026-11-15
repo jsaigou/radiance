@@ -1,0 +1,76 @@
+qwen4exp: 1224 mapped tensors, 83.310 GiB in Unsloth's formats, 5.692 GiB kept from the bf16 source (not in the map), total 89.003 GiB
+role                    ggml     target                        servable    n      GiB
+ple-table               IQ4_NL   blk.*.ple_ngram.weight        yes         1   26.822
+routed-expert gate/up   IQ3_XXS  blk.*.ffn_gate_up_exps.*.weightNO         76   22.729
+routed-expert down      IQ4_NL   blk.*.ffn_down_exps.*.weight  yes        26   11.426
+routed-expert down      Q5_0     blk.*.ffn_down_exps.*.weight  yes        20   10.742
+routed-expert gate/up   IQ4_XS   blk.*.ffn_gate_up_exps.*.weightNO         12    4.980
+routed-expert gate/up   IQ2_S    blk.*.ffn_gate_up_exps.*.weightNO          8    2.002
+delta-attn              Q6_K     blk.*.ssm_inz.weight          NO         70    1.122
+ssm_out                 Q8_0     blk.*.ssm_out.weight          NO         36    0.560
+output                  Q6_K     output.weight                 NO          1    0.486
+routed-expert down      TYPE42   blk.*.ffn_down_exps.*.weight  yes         2    0.439
+embedding               IQ4_XS   token_embd.weight             NO          1    0.315
+attn_q                  Q6_K     blk.*.attn_qg.weight          NO         12    0.288
+ffn_gate_inp            F32      blk.*.ffn_gate_inp.weight     yes        48    0.234
+gated-residual          Q8_0     blk.*.attn_hc_down.weight     NO         48    0.156
+gated-residual          Q8_0     blk.*.attn_hc_up.weight       NO         48    0.156
+gated-residual          Q8_0     blk.*.ffn_hc_down.weight      NO         48    0.156
+gated-residual          Q8_0     blk.*.ffn_hc_up.weight        NO         48    0.156
+attn_output             Q6_K     blk.*.attn_output.weight      NO         12    0.144
+shared-expert           Q8_0     blk.*.ffn_down_shexp.weight   NO         48    0.078
+ffn_gate_shexp          Q6_K     blk.*.ffn_gate_up_shexp.weightNO         47    0.059
+ffn_up_shexp            Q6_K     blk.*.ffn_gate_up_shexp.weightNO         47    0.059
+delta-attn              Q8_0     blk.*.ssm_inz.weight          NO          2    0.042
+indexer                 BF16     blk.*.qsa_qk.weight           yes        24    0.037
+ple_key                 Q8_0     blk.*.ple_key.weight          NO          1    0.026
+ssm_alpha               F32      blk.*.ssm_ab.weight           yes        36    0.016
+ssm_beta                F32      blk.*.ssm_ab.weight           yes        36    0.016
+attn_k                  Q6_K     blk.*.attn_k.weight           NO         12    0.012
+attn_v                  Q6_K     blk.*.attn_v.weight           NO         12    0.012
+gated-residual          F32      blk.*.attn_hc_inject.weight   yes        48    0.007
+gated-residual          F32      blk.*.ffn_hc_inject.weight    yes        48    0.007
+ple_value               Q8_0     blk.*.ple_value.weight        NO          1    0.006
+ssm_conv1d              F32      blk.*.ssm_conv1d.weight       yes        36    0.005
+output                  Q8_0     output_hc_down.weight         NO          1    0.003
+output                  Q8_0     output_hc_up.weight           NO          1    0.003
+gated-residual          F32      blk.*.attn_hc_norm.weight     yes        48    0.002
+gated-residual          F32      blk.*.ffn_hc_norm.weight      yes        48    0.002
+ffn_gate_shexp          Q8_0     blk.*.ffn_gate_up_shexp.weightNO          1    0.002
+ffn_up_shexp            Q8_0     blk.*.ffn_gate_up_shexp.weightNO          1    0.002
+ffn_gate_inp_shexp      F32      blk.*.ffn_gate_shexp.weight   yes        48    0.000
+ple_conv1d              F32      blk.*.ple_conv.weight         yes         1    0.000
+output                  F32      output_hc_norm.weight         yes         1    0.000
+ple_norm_conv           F32      blk.*.ple_norm_conv.weight    yes         1    0.000
+ple_norm_key            F32      blk.*.ple_norm_key.weight     yes         1    0.000
+ple_norm_query          F32      blk.*.ple_norm_query.weight   yes         1    0.000
+ssm_norm                F32      blk.*.ssm_norm.weight         yes        36    0.000
+attn_k_norm             F32      blk.*.attn_k_norm.weight      yes        12    0.000
+attn_q_norm             F32      blk.*.attn_q_norm.weight      yes        12    0.000
+ssm_a                   F32      blk.*.ssm_a_log               yes        36    0.000
+ssm_dt                  F32      blk.*.ssm_dt.bias             yes        36    0.000
+indexer                 F32      blk.*.qsa_k_norm.weight       yes        12    0.000
+indexer                 F32      blk.*.qsa_q_norm.weight       yes        12    0.000
+
+map coverage: 1044/1044 distinct declared targets present
+servable by the current build: 49.758 GiB (55.9% of the total); blocked on kernels: 39.245 GiB
+  by type (GiB): IQ4_NL 38.25, IQ3_XXS 22.73, Q5_0 10.74, IQ4_XS 5.29, Q6_K 2.18, IQ2_S 2.00, Q8_0 1.34, TYPE42 0.44, F32 0.29, BF16 0.04
+
+kept-weight variations (MTP layer blk.48 + mtp.*, vision v.*): total container
+  MTP     vision    total GiB  delta GiB
+  keep    keep         89.003      0.000
+
+last expert layer 47 experts (map size; the draft-only lever)
+  format    layer GiB  total GiB  delta GiB
+  keep          1.367     89.003      0.000
+  bf16          4.688     92.323      3.320
+  fp8           2.344     89.979      0.977
+  q8_0          2.490     90.126      1.123
+  w4nl64        1.208     88.844     -0.159
+  w5nl64        1.501     89.137      0.134
+
+kept from bf16 (no map entry): 5.692 GiB in 1388 weights
+  blk.48       bf16       1037 weight(s)   4.795 GiB
+  v            bf16        333 weight(s)   0.836 GiB
+  mtp          bf16         15 weight(s)   0.061 GiB
+  blk.1        i64           3 weight(s)   0.000 GiB
