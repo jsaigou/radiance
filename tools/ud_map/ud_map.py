@@ -34,22 +34,25 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "ud_repack"))
 from ud_repack import load_all, role_of  # noqa: E402
 
-# GGUF type -> (bits per weight, libquant `ggml type=` spelling, servable by build 23 + qwen4exp_fp8)
-# servable False means: libquant can write the format, but no kernel in the deployed build reads it.
+# GGUF type -> (bits per weight, libquant `ggml type=` spelling, servable by the current build)
+# servable False means: libquant can write the format, but no kernel/arch path in the deployed
+# build reads it. The MoE lane (base 2a3200f) serves IQ4_NL (iq4nl32a16 + the PLE gather), Q5_0
+# (q50a16) and Q2_0 (q20a16). Q6_K/Q8_0 have dense kernels but the qwen4exp arch does not wire
+# them yet (lane L3); IQ3_XXS/IQ2_S/IQ4_XS still lack kernels.
 TYPES = {
     "Q8_0":    (8.5,      "q8_0",   False),
     "Q6_K":    (6.5625,   "q6_k",   False),
     "Q5_K":    (5.5,      "q5_k",   False),
     "Q4_K":    (4.5,      "q4_k",   False),
-    "Q5_0":    (5.5,      "q5_0",   False),
-    "IQ4_NL":  (4.5,      "iq4_nl", False),
+    "Q5_0":    (5.5,      "q5_0",   True),
+    "IQ4_NL":  (4.5,      "iq4_nl", True),
     "IQ4_XS":  (4.25,     "iq4_xs", False),
     "IQ3_XXS": (3.0625,   "iq3_xxs", False),
     "IQ2_S":   (2.5625,   "iq2_s",  False),
     # llama.cpp type 42 is Q2_0: 64 values, f16 scale, 2-bit codes (-1,0,+1,+2), 2.25 bpw.
-    # libquant has no kind for it yet (port quantize_q2_0/unpack); the GGUF names it TYPE42.
-    "TYPE42":  (2.25,     None,     False),
-    "Q2_0":    (2.25,     None,     False),
+    # libquant's `q2_0` kind and the q20a16 expert GEMM exist; the GGUF names it TYPE42.
+    "TYPE42":  (2.25,     "q2_0",   True),
+    "Q2_0":    (2.25,     "q2_0",   True),
     "F32":     (32.0,     None,     True),
     "F16":     (16.0,     None,     True),
     "BF16":    (16.0,     None,     True),
@@ -176,17 +179,54 @@ ARCHES = {"qwen4exp": qwen4exp, "qwen35moe": qwen35moe}
 # Q5_K/Q6_K one w5nl64a8h, and the dense Q8_0 trunk the served block FP8. (The codebooks are not
 # the GGUF's K-quants; they are the nearest form libr4d has a kernel for, which is what the
 # hand-built q36-w4w5 recipes use.)
+#
+# The Flash-Next (qwen4exp) map adds the UD v3.1 types: IQ4_NL/IQ4_XS -> the rotated w4nl
+# codebook (4.125 bpw, smaller than IQ4_NL's 4.5 and the production Flash-Next format), Q5_0 ->
+# w5nl, and IQ3_XXS/IQ2_S/Q2_0 -> w3nl (the existing 3-bit codebook). Q2_0's native q2_0 plane is
+# smaller (2.25 bpw, served as q20a16), but its only tensors are blk.8/blk.10 down projections
+# whose gate/up are IQ2_S; MoeFP8 refuses an unrotated q20a16 table beside a rotated codebook in
+# one layer ("one table of experts takes one encoding"), so Q2_0 takes w3nl too (+0.17 GiB).
+_FAST_W4NL = ("rtn table=w4nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* "
+              "scale2_value=0.0001220703125 transform=fwht128 rule=search")
+_FAST_W5NL = ("rtn table=w5nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* "
+              "scale2_value=0.0001220703125 transform=fwht128 rule=search")
+_FAST_W3NL = ("rtn table=w3nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* "
+              "scale2_value=0.0001220703125 transform=fwht128 rule=search")
 FAST_EXPERTS = {
-    "Q4_K": ("w4nl64", "rtn table=w4nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* "
-                       "scale2_value=0.0001220703125 transform=fwht128 rule=search"),
-    "Q5_K": ("w5nl64", "rtn table=w5nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* "
-                       "scale2_value=0.0001220703125 transform=fwht128 rule=search"),
-    "Q6_K": ("w5nl64", "rtn table=w5nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* "
-                       "scale2_value=0.0001220703125 transform=fwht128 rule=search"),
-    "Q8_0": ("w5nl64", "rtn table=w5nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* "
-                       "scale2_value=0.0001220703125 transform=fwht128 rule=search"),
+    "Q4_K":    ("w4nl64", _FAST_W4NL),
+    "Q5_K":    ("w5nl64", _FAST_W5NL),
+    "Q6_K":    ("w5nl64", _FAST_W5NL),
+    "Q8_0":    ("w5nl64", _FAST_W5NL),
+    "IQ4_NL":  ("w4nl64", _FAST_W4NL),
+    "IQ4_XS":  ("w4nl64", _FAST_W4NL),
+    "Q5_0":    ("w5nl64", _FAST_W5NL),
+    "IQ3_XXS": ("w3nl64", _FAST_W3NL),
+    "IQ2_S":   ("w3nl64", _FAST_W3NL),
+    "Q2_0":    ("w3nl64", _FAST_W3NL),
+    "TYPE42":  ("w3nl64", _FAST_W3NL),
 }
-FAST_TRUNK = "rtn codes=fp8_e4m3 block=128x128 scale=bf16"
+# Bits per weight of each fast form, including its scale planes (the fp8/f32 scale overhead is
+# folded in: 4.125, 5.125 and 3.125 are 4/5/3 code bits plus one E4M3 byte per 64 of K; fp8 is
+# block fp8 at bf16 128x128 scales; q2_0 is 2 bits plus f16 per 64).
+FAST_BPW = {
+    "w4nl64": 4.125,
+    "w5nl64": 5.125,
+    "w3nl64": 3.125,
+    "q20a16": 2.25,
+    "q6_k":   6.5625,
+    "q8_0":   8.5,
+    "iq4_nl": 4.5,
+    "fp8":    8.0 + 16.0 / (128 * 128),
+    "f32":    32.0,
+    "f16":    16.0,
+    "bf16":   16.0,
+}
+# qwen35moe's fast recipe only ever remaps the K-quants; the qwen4exp arch additionally serves
+# the IQ/4-bit codebooks and Q2_0. Keep the old arch's set narrow so its behaviour is unchanged.
+_FAST_EXPERT_QWEN35 = ("Q4_K", "Q5_K", "Q6_K", "Q8_0")
+_Y_KEEP = ("F32", "F16", "BF16")
+_FAST_TRUNK = "rtn codes=fp8_e4m3 block=128x128 scale=bf16"
+FAST_TRUNK = _FAST_TRUNK
 FAST_DRAFT = "rtn codes=u2 group=128 scale=f16 zero=u8"
 BF16_TO_FAST_QUANT = "fp8"
 
@@ -319,17 +359,87 @@ _FAST_DENSE = ("attn_qg.weight", "attn_k.weight", "attn_v.weight", "attn_output.
 
 
 def _expert_rule(fmt, gptq):
-    rule = FAST_EXPERTS[fmt][1] if fmt in FAST_EXPERTS else None
-    if rule is None:
+    entry = FAST_EXPERTS.get(fmt)
+    if entry is None:
         return None
-    if gptq:
+    rule = entry[1]
+    if gptq and rule.startswith("rtn "):
         rule = rule.replace("rtn ", "gptq ", 1) + " cd=3 calib=$CALIB"
     return rule
 
 
-def _fast_recipe(rows, gguf, gptq=False, mtp=None):
-    """The Route B recipe for arch/qwen35moe_fp8: the GGUF decides the bits, the recipe picks the
-    nearest format libr4d serves. The hand-built q36-w4w5 recipes are this text."""
+def _fast_dtype(arch, row):
+    """The fast-path form of one map row: (dtype label, bits/weight, servable now, dependency).
+
+    None means no served form: the caller reports it rather than guessing. `servable` is the
+    current build (base 2a3200f): the MoE codebooks w4nl64a8h/w5nl64a8h/q20a16 and the native
+    IQ4_NL PLE gather are wired; w3nl64a8h has a kernel but not yet a qwen4exp arch format, and
+    the native Q6_K/Q8_0 dense forms wait on lane L3.
+    """
+    ty = row.get("type")
+    tgt = row.get("target") or ""
+    role = row.get("role") or ""
+    if arch == "qwen4exp":
+        # The 26.8 GiB PLE n-gram table is a gather, not a GEMM. Keep the GGUF's own IQ4_NL:
+        # that is the kernel the PLE lane wired (there is no w4nl64 gather), and it is smaller
+        # than a block-FP8 table.
+        if role == "ple-table" or tgt.endswith("ple_ngram.weight"):
+            return ("iq4_nl", FAST_BPW["iq4_nl"], True, None)
+        if "exps." in tgt:
+            entry = FAST_EXPERTS.get(ty)
+            if entry is None:
+                return None
+            label = entry[0]
+            if label == "w3nl64":
+                return (label, FAST_BPW[label], False,
+                        "arch: qwen4exp format_of/kServed/probe for w3nl64a8h (L1 kernel exists)")
+            return (label, FAST_BPW[label], True, None)
+        if role == "embedding" or tgt == "token_embd.weight":
+            # The early path keeps the 4.25-bpw token embedding as the checkpoint's bf16
+            # (1.186 GiB). A q8_0 form is 0.630 GiB, but it needs L3's embedding wiring.
+            return ("bf16", FAST_BPW["bf16"], True, None)
+        if ty == "Q6_K":
+            return ("q6_k", FAST_BPW["q6_k"], False, "L3: qwen4exp dense Q6_K wiring")
+        if ty == "Q8_0":
+            return ("q8_0", FAST_BPW["q8_0"], False, "L3: qwen4exp dense Q8_0 wiring")
+        if ty in _Y_KEEP:
+            return (ty.lower(), FAST_BPW[ty.lower()], True, None)
+        return None
+    # qwen35moe: the Route B forms the hand-built q36-w4w5 recipes use.
+    if "*" in tgt:
+        if ty not in _FAST_EXPERT_QWEN35:
+            return None
+        label = FAST_EXPERTS[ty][0]
+        return (label, FAST_BPW[label], True, None)
+    if ty == "Q8_0":
+        return ("fp8", FAST_BPW["fp8"], True, None)
+    if ty in _Y_KEEP:
+        return (ty.lower(), FAST_BPW[ty.lower()], True, None)
+    return None
+
+
+def _fast_bytes(row, label, bpw):
+    """The row's size in a fast form. A form the GGUF already stores is exactly its stored bytes;
+    a remap is elements * bpw / 8 (the scale planes are in FAST_BPW)."""
+    ty = row.get("type")
+    native = {"iq4_nl": ("IQ4_NL",), "q2_0": ("Q2_0", "TYPE42"),
+              "q6_k": ("Q6_K",), "q8_0": ("Q8_0",),
+              "f32": ("F32",), "f16": ("F16",), "bf16": ("BF16",)}.get(label, ())
+    if ty in native:
+        return row["bytes"]
+    elems = 1
+    for x in row.get("shape") or []:
+        elems *= x
+    if elems <= 0:
+        return row["bytes"]
+    return int(elems * bpw / 8)
+
+
+def _fast_recipe(rows, gguf, gptq=False, mtp=None, arch="qwen35moe", mtp_layer=None):
+    """The Route B recipe for arch/qwen35moe_fp8 or arch/qwen4exp: the GGUF decides the bits, the
+    recipe picks the nearest format the architecture serves."""
+    if arch == "qwen4exp":
+        return _fast_recipe_4exp(rows, gguf, gptq=gptq, mtp=mtp, mtp_layer=mtp_layer)
     lines = ["# Generated by tools/ud_map/ud_map.py from %s" % os.path.basename(gguf),
              "# The GGUF is the MAP. The routed experts take the nearest fast codebook format to",
              "# Unsloth's K-quant (Q4_K -> w4nl64a8h, Q5_K/Q6_K/Q8_0 -> w5nl64a8h); the dense Q8_0",
@@ -382,6 +492,84 @@ def _fast_recipe(rows, gguf, gptq=False, mtp=None):
     return "\n".join(lines) + "\n"
 
 
+def _fast_recipe_4exp(rows, gguf, gptq=False, mtp=None, mtp_layer=None):
+    """The Flash-Next Route B recipe: UD formats -> the kernels the build already serves.
+
+    Routed experts take the nearest rotated codebook form (IQ4_NL/IQ4_XS -> w4nl64a8h, Q5_0 ->
+    w5nl64a8h, IQ3_XXS/IQ2_S/Q2_0 -> w3nl64a8h). Q2_0's native q20a16 is smaller but unrotated,
+    and its layers' gate/up are IQ2_S, so MoeFP8's one-encoding-per-layer rule keeps it in the
+    codebook family. The dense Q6_K/Q8_0 trunk keeps its own dense formats (the kernels exist;
+    the qwen4exp arch wiring is lane L3). The PLE n-gram table stays IQ4_NL (the wired gather);
+    the token embedding stays bf16 for the early path. The kept MTP layer (blk.48) experts take
+    w4nl64 by default, because a whole layer left bf16 is refused ("the sort places at most 8").
+    """
+    lines = ["# Generated by tools/ud_map/ud_map.py from %s" % os.path.basename(gguf),
+             "# Flash-Next FAST path: the UD map's formats mapped onto the kernels that exist.",
+             "# Routed experts: IQ4_NL/IQ4_XS -> w4nl64a8h, Q5_0 -> w5nl64a8h,",
+             "# IQ3_XXS/IQ2_S/Q2_0 -> w3nl64a8h (kernel present; the qwen4exp arch must",
+             "# declare it; Q2_0 stays in the rotated family, see _fast_dtype). All are rotated",
+             "# codebooks, so one layer keeps one encoding family. This is the early, not",
+             "# format-faithful, path. Dense Q6_K/Q8_0 keep their own dense formats; the",
+             "# qwen4exp dense wiring is L3, so a conversion stops on those until it lands",
+             "# (3.52 GiB). The source is bf16: convert with",
+             "# --set quantization_config.quant_method=fp8.",
+             ""]
+    lines.append("# routed experts: one rule per layer, because the map's mix differs by layer")
+    expert = collections.defaultdict(dict)
+    for r in rows:
+        m = re.fullmatch(r"blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight", r["name"])
+        if not m:
+            continue
+        layer, kind = int(m.group(1)), "down" if m.group(2) == "down" else "gate_up"
+        expert[layer].setdefault(kind, []).append(r["type"])
+    for layer in sorted(expert):
+        e = expert[layer]
+        for kind, pattern in (("gate_up", "ffn_gate_up_exps"), ("down", "ffn_down_exps")):
+            if kind not in e:
+                continue
+            ty = max(e[kind], key=lambda x: TYPES.get(x, UNKNOWN_TYPE)[0] or 0)
+            rule = _expert_rule(ty, gptq)
+            if rule is None:
+                lines.append(f"# blk.{layer}.{pattern}: {ty} has no fast format")
+                continue
+            lines.append(f"blk.{layer}.{pattern}.*.weight".ljust(40) + " " + rule +
+                         f"   # {ty} -> {FAST_EXPERTS[ty][0]}")
+    if mtp in (None, "") and mtp_layer is not None:
+        mtp = "w4nl64"          # a whole bf16 expert layer is refused by the arch
+    if mtp in ("w4nl64", "w5nl64") and mtp_layer is not None:
+        rule = _expert_rule("Q4_K" if mtp == "w4nl64" else "Q5_K", gptq)
+        for pattern in ("ffn_gate_up_exps", "ffn_down_exps"):
+            lines.append(f"blk.{mtp_layer}.{pattern}.*.weight".ljust(40) + " " + rule +
+                         f"   # MTP layer -> {mtp}")
+    lines.append("")
+    ple = next((r.get("target") for r in rows
+                if r.get("target") and (r.get("role") == "ple-table" or
+                                        r["target"].endswith("ple_ngram.weight"))), None)
+    if ple:
+        lines.append("# the PLE n-gram table: the native IQ4_NL the gather kernel reads")
+        lines.append(ple.ljust(40) + " ggml type=iq4_nl   # IQ4_NL (native, PLE gather)")
+        lines.append("")
+    lines.append("# dense Q6_K/Q8_0: their own dense formats (qwen4exp wiring: L3)")
+    written = set()
+    for r in rows:
+        tgt, ty = r.get("target"), r.get("type")
+        if not tgt or "*" in tgt or ty not in ("Q6_K", "Q8_0"):
+            continue
+        if r.get("role") == "ple-table" or tgt.endswith("ple_ngram.weight"):
+            continue
+        if tgt == "token_embd.weight":
+            continue
+        key = (tgt, ty)
+        if key in written:
+            continue
+        written.add(key)
+        lines.append(f"{tgt:40s} ggml type={TYPES[ty][1]}   # {ty} -> {ty.lower()} (L3)")
+    lines.append("")
+    lines.append("# token_embd.weight (IQ4_XS) is kept bf16 for the early path (1.186 GiB);")
+    lines.append("# q8_0 would be 0.630 GiB once L3 wires the embedding.")
+    return "\n".join(lines) + "\n"
+
+
 def compute_plan(args):
     kv, ts = load_all(args.gguf)
     arch = kv.get("general.architecture", "?")
@@ -417,12 +605,16 @@ def compute_plan(args):
     name_set = set(names)
     for r in rows:
         if policy == "fast":
-            if r["kind"] == "unknown":
+            fd = _fast_dtype(arch, r)
+            if fd is None:
+                r["fast_dtype"] = r["fast_bpw"] = r["fast_dep"] = None
+                r["fast_servable"] = False
+                r["fast_bytes"] = r["bytes"]
                 r["servable"] = False
-            elif "*" in (r["target"] or ""):
-                r["servable"] = r["type"] in FAST_EXPERTS
             else:
-                r["servable"] = r["type"] in ("Q8_0", "F32", "F16", "BF16")
+                r["fast_dtype"], r["fast_bpw"], r["fast_servable"], r["fast_dep"] = fd
+                r["fast_bytes"] = _fast_bytes(r, r["fast_dtype"], r["fast_bpw"])
+                r["servable"] = r["fast_servable"]
         else:
             ty = r["type"]
             if ty in ("Q6_K", "Q8_0"):
@@ -444,6 +636,9 @@ def compute_plan(args):
                 r["declared_found"] = 1 if tgt in name_set else 0
         if r["kind"] == "unknown":
             r["servable"] = False
+            if policy == "fast":
+                r["fast_servable"] = False
+                r["fast_dtype"] = None
 
     # declared weights the map does not cover: the MTP head and the vision tower (the UD text GGUF
     # leaves them out), plus i64 metadata. They are kept from the bf16 source.
@@ -526,9 +721,61 @@ def compute_plan(args):
                    for ty in {r["type"] for r in rows}), key=lambda x: -x[1])
     ok_bytes = sum(r["bytes"] for r in rows if r["servable"])
 
+    fast = None
+    mtp_kept_layer = None
+    for k in kept:
+        m = re.match(r"blk\.(\d+)\.", k["name"])
+        if m and _kept_group(k["name"]) == "mtp":
+            mtp_kept_layer = max(mtp_kept_layer or 0, int(m.group(1)))
     if policy == "fast":
+        fast_map = sum(r["fast_bytes"] for r in rows)
+        fast_total = fast_map + kept_bytes + derived_bytes
+        fast_ok = sum(r["fast_bytes"] for r in rows if r["fast_servable"])
+        mtp_variant = getattr(args, "mtp_variant", None)
+        if arch == "qwen4exp" and mtp_variant in (None, ""):
+            # The fast recipe always writes the kept MTP layer (a whole bf16 expert layer is
+            # refused by the arch); w4nl64 is the measured production choice.
+            mtp_variant = "w4nl64"
+        mtp_delta = 0
+        if mtp_variant in ("w4nl64", "w5nl64") and mtp_kept_layer is not None:
+            for k in kept:
+                if (k["name"].startswith(f"blk.{mtp_kept_layer}.") and
+                        re.search(r"ffn_(?:gate_up|gate|up|down)_exps\.", k["name"])):
+                    mtp_delta += _kept_bytes(k, mtp_variant) - k["bytes"]
+            fast_ok += mtp_delta
+        # Kept/derived weights are served as bf16 (or the chosen MTP form), so they count here.
+        fast_ok += kept_bytes + derived_bytes
+        ok_bytes = fast_ok
+        fb = collections.OrderedDict()
+        for r in rows:
+            k = (r["fast_dtype"], r["type"], r["fast_dep"] or "", r["fast_servable"])
+            a = fb.setdefault(k, [0, 0, 0])
+            a[0] += 1
+            a[1] += r["bytes"]
+            a[2] += r["fast_bytes"]
+        fast_by = [dict(dtype=d, ud_type=ty, dep=dep, servable=ok, n=n, ud_bytes=b,
+                        bytes=fb_) for (d, ty, dep, ok), (n, b, fb_) in
+                   sorted(fb.items(), key=lambda kv: -kv[1][2])]
+        fast_cov = {}
+        for r in rows:
+            if r["target"]:
+                fast_cov.setdefault(r["target"], r["fast_dtype"])
+        fast_missing = [t for t, d in fast_cov.items() if d is None]
+        fast_largest = [dict(name=r["name"], target=r["target"], type=r["type"],
+                             dtype=r["fast_dtype"], bytes=r["fast_bytes"],
+                             dep=r["fast_dep"]) for r in
+                        sorted(rows, key=lambda r: -r["fast_bytes"])[:15]]
+        fast = dict(map_bytes=fast_map, total_bytes=fast_total,
+                    build_bytes=fast_total + mtp_delta, kept_bytes=kept_bytes,
+                    derived_bytes=derived_bytes, servable_bytes=fast_ok,
+                    mtp_variant=mtp_variant, mtp_variant_delta=mtp_delta,
+                    by=fast_by, largest=fast_largest,
+                    coverage=dict(targets=len(fast_cov),
+                                  covered=len(fast_cov) - len(fast_missing),
+                                  missing=fast_missing))
         recipe = _fast_recipe(rows, args.gguf[-1], gptq=getattr(args, "gptq", False),
-                              mtp=getattr(args, "mtp_variant", None))
+                              mtp=mtp_variant, arch=arch,
+                              mtp_layer=mtp_kept_layer)
     else:
         recipe = _mirror_recipe(rows, args.gguf[-1])
     return dict(tool="ud_map 0.2", arch=arch, policy=policy, map=list(args.gguf),
@@ -539,8 +786,9 @@ def compute_plan(args):
                             map_bpw=(map_bits / map_elems if map_elems else 0),
                             servable_bytes=ok_bytes),
                 variations=variations, mtp_variations=mtp_variations,
-                mtp_layer=mtp_layer, tensors=rows, kept=kept, derived=derived,
-                unmapped=unmapped,
+                mtp_layer=mtp_layer, mtp_kept_layer=mtp_kept_layer,
+                tensors=rows, kept=kept, derived=derived,
+                unmapped=unmapped, fast=fast,
                 fusion_problems=problems, coverage=dict(declared=len(cov),
                                                         missing=missing),
                 recipe=recipe), by, missing, tsum
@@ -566,20 +814,58 @@ def plan(args):
         groups = collections.Counter(re.sub(r'^blk\.\d+\.', 'blk.*.', t) for t in missing)
         print('  no declared weight for: ' + ', '.join(f'{k} x{n}' for k, n in groups.most_common(6)))
     ok_bytes = data["totals"]["servable_bytes"]
-    print(f'servable by the current build: {ok_bytes/2**30:.3f} GiB ({100*ok_bytes/total:.1f}% of the total); '
-          f'blocked on kernels: {(total-ok_bytes)/2**30:.3f} GiB')
+    fast = data.get("fast")
+    servable_base = fast["build_bytes"] if fast else total
+    print(f'servable by the current build: {ok_bytes/2**30:.3f} GiB '
+          f'({100*ok_bytes/servable_base:.1f}% of the {"fast build" if fast else "total"}); '
+          f'blocked on kernels: {(servable_base-ok_bytes)/2**30:.3f} GiB')
     print('  by type (GiB): ' + ', '.join(f'{ty} {b/2**30:.2f}' for ty, b in tsum))
+    if fast:
+        print('\nfast mapping (UD type -> served kernel):')
+        print(f'  {"fast dtype":12s}{"UD type":10s}{"servable":9s}{"depends":38s}'
+              f'{"n":>4s}{"UD GiB":>9s}{"fast GiB":>10s}')
+        for x in fast["by"]:
+            print(f'  {(x["dtype"] or "-"):12s}{(x["ud_type"] or "-"):10s}'
+                  f'{"yes" if x["servable"] else "NO":9s}{(x["dep"] or "-"):38s}'
+                  f'{x["n"]:4d}{x["ud_bytes"]/2**30:9.3f}{x["bytes"]/2**30:10.3f}')
+        delta = (fast["total_bytes"] - total) / 2**30
+        print(f'fast total (MTP kept bf16, like the UD plan): {fast["total_bytes"]/2**30:.3f} GiB '
+              f'(map {fast["map_bytes"]/2**30:.3f} + kept {fast["kept_bytes"]/2**30:.3f} '
+              f'+ derived {fast["derived_bytes"]/2**30:.3f}); '
+              f'delta vs the UD plan {total/2**30:.3f} GiB: {delta:+.3f} GiB')
+        if fast.get("mtp_variant") in ("w4nl64", "w5nl64"):
+            print(f'  MTP layer {data.get("mtp_kept_layer")} at {fast["mtp_variant"]}: '
+                  f'{fast["mtp_variant_delta"]/2**30:+.3f} GiB vs kept; '
+                  f'what the fast recipe writes: {fast["build_bytes"]/2**30:.3f} GiB')
+        cov_f = fast["coverage"]
+        print(f'fast coverage: {cov_f["covered"]}/{cov_f["targets"]} distinct declared targets '
+              f'have a selected fast dtype')
+        if cov_f["missing"]:
+            groups = collections.Counter(re.sub(r'^blk\.\d+\.', 'blk.*.', t)
+                                         for t in cov_f["missing"])
+            print('  no fast dtype for: ' + ', '.join(f'{k} x{n}' for k, n in
+                                                      groups.most_common(6)))
+        print(f'fast servable by the current build: {fast["servable_bytes"]/2**30:.3f} GiB '
+              f'({100*fast["servable_bytes"]/fast["build_bytes"]:.1f}% of the fast build); '
+              f'blocked: {(fast["build_bytes"]-fast["servable_bytes"])/2**30:.3f} GiB '
+              f'(w3nl64 arch + L3 dense)')
+        print('\nlargest targets by fast size:')
+        print(f'  {"target":40s}{"UD":9s}{"fast":10s}{"GiB":>9s}  depends')
+        for x in fast["largest"]:
+            print(f'  {(x["target"] or x["name"]):40s}{x["type"]:9s}{(x["dtype"] or "-"):10s}'
+                  f'{x["bytes"]/2**30:9.3f}  {x["dep"] or "-"}')
     variations = data["variations"]
     if variations:
         base = next((x for x in variations if x["mtp"] == "keep" and x["vision"] == "keep"), None)
-        print('\nkept-weight variations (MTP layer blk.48 + mtp.*, vision v.*): total container')
+        _mn = data.get("mtp_kept_layer") or data.get("mtp_layer")
+        print(f'\nkept-weight variations (MTP layer blk.{_mn} + mtp.*, vision v.*): total container')
         print(f'  {"MTP":8s}{"vision":8s}{"total GiB":>11s}{"delta GiB":>11s}')
         for x in variations:
             delta = (x["total_bytes"] - base["total_bytes"]) / 2**30 if base else 0.0
             print(f'  {x["mtp"]:8s}{x["vision"]:8s}{x["total_bytes"]/2**30:11.3f}{delta:11.3f}')
     mtp_variations = data.get("mtp_variations") or []
     if mtp_variations:
-        print(f'\nMTP layer {data.get("mtp_layer")} experts (map size; the draft-only lever)')
+        print(f'\nlast expert layer {data.get("mtp_layer")} experts (map size; the draft-only lever)')
         print(f'  {"format":8s}{"layer GiB":>11s}{"total GiB":>11s}{"delta GiB":>11s}')
         for x in mtp_variations:
             print(f'  {x["mtp"]:8s}{x["mtp_bytes"]/2**30:11.3f}'
