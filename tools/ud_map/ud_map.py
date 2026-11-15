@@ -352,7 +352,7 @@ def _mirror_recipe(rows, gguf, mtp=None, mtp_layer=None):
         for pattern in ("ffn_gate_up_exps", "ffn_down_exps"):
             lines.append(f"blk.{mtp_layer}.{pattern}.*.weight".ljust(40) + " " + rule +
                          f"   # kept MTP layer -> {mtp}")
-        return "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n"
 
 
 # The dense trunk the qwen35moe_fp8 container serves as block FP8, and the draft head it derives
@@ -496,6 +496,82 @@ def _fast_recipe(rows, gguf, gptq=False, mtp=None, arch="qwen35moe", mtp_layer=N
     lines.append("mtp.draft_head.weight".ljust(40) + " " + FAST_DRAFT)
     return "\n".join(lines) + "\n"
 
+
+def _expert_choices(rows):
+    """Per-layer choice between the GGUF-native family and the rotated codebook family.
+
+    MoeFP8 keeps one encoding family per layer, so the choice is made for the layer's gate/up and
+    down projections together. The native family is exactly the UD map; the rotated family is the
+    FAST_EXPERTS mapping. The measured .rad sizes show native IQ3_XXS carries ~5% extra plane
+    overhead and w3nl is smaller there, while IQ2_S/Q2_0 are genuinely smaller native; the
+    per-layer comparison still picks the family with the smaller total.
+    """
+    groups = collections.defaultdict(lambda: collections.defaultdict(list))
+    for r in rows:
+        m = re.fullmatch(r"blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight", r["name"])
+        if not m:
+            continue
+        layer, kind = int(m.group(1)), "down" if m.group(2) == "down" else "gate_up"
+        groups[layer][kind].append(r)
+    out = {}
+    for layer, kinds in groups.items():
+        native = sum(r["bytes"] for rs in kinds.values() for r in rs)
+        fast = 0
+        for rs in kinds.values():
+            for r in rs:
+                entry = FAST_EXPERTS.get(r["type"])
+                if entry is None:
+                    fast += r["bytes"]
+                else:
+                    label = entry[0]
+                    fast += _fast_bytes(r, label, FAST_BPW[label])
+        out[layer] = dict(kinds=kinds, native=native, fast=fast, use_fast=fast < native)
+    return out
+
+
+def _size_map_bytes(rows):
+    """The map's size after the per-layer family choice."""
+    saved = sum(c["native"] - c["fast"] for c in _expert_choices(rows).values()
+                if c["use_fast"])
+    return sum(r["bytes"] for r in rows) - saved
+
+
+def _size_recipe_4exp(rows, gguf, mtp=None, mtp_layer=None):
+    """The size policy: one rule per layer, choosing the smaller encoding family.
+
+    The mirror recipe is reused for every non-expert rule; its expert rules are removed first so
+    the chosen layer rule is the only one for that target. Mixing native and rotated projections
+    inside one layer is not used: MoeFP8 refuses it.
+    """
+    mirror = _mirror_recipe(rows, gguf, mtp=mtp, mtp_layer=mtp_layer).splitlines()
+    expert_rule = re.compile(r"^blk\.\d+\.ffn_(?:gate_up|down)_exps\.\*\.weight\s")
+    lines = [line for line in mirror if not expert_rule.match(line)]
+    lines.append("")
+    lines.append("# SIZE path: one rule per expert layer, the smaller of native and rotated")
+    for layer, c in sorted(_expert_choices(rows).items()):
+        for kind, pattern in (("gate_up", "ffn_gate_up_exps"), ("down", "ffn_down_exps")):
+            if kind not in c["kinds"]:
+                continue
+            ty = max({r["type"] for r in c["kinds"][kind]},
+                     key=lambda x: TYPES.get(x, UNKNOWN_TYPE)[0] or 0)
+            if c["use_fast"]:
+                rule = _expert_rule(ty, False)
+                if rule is None:
+                    continue
+                lines.append(f"blk.{layer}.{pattern}.*.weight".ljust(40) + " " + rule +
+                             f"   # {ty} -> {FAST_EXPERTS[ty][0]} (size)")
+            else:
+                spell = TYPES.get(ty, UNKNOWN_TYPE)[1]
+                if spell is None:
+                    continue
+                lines.append(f"blk.{layer}.{pattern}.*.weight".ljust(40) +
+                             f" ggml type={spell}   # {ty} (native, size)")
+    if mtp in ("w4nl64", "w5nl64") and mtp_layer is not None:
+        rule = _expert_rule("Q4_K" if mtp == "w4nl64" else "Q5_K", False)
+        for pattern in ("ffn_gate_up_exps", "ffn_down_exps"):
+            lines.append(f"blk.{mtp_layer}.{pattern}.*.weight".ljust(40) + " " + rule +
+                         f"   # kept MTP layer -> {mtp}")
+    return "\n".join(lines) + "\n"
 
 def _fast_recipe_4exp(rows, gguf, gptq=False, mtp=None, mtp_layer=None):
     """The Flash-Next Route B recipe: UD formats -> the kernels the build already serves.
@@ -734,6 +810,7 @@ def compute_plan(args):
     ok_bytes = sum(r["bytes"] for r in rows if r["servable"])
 
     fast = None
+    size = None
     mtp_kept_layer = None
     n_layers = 0
     for r in rows:
@@ -802,6 +879,18 @@ def compute_plan(args):
             mirror_variant = "w4nl64"
         recipe = _mirror_recipe(rows, args.gguf[-1], mtp=mirror_variant,
                                 mtp_layer=mtp_kept_layer)
+        if policy == "size":
+            choices = _expert_choices(rows)
+            size_map = _size_map_bytes(rows)
+            size = dict(map_bytes=size_map, saved_bytes=map_bytes - size_map,
+                        by_layer=[dict(layer=l, native=c["native"], fast=c["fast"],
+                                       use_fast=c["use_fast"])
+                                  for l, c in sorted(choices.items())])
+            map_bytes = size_map
+            total = map_bytes + kept_bytes + derived_bytes
+            ok_bytes = total
+            recipe = _size_recipe_4exp(rows, args.gguf[-1], mtp=mirror_variant,
+                                       mtp_layer=mtp_kept_layer)
     return dict(tool="ud_map 0.2", arch=arch, policy=policy, map=list(args.gguf),
                 declared_plan=getattr(args, "declared", None),
                 source=getattr(args, "source", None),
@@ -812,7 +901,7 @@ def compute_plan(args):
                 variations=variations, mtp_variations=mtp_variations,
                 mtp_layer=mtp_layer, mtp_kept_layer=mtp_kept_layer,
                 tensors=rows, kept=kept, derived=derived,
-                unmapped=unmapped, fast=fast,
+                unmapped=unmapped, fast=fast, size=size,
                 fusion_problems=problems, coverage=dict(declared=len(cov),
                                                         missing=missing),
                 recipe=recipe), by, missing, tsum
@@ -825,9 +914,13 @@ def plan(args):
     map_bytes = data["totals"]["map_bytes"]
     kept_bytes = data["totals"]["kept_bytes"]
     rows, kept = data["tensors"], data["kept"]
-    print(f"{arch}: {len(rows)} mapped tensors, {map_bytes/2**30:.3f} GiB in Unsloth's formats, "
+    label = "chosen formats" if data["policy"] == "size" else "Unsloth's formats"
+    print(f"{arch}: {len(rows)} mapped tensors, {map_bytes/2**30:.3f} GiB in {label}, "
           f"{kept_bytes/2**30:.3f} GiB kept from the bf16 source (not in the map), "
           f"total {total/2**30:.3f} GiB")
+    if data.get("size"):
+        print(f'size policy: saved {data["size"]["saved_bytes"]/2**30:.3f} GiB by choosing the '
+              f'smaller per-layer family')
     print(f'{"role":24s}{"ggml":9s}{"target":30s}{"servable":9s}{"n":>4s}{"GiB":>9s}')
     for (role, ty, tgt, ok), (n, b) in sorted(by.items(), key=lambda kv: -kv[1][1]):
         print(f'{(role or "?"):24s}{ty:9s}{(tgt or "-"):30s}{"yes" if ok else "NO":9s}'
@@ -2322,7 +2415,7 @@ def main():
     p.add_argument("--json")
     p.add_argument("--mtp", default="keep", help="comma list of keep,bf16,fp8,q8_0,w4nl64,w5nl64")
     p.add_argument("--vision", default="keep", help="comma list of keep,bf16,fp8,q8_0,w4nl64,w5nl64")
-    p.add_argument("--policy", choices=["mirror", "fast", "auto"], default="mirror")
+    p.add_argument("--policy", choices=["mirror", "fast", "size", "auto"], default="mirror")
     p.add_argument("--gptq", action="store_true", help="with --policy fast: the calibrated recipe")
     p.add_argument("--mtp-variant", choices=["keep", "bf16", "fp8", "q8_0", "w4nl64", "w5nl64"],
                    help="with --policy fast: the MTP layer's expert format")
@@ -2333,7 +2426,7 @@ def main():
     b.add_argument("--source", required=True)
     b.add_argument("--out", required=True)
     b.add_argument("--declared")
-    b.add_argument("--policy", choices=["mirror", "fast", "auto"], default="auto")
+    b.add_argument("--policy", choices=["mirror", "fast", "size", "auto"], default="auto")
     b.add_argument("--source-quant", choices=["auto", "bf16", "quantised", "gguf", "unknown"],
                    default="auto")
     b.add_argument("--imatrix")
@@ -2376,7 +2469,7 @@ def main():
     c.add_argument("--imatrix")
     c.add_argument("--set", action="append", default=[])
     c.add_argument("--auto-fp8", action=argparse.BooleanOptionalAction, default=True)
-    c.add_argument("--policy", choices=["mirror", "fast", "auto"], default="auto")
+    c.add_argument("--policy", choices=["mirror", "fast", "size", "auto"], default="auto")
     c.add_argument("--mtp-variant", choices=["keep", "bf16", "fp8", "q8_0", "w4nl64", "w5nl64"])
     c.add_argument("--calibrate-only", action="store_true")
     c.add_argument("--convert-only", action="store_true")
@@ -2423,7 +2516,7 @@ def main():
     va = sp.add_parser("variations", help="the size table and, per container, decode/acceptance/TTFT")
     va.add_argument("gguf", nargs="+")
     va.add_argument("--declared")
-    va.add_argument("--policy", choices=["mirror", "fast", "auto"], default="auto")
+    va.add_argument("--policy", choices=["mirror", "fast", "size", "auto"], default="auto")
     va.add_argument("--mtp", default="keep")
     va.add_argument("--vision", default="keep")
     va.add_argument("--mtp-variant", choices=["keep", "bf16", "fp8", "q8_0", "w4nl64", "w5nl64"])

@@ -236,7 +236,7 @@ class FastFlashNext(unittest.TestCase):
         self.assertNotIn("ggml type=q2_0", text)
         self.assertIn("blk.1.ple_ngram.weight", text)
         self.assertIn("ggml type=iq4_nl", text)
-        self.assertRegex(text, r"output\.weight.*ggml type=q6_k")
+        self.assertRegex(text, r"output\.weight.*codes=i8")
         self.assertRegex(text, r"blk\.0\.ssm_out\.weight.*ggml type=q8_0")
         self.assertNotIn("has no fast format", text)
 
@@ -303,13 +303,15 @@ class MirrorFlashNext(unittest.TestCase):
             "blk.2.ffn_down_exps.*.weight": "q2_0",         # TYPE42 down
             "blk.1.ple_ngram.weight": "iq4_nl",             # PLE n-gram table
             "token_embd.weight": "iq4_xs",                  # token embedding
-            "output.weight": "q6_k",
             "blk.0.ssm_out.weight": "q8_0",
             "blk.0.ffn_gate_up_shexp.weight": "q6_k",
         }
         for target, spell in expected.items():
             self.assertRegex(text, re.escape(target) + r"\s+ggml type=" + re.escape(spell),
                              f"{target} should keep {spell}")
+        # The Q6_K head has no logits row; it is the served int8 head, not a q6_K mirror.
+        self.assertRegex(text, r"output\.weight\s+rtn\s+codes=i8")
+        self.assertNotRegex(text, r"output\.weight\s+ggml type=q6_k")
 
     def test_mixed_projection_formats_are_preserved(self):
         # UD mixes gate/up and down within a layer; the mirror recipe must not flatten it.
@@ -329,8 +331,10 @@ class MirrorFlashNext(unittest.TestCase):
         self.assertNotIn("ffn_gate_inp", text)
         # The mirror recipe is not the fast path.
         self.assertNotIn("table=", text)
-        self.assertNotIn("rtn ", text)
         self.assertNotIn("gptq ", text)
+        # output.weight is the one served int8 exception, not a fast expert table.
+        self.assertNotIn("ffn", "".join(line for line in text.splitlines()
+                                        if line.startswith("output.weight")))
 
     def test_one_rule_per_target_and_type(self):
         text = ud_map._mirror_recipe(_rows_4exp(), "m.gguf")
@@ -343,6 +347,50 @@ class MirrorFlashNext(unittest.TestCase):
         a = argparse.Namespace(policy="auto")
         self.assertEqual(ud_map._choose_policy(a, "qwen4exp"), "mirror")
         self.assertEqual(ud_map._choose_policy(a, "qwen35moe"), "fast")
+
+
+class SizePolicy(unittest.TestCase):
+    def _rows(self):
+        rows = _rows_4exp()
+        for r in rows:
+            elems = 1
+            for x in r["shape"]:
+                elems *= x
+            r["bytes"] = int(elems * ud_map.TYPES[r["type"]][0] / 8)
+        return rows
+
+    def test_per_layer_choice_keeps_the_small_native_family(self):
+        choices = ud_map._expert_choices(self._rows())
+        # blk.0 (IQ3_XXS gate/up + IQ4_NL down) takes the smaller rotated family.
+        self.assertTrue(choices[0]["use_fast"])
+        # blk.1 (IQ4_XS gate/up + Q5_0 down) also takes it.
+        self.assertTrue(choices[1]["use_fast"])
+        # blk.2 (IQ2_S gate/up + Q2_0 down) is much smaller native.
+        self.assertFalse(choices[2]["use_fast"])
+
+    def test_size_map_is_below_both_families(self):
+        rows = self._rows()
+        native = sum(r["bytes"] for r in rows)
+        size_map = ud_map._size_map_bytes(rows)
+        self.assertLess(size_map, native)
+        self.assertLess(size_map, sum(
+            ud_map._fast_bytes(r, ud_map.FAST_EXPERTS[r["type"]][0],
+                               ud_map.FAST_BPW[ud_map.FAST_EXPERTS[r["type"]][0]])
+            if r["name"].endswith("_exps.weight") else r["bytes"] for r in rows))
+
+    def test_recipe_overrides_only_the_chosen_layers(self):
+        text = ud_map._size_recipe_4exp(self._rows(), "m.gguf")
+        self.assertRegex(text, r"blk\.0\.ffn_gate_up_exps\.\*\.weight.*table=w3nl")
+        self.assertRegex(text, r"blk\.0\.ffn_down_exps\.\*\.weight.*table=w4nl")
+        self.assertRegex(text, r"blk\.1\.ffn_gate_up_exps\.\*\.weight.*table=w4nl")
+        self.assertRegex(text, r"blk\.2\.ffn_gate_up_exps\.\*\.weight\s+ggml type=iq2_s")
+        self.assertRegex(text, r"blk\.2\.ffn_down_exps\.\*\.weight\s+ggml type=q2_0")
+        self.assertRegex(text, r"token_embd\.weight\s+ggml type=iq4_xs")
+        self.assertNotIn("blk.2.ffn_gate_up_exps.*.weight          rtn", text)
+
+    def test_choose_policy_accepts_size(self):
+        a = argparse.Namespace(policy="size")
+        self.assertEqual(ud_map._choose_policy(a, "qwen4exp"), "size")
 
 
 class Build(unittest.TestCase):
