@@ -432,7 +432,10 @@ private:
         try {
             threads_.emplace_back([this] { work(); });
         } catch (const std::system_error& e) {
-            RAD_WARN("server: cannot start an HTTP worker (%s); the connection waits", e.what());
+            /* An OS message carries no socket bytes, but it is still text this log must not
+             * pass through unsanitized -- every other catch here reads it through log_sanitize. */
+            RAD_WARN("server: cannot start an HTTP worker (%s); the connection waits",
+                     log_sanitize(e.what()).c_str());
             return false;
         }
         ++free_;
