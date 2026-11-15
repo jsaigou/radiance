@@ -2725,6 +2725,53 @@ TEST(q6k_and_q80_dense_weights_take_the_ggml_gemm_rows) {
     CHECK_EQ(codes_i8, 1);
     CHECK_EQ(scale_f16, 1);
 
+    /* At issue the Q6_K row needs all three weight planes: codes (`b`), the per-16 scale
+     * (`b_scale`) and the per-256 super-scale (`b_ref`, operand 6). The row refuses the launch
+     * when any is absent, which is what a Q6_K trunk looked like before `declare` stored the
+     * branch on the linear: the plan declared `b_ref` but `step` fell through to the fp8 form and
+     * issued none. Check the shared expert's own issue too. */
+    std::unique_ptr<Kit> k = kit(b, {}, { 101 });
+    RadCtx run{};
+    run.b = &b;
+    run.batch = &k->b;
+    qwen4exp_fp8::step(&run, &k->b);
+    auto wh = [&](const char* name) -> uint32_t {
+        for (size_t i = 0; i < b.weights.size(); ++i)
+            if (b.weights[i].name == name) return (uint32_t)(i + 1);
+        return 0;
+    };
+    const uint32_t shared_codes = wh("blk.0.ffn_gate_up_shexp.weight");
+    const uint32_t shared_ref = wh("blk.0.ffn_gate_up_shexp.scale1");
+    REQUIRE(shared_ref != 0 && shared_codes != 0);
+    int q6k_steps = 0, q80_steps = 0, shared_steps = 0;
+    for (const RecIssue& i : run.issues) {
+        const RecOp* o = b.op_of(i.op);
+        if (!o || o->op != "gemm_nt_q") continue;
+        std::string dt;
+        for (const auto& p : o->p) if (p.key == "dtype") dt = p.sval;
+        if (dt != "q6k" && dt != "q80a16") continue;
+        REQUIRE_EQ(i.opd.size(), (size_t)7);
+        CHECK(i.opd[0].handle != 0);              /* the bf16 activation, no quantiser pair */
+        CHECK_EQ(i.opd[1].handle, 0u);            /* no a_scale */
+        CHECK_EQ(i.opd[5].handle, 0u);            /* no a_sum */
+        CHECK(i.opd[2].handle != 0);              /* codes */
+        CHECK(i.opd[3].handle != 0);              /* scale */
+        if (dt == "q6k") {
+            ++q6k_steps;
+            CHECK(i.opd[6].handle != 0);          /* scale.1 arrives as b_ref */
+            if (i.opd[6].handle == shared_ref) {
+                ++shared_steps;
+                CHECK_EQ(i.opd[2].handle, shared_codes);
+            }
+        } else {
+            ++q80_steps;
+            CHECK_EQ(i.opd[6].handle, 0u);        /* Q8_0 has no third plane */
+        }
+    }
+    CHECK(q6k_steps > 0);
+    CHECK(q80_steps > 0);
+    CHECK_EQ(shared_steps, 1);   /* layer 0's shared gate/up, the failing M=101 launch */
+
     /* The same planes at two ranks: ssm_out and the shared down are column slices, the trunk
      * in/out row slices. Both must be whole Q6_K/Q8_0 blocks. */
     RadBuildCtx c2 = build_ctx(0, 2);

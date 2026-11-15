@@ -100,6 +100,21 @@ are mapped by `ud_map` to the served `fp8_e4m3` + f32-per-group rows (down group
 — the production recipe's form, essentially the same bytes. Q8_0 stays exact for the dense GEMMs;
 the connection rows lose their 8-bit codes to E4M3.
 
+### Issue-time wiring (branch `kernel-q6k-shared`, 2026-11-15)
+
+The declaration above was right, but `LinearFP8::declare` kept the branch in `const bool` locals
+that shadowed its `q6k`/`q80` members, so `step` never saw them: the plan declared `gemm_nt_q` with
+`codes`, `scale` and `scale.1` (operand 6, `b_ref`) while the issue fell through to the fp8 form and
+passed no `b_ref`. The Q6_K row checks all five operands (`q6k_args` reads `a`, `b`, `b_scale`, `y`
+and `b_ref`), so the first Q6_K GEMM of the step -- the shared expert's fused `ffn_gate_up_shexp` at
+`N=16384 K=2560`, M=101 -- was refused with `RAD_E_INVAL` ("invalid argument"). The shared arm was
+already `LinearFP8` (`sh_gate_up`, `sh_down` in `rad_block_moe_fp8.h`), so no separate shared row
+existed to fix; the trunk, the shared gate/up and the shared down were all affected.
+
+`declare` now stores the flags on the members. The arch test issues one step and checks every Q6_K
+issue carries all three weight planes with `scale.1` on operand 6 (and Q8_0 none), including the
+shared expert's own issue at M=101.
+
 ### Out of scope (not in this map)
 
 Q8_0 `token_embd` does not occur (the map's embedding is IQ4_XS, L2) and the MTP layer is kept from
