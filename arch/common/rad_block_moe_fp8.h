@@ -885,6 +885,17 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
                 const char* nmv[2];
                 fmt_of(e, enc, fe, nmv);
                 if (fe[0] == 3 && fe[1] == 3) continue;
+                for (int i = 0; i < 2; ++i)
+                    if (fe[i] < 0) {
+                        char en[256];
+                        rad_enc_format(&enc[i], en, sizeof en);
+                        fprintf(stderr, "radiance: '%s' is %s, and the routed experts' %s "
+                                        "projection is served as block fp8, four-bit, the rotated "
+                                        "codebook, IQ4_NL, Q5_0, Q2_0, IQ3_XXS, IQ2_S or plain "
+                                        "bf16. Convert it with a recipe that makes one of them.\n",
+                                nmv[i], en, i ? "down" : "gate_up");
+                        return RAD_E_DTYPE;
+                    }
                 if (fe[0] == 3 || fe[1] == 3) {
                     fprintf(stderr, "radiance: layer %d's gate_up experts are %s but its down "
                                     "experts are %s; a plain bf16 projection beside a quantised "
@@ -909,6 +920,17 @@ inline int MoeFP8::declare(RadBuilder* b, Names& nm, const Geom& geom, int l,
             int fe[2];
             const char* names[2];
             fmt_of(e, enc, fe, names);
+            for (int i = 0; i < 2; ++i)
+                if (fe[i] < 0) {
+                    char en[256];
+                    rad_enc_format(&enc[i], en, sizeof en);
+                    fprintf(stderr, "radiance: '%s' is %s, and the routed experts' %s projection "
+                                    "is served as block fp8, four-bit, the rotated codebook, "
+                                    "IQ4_NL, Q5_0, Q2_0, IQ3_XXS, IQ2_S or plain bf16. Convert "
+                                    "it with a recipe that makes one of them.\n",
+                            names[i], en, i ? "down" : "gate_up");
+                    return RAD_E_DTYPE;
+                }
             if (fe[0] == fmt[0] && fe[1] == fmt[1]) continue;
             if (fmt[0] != 3 && fe[0] == 3 && fe[1] == 3) {
                 prot.push_back(e);
