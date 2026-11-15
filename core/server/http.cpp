@@ -726,6 +726,9 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
                 hres.status = 401;
                 hres.set_content(error_body(p, 401, "authentication_error", "invalid api key"),
                                  "application/json");
+                /* Close over it: a credential-guessing client should pay a fresh TLS/TCP setup
+                 * per try, not one keep-alive for a thousand. */
+                hres.set_header("Connection", "close");
                 return false;
             }
         }
