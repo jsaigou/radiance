@@ -6,6 +6,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ggml_blocks import BLOCK, SPLIT, DECODE, MERGE, dequant_ref
 import kq_layout as kq
+import radfile
 
 D_OFFS = {'Q8_0': [0], 'Q4_K': [0, 2], 'Q5_K': [0, 2], 'Q6_K': [208], 'Q5_0': [0], 'IQ4_NL': [0], 'IQ4_XS': [0],
           'Q2_0': [0], 'IQ3_XXS': [0], 'IQ2_S': [0]}
@@ -26,6 +27,64 @@ def random_blocks(ty, n, rng):
 
 def bits_equal(a, b):
     return np.array_equal(np.ascontiguousarray(a, np.float32).view(np.uint32), np.ascontiguousarray(b, np.float32).view(np.uint32))
+
+
+class RadFilePlanes(unittest.TestCase):
+    def test_64bit_planes_decode_without_overflow(self):
+        vals = np.array([0, 1, 2**63, 2**64 - 1], dtype=np.uint64)
+        rows = np.ascontiguousarray(vals.view(np.uint8).reshape(1, -1))
+        got = radfile.unpack_stream(rows, 64, len(vals)).reshape(-1)
+        self.assertTrue(np.array_equal(got, vals))
+        signed = radfile.signed_from_bits(got, 64)
+        self.assertEqual(signed.dtype, np.int64)
+        self.assertTrue(np.array_equal(signed, np.array([0, 1, -(2**63), -1], np.int64)))
+
+    def test_signed_extension_below_64_bits(self):
+        v = np.array([0, 7, 8, 15], dtype=np.uint32)
+        self.assertTrue(np.array_equal(radfile.signed_from_bits(v, 4),
+                                       np.array([0, 7, -8, -1], np.int64)))
+
+    def test_plugin_dtypes_are_named_and_refused(self):
+        self.assertTrue(radfile.is_plugin_dtype(radfile.RAD_DT_PLUGIN_BASE + 7))
+        self.assertEqual(radfile.dt_name(radfile.RAD_DT_PLUGIN_BASE + 7), 'halo_moew4')
+        self.assertFalse(radfile.is_plugin_dtype(radfile.DT_BY_NAME['u4']))
+        self.assertEqual(radfile.dt_bits(radfile.RAD_DT_PLUGIN_BASE + 7), 0)
+
+    def test_encoding_with_a_plugin_plane_is_kernel_private(self):
+        raw = bytearray(radfile.ENC_SZ)
+        raw[0:6] = b'affine'
+        import struct
+        struct.pack_into('<ii', raw, 48, 1, 0)
+        struct.pack_into('<24s II 2q 2q', raw, 56, b'codes', radfile.RAD_DT_PLUGIN_BASE + 7,
+                         0, 1, 1, 0, 0)
+        enc = radfile.Encoding(bytes(raw))
+        self.assertEqual(len(enc.kernel_private_planes()), 1)
+        self.assertIn('halo_moew4', enc.name())
+
+    def test_decode_entry_refuses_a_plugin_plane(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'ud_map'))
+        import ud_map
+        raw = bytearray(radfile.ENC_SZ)
+        raw[0:6] = b'plain'
+        import struct
+        struct.pack_into('<ii', raw, 48, 1, 0)
+        struct.pack_into('<24s II 2q 2q', raw, 56, b'codes', radfile.RAD_DT_PLUGIN_BASE + 9,
+                         0, 1, 1, 0, 0)
+        e = type('E', (), {})()
+        e.enc = radfile.Encoding(bytes(raw))
+        e.shape = (4, 4)
+        with self.assertRaises(radfile.KernelPrivateDtype):
+            ud_map.decode_entry(None, e)
+
+    def test_policy_verdict_does_not_pass_kernel_private(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'ud_map'))
+        import ud_map
+        self.assertEqual(ud_map._policy_verdict(True, 0), 'PASS')
+        self.assertEqual(ud_map._policy_verdict(True, 3), 'PARTIAL')
+        self.assertEqual(ud_map._policy_verdict(False, 3), 'FAIL')
+        line = ud_map._policy_line('quantised', 'PARTIAL', 10, 3, 1 << 20, ['halo_moew4'])
+        self.assertIn('kernel-private planes not Python-decoded', line)
+        self.assertNotIn(': PASS', line)
 
 
 class Synthetic(unittest.TestCase):

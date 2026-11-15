@@ -165,6 +165,10 @@ class Safetensors:
 
     def get(self, name, sl=None):
         mm, off, nb, dt, shp = self.idx[name]
+        if dt == 'I64':
+            # integer metadata the arch declares beside the weights (the PLE offsets/sizes).
+            a = np.asarray(mm[off:off + nb]).view('<i8').reshape(shp)
+            return a[sl] if sl is not None else a
         assert dt == 'BF16', dt
         a = np.asarray(mm[off:off + nb]).view('<u2').reshape(shp)
         if sl is not None:

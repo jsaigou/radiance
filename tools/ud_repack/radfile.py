@@ -26,9 +26,44 @@ DT = {1: ('f32', 32), 2: ('f16', 16), 3: ('bf16', 16), 4: ('fp8_e4m3', 8), 5: ('
       35: ('fp6_e2m3', 6), 36: ('fp6_e3m2', 6), 37: ('u16', 16)}
 DT_BY_NAME = {v[0]: k for k, v in DT.items()}
 
+# Plugin-private dtypes (abi/rad_types.h: everything >= RAD_DT_PLUGIN_BASE is sized by the
+# kernel plugin, not by rad_dtype_bits). These are libhalo's codes as recorded in
+# libhalo/halo_args.h. They are not plain bit streams this reader can dequantise: several are
+# WMMA fragment permutations or interleaved magnitude/sign planes, and several are not a whole
+# number of bits per element. We name them so a verifier can report them as kernel-private
+# instead of mis-decoding the bytes as some standard dtype.
+RAD_DT_PLUGIN_BASE = 256
+PLUGIN_DT = {
+    256: 'halo_w4_frag', 257: 'halo_w4_sz', 258: 'halo_w8_frag', 259: 'halo_w8_s',
+    260: 'halo_w2_frag', 261: 'halo_mxfp4_frag', 262: 'halo_e8m0',
+    263: 'halo_moew4', 264: 'halo_moew5', 265: 'halo_moew3',
+    266: 'halo_moeiq3', 267: 'halo_moeiq2',
+}
+
+
+class KernelPrivateDtype(Exception):
+    """Raised when a plane's dtype is a plugin-private layout this reader cannot decode."""
+
+    def __init__(self, dtypes):
+        self.dtypes = list(dtypes)
+        names = ', '.join(dt_name(d) for d in self.dtypes)
+        super().__init__(f'kernel-private plane dtype(s) not Python-decoded: {names}')
+
+
+def is_plugin_dtype(dt):
+    return dt >= RAD_DT_PLUGIN_BASE
+
+
+def dt_name(dt):
+    if dt in DT:
+        return DT[dt][0]
+    if dt in PLUGIN_DT:
+        return PLUGIN_DT[dt]
+    return 'plugin-private' if is_plugin_dtype(dt) else f'unknown({dt})'
+
 
 def dt_bits(dt):
-    return DT[dt][1]
+    return DT[dt][1] if dt in DT else 0
 
 
 class Plane:
@@ -43,7 +78,7 @@ class Plane:
         return pr, pc
 
     def __repr__(self):
-        return f'{self.role}:{DT[self.dtype][0]}' + (f'[{self.block[0]}x{self.block[1]}]' if self.kind == 0 else f'<table {self.extent}>')
+        return f'{self.role}:{dt_name(self.dtype)}' + (f'[{self.block[0]}x{self.block[1]}]' if self.kind == 0 else f'<table {self.extent}>')
 
 
 class Encoding:
@@ -58,8 +93,12 @@ class Encoding:
 
     def name(self):
         if self.scheme == 'plain':
-            return DT[self.planes[0].dtype][0]
+            return dt_name(self.planes[0].dtype)
         return self.scheme + ':' + ','.join(repr(p) for p in self.planes) + (('/' + self.transform) if self.transform else '')
+
+    def kernel_private_planes(self):
+        """Planes whose dtype is plugin-private (or otherwise unknown to this reader)."""
+        return [p for p in self.planes if p.dtype not in DT]
 
 
 class Entry:
@@ -117,13 +156,18 @@ class RadFile:
         rows = int(np.prod(e.shape[:-1])) if len(e.shape) > 1 else 1
         cols = e.shape[-1] if e.shape else 1
         pl = e.enc.planes[k]
+        if pl.dtype not in DT:
+            raise KernelPrivateDtype([pl.dtype])
         pr, pc = pl.dims(rows, cols)
         rb = (pc * dt_bits(pl.dtype) + 7) // 8
         return self.plane_bytes(e, k).reshape(pr, rb), pr, pc
 
 
 def unpack_stream(rows_u8, bits, n):
-    """(R, row_bytes) bit-stream rows (LSB first, rows start on a byte) -> (R, n) uint32 values."""
+    """(R, row_bytes) bit-stream rows (LSB first, rows start on a byte) -> (R, n) unsigned values.
+
+    The dtype is uint32 where every value fits, else uint64 (a 64-bit plane is the only standard
+    dtype above 32 bits; anything in 33..64 accumulates in uint64 too)."""
     R = rows_u8.shape[0]
     if bits == 8:
         return rows_u8[:, :n].astype(np.uint32)
@@ -131,6 +175,8 @@ def unpack_stream(rows_u8, bits, n):
         return np.ascontiguousarray(rows_u8[:, :2 * n]).view('<u2').astype(np.uint32)
     if bits == 32:
         return np.ascontiguousarray(rows_u8[:, :4 * n]).view('<u4').astype(np.uint32)
+    if bits == 64:
+        return np.ascontiguousarray(rows_u8[:, :8 * n]).view('<u8')
     if bits == 4:
         lo = rows_u8 & 15
         hi = rows_u8 >> 4
@@ -138,13 +184,30 @@ def unpack_stream(rows_u8, bits, n):
         out[:, 0::2] = lo
         out[:, 1::2] = hi
         return out[:, :n]
-    b = np.unpackbits(np.ascontiguousarray(rows_u8), axis=1, bitorder='little')[:, :n * bits].reshape(R, n, bits).astype(np.uint32)
-    return (b << np.arange(bits, dtype=np.uint32)).sum(axis=2, dtype=np.uint32)
+    dt = np.uint64 if bits > 32 else np.uint32
+    b = np.unpackbits(np.ascontiguousarray(rows_u8), axis=1, bitorder='little')[:, :n * bits].reshape(R, n, bits).astype(dt)
+    return (b << np.arange(bits, dtype=dt)).sum(axis=2, dtype=dt)
+
+
+def signed_from_bits(v, bits):
+    """Two's-complement decode of `bits`-wide unsigned values, without overflowing Python ints.
+
+    bits == 64 is the int64 bit pattern itself; the generic `1 << 64` sign extension below would
+    raise OverflowError (a C long is 64 bits)."""
+    v = np.asarray(v)
+    if bits >= 64:
+        return v.view(np.int64) if v.dtype == np.uint64 else v.astype(np.int64)
+    v = v.astype(np.int64)
+    sign = 1 << (bits - 1)
+    return np.where(v >= sign, v - (1 << bits), v)
 
 
 def plane_values(rf, e, k, row0=0, nrows=None):
     """Plane k's elements as a numpy array (rows row0..row0+nrows of the plane): floats as float32/float64-exact
-    (f16 -> float32, bf16 -> float32), integers as int64 (signed dtypes sign-extended)."""
+    (f16 -> float32, bf16 -> float32), integers as int64 (signed dtypes sign-extended).
+
+    Raises KernelPrivateDtype for a plane whose dtype this reader does not know; it does not
+    guess a width."""
     rows_u8, pr, pc = rf.plane_rows(e, k)
     if nrows is None:
         nrows = pr - row0
@@ -158,11 +221,10 @@ def plane_values(rf, e, k, row0=0, nrows=None):
     if name == 'bf16':
         u = np.ascontiguousarray(sub[:, :2 * pc]).view('<u2').astype(np.uint32) << 16
         return u.view('<f4')
-    v = unpack_stream(sub, bits, pc).astype(np.int64)
+    v = unpack_stream(sub, bits, pc)
     if name.startswith('i'):
-        sign = 1 << (bits - 1)
-        v = np.where(v >= sign, v - (1 << bits), v)
-    return v
+        return signed_from_bits(v, bits).astype(np.int64)
+    return v.astype(np.int64)
 
 
 def decode_affine(rf, e, row0=0, nrows=None):

@@ -95,7 +95,8 @@ class Gguf:
         return int(np.prod(shp[:-1])) if len(shp) > 1 else 1, shp[-1]
 
     def blocks(self, t):
-        qk, bb = BLOCK[t['type']] if t['type'] in BLOCK else (1, {'F32': 4}[t['type']])
+        simple = {'F32': 4, 'F16': 2, 'BF16': 2}
+        qk, bb = BLOCK[t['type']] if t['type'] in BLOCK else (1, simple[t['type']])
         o = self.h['data_start'] + t['offset']
         return self.mm[o:o + t['nbytes']], qk, bb
 
@@ -112,6 +113,11 @@ class Gguf:
             raw = raw[expert * nbytes:(expert + 1) * nbytes]
         if t['type'] == 'F32':
             return np.ascontiguousarray(raw.view('<f4').reshape(rows, cols)[r0:r0 + nr])
+        if t['type'] == 'BF16':
+            u = np.ascontiguousarray(raw).view('<u2').reshape(rows, cols)[r0:r0 + nr]
+            return (u.astype(np.uint32) << 16).view('<f4')
+        if t['type'] == 'F16':
+            return np.ascontiguousarray(raw).view('<f2').reshape(rows, cols)[r0:r0 + nr].astype(np.float32)
         rb = cols // qk * bb
         blk = raw.reshape(rows, rb)[r0:r0 + nr].reshape(-1, bb)
         return dequant_ref(t['type'], blk).reshape(nr, cols).astype(np.float32)
