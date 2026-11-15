@@ -191,15 +191,20 @@ F32 0.292, BF16 0.037. Kept: MTP layer `blk.48` 4.795, MTP head `mtp.*` 0.061, v
 0.836, i64 metadata; derived 0. The base build serves 49.758 GiB by format; the rest waits on
 L1/L2/L3.
 
-`rad-convert --plan-only` parses the 511 rules and stops on the first missing format:
-`blk.0.ffn_gate_up_exps.0.weight` is IQ2_S (`u10`, 1024x8 grid, signs, `u5`) — L1
-(`acdc63f`). L2 (`ead15cc`) and L3 (`13ab816`) are also unmerged. After those, the map still
-has two non-lane blockers: the IQ4_XS routed experts (4.98 GiB) have no kernel (L2 only adds
-the token-embedding gather), and `MoeFP8` serves one encoding per layer except the rotated
-w4/w5 family (the fast path's w3 adds a fourth), while the UD map mixes gate/up and down in all
-48 layers. The kept bf16 MTP layer (512 experts) is also refused (protected-expert cap 8). The
-fast recipe exists to avoid exactly those two constraints. The fit model, levers and lead
-runbook are in `fork-notes/flashnext-ud-fit-runbook.md`.
+`rad-convert --plan-only` parses the 511 rules and stops on the first missing format. On the
+base build (before the shared tree picked up L3) that was `blk.0.ffn_gate_up_exps.0.weight`,
+IQ2_S (`u10`, 1024x8 grid, signs, `u5`) — L1 (`acdc63f`). L2 (`ead15cc`) and L3 (`13ab816`)
+were also unmerged. On the current tree (L3's dense wiring) the exact base recipe is refused
+earlier at `output.weight` Q6_K: `logits_gemm` has one operand and no Q6_K row, so L3's
+`ud_map.py` writes the head as the served i8 form (+118 MiB) and the Q8_0 `*_hc_down/up` rows
+as E4M3. The servable post-L3 mirror is therefore ~89.12 GiB, not 89.003.
+
+After L1/L2/L3 the map still has two non-lane blockers: the IQ4_XS routed experts (4.98 GiB)
+have no kernel (L2 only adds the token-embedding gather), and `MoeFP8` serves one encoding per
+layer except the rotated w4/w5 family (the fast path's w3 adds a fourth), while the UD map
+mixes gate/up and down in all 48 layers. The kept bf16 MTP layer (512 experts) is also refused
+(protected-expert cap 8). The fast recipe exists to avoid exactly those two constraints. The
+fit model, levers and lead runbook are in `fork-notes/flashnext-ud-fit-runbook.md`.
 
 ### For the lead: the one arch change this lane needs
 

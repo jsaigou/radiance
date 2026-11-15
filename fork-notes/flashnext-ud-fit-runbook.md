@@ -60,6 +60,14 @@ Kept parts (all bf16 from the source):
 | vision (`v.*`) | 333 | 897,862,112 | 0.836199 | ViT |
 | i64 metadata (`blk.1.ple_*`) | 3 | 280 | 0.000000 | PLE offsets/vocab sizes |
 
+This is the **base** `ud_map.py` mirror recipe: every mapped tensor keeps its UD type. L3's
+merged `ud_map.py` deliberately overrides two groups the arch serves a different way (commit
+`13ab816`): `output.weight` Q6_K → the served int8 head (+118 MiB, +0.115 GiB) and the Q8_0
+`*_hc_down/up` connection matrices → E4M3 rows (about the same size). The servable post-L3
+mirror is therefore **~89.118 GiB**, not 89.003; the fit in §3 shifts by +0.115 GiB. Those two
+overrides are lossy where the GGUF was exact (`fork-notes/q6k-dense-arch-note.md`); the plan
+below still records the exact UD map.
+
 The committed artifacts are `fork-notes/flashnext-ud-mirror.recipe` (511 rules; one `ggml type=`
 per mapped common type, per-layer expert rules, no fast-path `table=`/`rtn`),
 `fork-notes/flashnext-ud-mirror.plan.txt` (the printed table) and
@@ -100,6 +108,20 @@ The refused format is **IQ2_S** (`u10` codes, 1024x8 grid, signs, `u5` sub-scale
 L2 (`IQ4_XS` token embedding, `ead15cc`) and L3 (`Q6_K`/`Q8_0` dense wiring, `13ab816`). This
 is exactly the "build predates L1/L2/L3" case; the recipe was not changed.
 
+**The shared `src-full` moved during this lane.** It now carries L3, so rerunning the exact
+base mirror recipe on it refuses *earlier*, at the UD head:
+
+```
+radiance: 'output.weight' is i6*i8[1x16]*f16[1x256], which no logits_gemm row reads;
+          store it as i8*bf16[1x128], block fp8 or bf16
+```
+
+That is L3's dense wiring, not a new kernel gap: `logits_gemm` has one weight operand and no
+Q6_K row, so L3's `ud_map.py` writes the head as i8 (+118 MiB) and the Q8_0 `*_hc_down/up`
+rows as E4M3 before the rest of the map. After merging L3, the preflight uses that override and
+the next refusal is L1's IQ2_S. This is the second arch-mandated deviation from the exact UD
+formats; the base-tree run (pre-L3) is the one that reported IQ2_S first.
+
 By format, after those three branches the plan would serve **78.329 GiB** of the 83.310 GiB
 map; the remaining **4.98 GiB** is the IQ4_XS routed gate/up experts, which no lane implements
 (L2 only adds the `token_embd` gather). See §5 for the arch-level blockers.
@@ -135,7 +157,8 @@ At 262144 ctx, `--max-num-seqs 4`, fp8 KV, router `top_k=10` (model), MTP depth 
 
 **Verdict: it fits.** 103.99–104.08 GiB = 111.66–111.76 GB against a 120.0 GiB
 (128.85 GB) GTT pool: **~16.0 GiB headroom** (15.9 GiB if the calibration is the 36.4 GB
-figure). The host has 123.4 GiB RAM; the token embedding can stay in host RAM (default
+figure; the L3 served overrides take it to 15.8–15.9 GiB). The host has 123.4 GiB RAM; the
+token embedding can stay in host RAM (default
 `--embedding-placement ram`), and the 26.8 GiB PLE n-gram table plus the vision tower are in
 GTT under `--ngram-placement auto` if they fit (they do at 104 GiB total). If the n-gram table
 is placed in RAM instead, GTT drops by 26.8 GiB and host RAM needs 26.8 GiB pinned; both fit.
@@ -150,7 +173,8 @@ See §5. The buildable variants are smaller and fit more easily:
 
 | variant | weights | total resident | headroom |
 |---|---:|---:|---:|
-| exact mirror, MTP bf16 | 89.003 GiB | 103.99–104.08 GiB | 15.9–16.0 GiB |
+| exact mirror, MTP bf16 (base plan, §1) | 89.003 GiB | 103.99–104.08 GiB | 15.9–16.0 GiB |
+| exact mirror + L3's served overrides (int8 head, E4M3 hc) | 89.118 GiB | 104.11–104.20 GiB | 15.8–15.9 GiB |
 | mirror with MTP layer at w4 (the fast recipe's rule) | 85.524 GiB | 100.51–100.60 GiB | 19.4–19.5 GiB |
 | fast path (L5, `fn-fast`) | 85.637 GiB | 100.62–100.71 GiB | 19.3–19.4 GiB |
 
@@ -242,8 +266,9 @@ python3 tools/ud_map/ud_map.py build \
   --flock ~/radiance-test/gpu.lock
 ```
 
-Expected size 95.57 GB (89.00 GiB) of weights; the file will be slightly larger with the
-header/padding (Qwen3.6: plan 20.92 GiB → 21.01 GiB file, +0.4%). `--verify` samples every
+Expected size 95.68 GB (89.12 GiB) of weights after L3's head/hc overrides (the exact base plan
+is 95.57 GB / 89.00 GiB); the file will be slightly larger with the header/padding (Qwen3.6:
+plan 20.92 GiB → 21.01 GiB file, +0.4%). `--verify` samples every
 dense/vision/MTP-head weight and 8 experts per (layer, projection); expect `policy PASS`, the
 kept bf16 weights hash-equal to the source, and the quantised experts' RMSE vs the GGUF
 dequant in the Qwen3.6 range (0.03–0.07), not hash-equal.
