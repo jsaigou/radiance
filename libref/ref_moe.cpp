@@ -277,6 +277,12 @@ static TileFn pick_tile(uint32_t da, uint32_t db) {
  * stored in the joined form of abi/rad_planes.h, which these rows' layout hooks ask for. A view of
  * one plane (w4nla8h's bf16 scale, every view of the other dtypes) is stored as it is.
  *
+ * The three unrotated GGUF forms share that path with bf16 activations and f16 scales, and no
+ * activation scale: `iq4nl32a16` is IQ4_NL's u4 codes into a sixteen-entry i8 table, `q50a16` is
+ * Q5_0's signed i5 codes (the code is the level) and `q20a16` is Q2_0's u2 codes (the level is
+ * code - 1), the last two with implicit tables and stored as single planes. Nothing rotates their
+ * activation.
+ *
  * The arithmetic is quant_dot's: per weight group, the sub-sum of table values times activation
  * codes, then `(sub * sa) * sb` with sb the scale times its level in f32. The logical form the
  * oracle and rad-kbench pass (enc_selection_logical: table entries for codes, scale products for
@@ -285,17 +291,26 @@ static TileFn pick_tile(uint32_t da, uint32_t db) {
  * folds each 64- or 32-wide group's sum under its scale first and the activation's scale per 128
  * after (`(sub0 * sb0 + sub1 * sb1) * sa`), which differs in the last bits. */
 
-/* What a codebook `dtype` stores: the code width, the scale's group along K and dtype, and whether
- * the scale view carries the level above it. `bits` is 0 for any other dtype. */
-struct CbForm { int bits; int64_t group; uint32_t sdt; bool level; };
+/* What a codebook `dtype` stores: the code width and dtype, the scale's group along K and dtype,
+ * whether the scale view carries the level above it, the table's dtype (0 for the implicit tables
+ * of the unrotated GGUF forms), and whether the activation is rotated (fwht128). `bits` is 0 for
+ * any other dtype. */
+struct CbForm { int bits; int64_t group; uint32_t sdt; bool level; uint32_t cdt; uint32_t tdt;
+                bool rot; };
 static CbForm cb_form(const RadParam* p, int n_p) {
     const RadParam* d = rad_param_find(p, n_p, "dtype");
     const char* s = d && d->kind == RAD_P_STR ? d->sval : nullptr;
-    if (s && !std::strcmp(s, "w4nla8h"))   return CbForm{ 4, 128, RAD_BF16, false };
-    if (s && !std::strcmp(s, "w4nl64a8h")) return CbForm{ 4, 64, RAD_F8E4M3, true };
-    if (s && !std::strcmp(s, "w4nl32a8h")) return CbForm{ 4, 32, RAD_F8E4M3, true };
-    if (s && !std::strcmp(s, "w5nl64a8h")) return CbForm{ 5, 64, RAD_F8E4M3, true };
-    return CbForm{ 0, 0, 0, false };
+    if (s && !std::strcmp(s, "w4nla8h"))   return CbForm{ 4, 128, RAD_BF16, false, RAD_U4, RAD_F32, true };
+    if (s && !std::strcmp(s, "w4nl64a8h")) return CbForm{ 4, 64, RAD_F8E4M3, true, RAD_U4, RAD_F32, true };
+    if (s && !std::strcmp(s, "w4nl32a8h")) return CbForm{ 4, 32, RAD_F8E4M3, true, RAD_U4, RAD_F32, true };
+    if (s && !std::strcmp(s, "w5nl64a8h")) return CbForm{ 5, 64, RAD_F8E4M3, true, RAD_U5, RAD_F32, true };
+    /* The unrotated GGUF forms (f16 scales per 32 or 64, bf16 activations): IQ4_NL's codes join a
+     * sixteen-entry i8 table; Q5_0's signed i5 and Q2_0's u2 codes have implicit tables and are
+     * stored as single planes. */
+    if (s && !std::strcmp(s, "iq4nl32a16")) return CbForm{ 4, 32, RAD_F16, false, RAD_U4, RAD_I8, false };
+    if (s && !std::strcmp(s, "q50a16"))     return CbForm{ 5, 32, RAD_F16, false, RAD_I5, 0,      false };
+    if (s && !std::strcmp(s, "q20a16"))     return CbForm{ 2, 64, RAD_F16, false, RAD_U2, 0,      false };
+    return CbForm{ 0, 0, 0, false, 0, 0, false };
 }
 
 /* Whether a selection of several planes for `operand` is what `dtype` names: the codes operands of
@@ -306,23 +321,32 @@ static int cb_check(const RadParam* p, int n_p, int operand, const RadEncoding* 
     const CbForm f = cb_form(p, n_p);
     const bool codes = operand == 2 || operand == 6 || operand == 8 || operand == 10;
     const bool scale = operand == 3 || operand == 7 || operand == 9 || operand == 11;
-    if (!f.bits || (!codes && !scale) || !enc || !sel || n_planes != 2 ||
-        std::strcmp(enc->transform, "fwht128") != 0)
+    const bool rot = enc && (f.rot ? std::strcmp(enc->transform, "fwht128") == 0
+                                    : enc->transform[0] == 0);
+    if (!f.bits || (!codes && !scale) || !enc || !sel || n_planes < 1 || !rot)
         return RAD_E_DTYPE;
-    for (int i = 0; i < 2; ++i)
+    for (int i = 0; i < n_planes; ++i)
         if (sel[i] < 0 || sel[i] >= enc->n_planes) return RAD_E_SHAPE;
     const RadEncPlane& a = enc->plane[sel[0]];
-    const RadEncPlane& b = enc->plane[sel[1]];
-    if (codes)
-        return !std::strcmp(a.role, "codes") && a.kind == RAD_PLANE_TILED &&
-               a.dtype == (f.bits == 5 ? (uint32_t)RAD_U5 : (uint32_t)RAD_U4) &&
-               a.block[0] == 1 && a.block[1] == 1 && !std::strcmp(b.role, "table") &&
-               b.kind == RAD_PLANE_TABLE && b.dtype == RAD_F32 && b.extent[0] == 1 &&
+    if (codes) {
+        const bool ct = a.kind == RAD_PLANE_TILED && !std::strcmp(a.role, "codes") &&
+                        a.dtype == f.cdt && a.block[0] == 1 && a.block[1] == 1;
+        if (!ct) return RAD_E_DTYPE;
+        if (!f.tdt) return n_planes == 1 ? RAD_OK : RAD_E_DTYPE;
+        if (n_planes != 2) return RAD_E_DTYPE;
+        const RadEncPlane& b = enc->plane[sel[1]];
+        return !std::strcmp(b.role, "table") && b.kind == RAD_PLANE_TABLE &&
+               b.dtype == f.tdt && b.extent[0] == 1 &&
                b.extent[1] == ((int64_t)1 << f.bits)
                    ? RAD_OK : RAD_E_DTYPE;
-    return f.level && !std::strcmp(a.role, "scale") && a.kind == RAD_PLANE_TILED &&
-           a.dtype == f.sdt && a.block[0] == 1 && a.block[1] == f.group &&
-           !std::strcmp(b.role, "scale.1") && b.kind == RAD_PLANE_TILED && b.dtype == RAD_F32 &&
+    }
+    if (n_planes != (f.level ? 2 : 1)) return RAD_E_DTYPE;
+    if (std::strcmp(a.role, "scale") || a.kind != RAD_PLANE_TILED || a.dtype != f.sdt ||
+        a.block[0] != 1 || a.block[1] != f.group)
+        return RAD_E_DTYPE;
+    if (!f.level) return RAD_OK;
+    const RadEncPlane& b = enc->plane[sel[1]];
+    return !std::strcmp(b.role, "scale.1") && b.kind == RAD_PLANE_TILED && b.dtype == RAD_F32 &&
            b.block[0] == 0 && b.block[1] == 0
                ? RAD_OK : RAD_E_DTYPE;
 }
@@ -377,11 +401,26 @@ struct LdCb {
     }
 };
 
-/* An expert's codes when its entry is the joined form: 1 with `out` filled, 0 for a plain plane
- * (any dtype but u4 and u5), RAD_E_DTYPE for a form these kernels do not read and RAD_E_SHAPE for
- * codes not covering [n, k]. A u4 or u5 entry is always joined: only its table says what a code
- * means. */
+/* An expert's codes: 1 with `out` filled, 0 for a plain plane these kernels do not read as a
+ * codebook, RAD_E_DTYPE for a joined form they do not read and RAD_E_SHAPE for codes not covering
+ * [n, k]. A u4 or u5 entry is always joined (only its table says what a code means); Q5_0's signed
+ * i5 and Q2_0's u2 entries are the plain planes GGUF stores, whose code is the level (Q5_0) or the
+ * level plus one (Q2_0). */
 static int cb_codes(const RadTensor& w, int64_t n, int64_t k, CbTensor* out) {
+    if (w.dtype == RAD_I5 || w.dtype == RAD_U2) {
+        if (!w.data || w.rank < 2 || w.shape[0] < n || w.shape[1] < k) return RAD_E_SHAPE;
+        if (rad_planes_header(w.data)) return RAD_E_DTYPE;   /* stored as a single plane */
+        const bool i5 = w.dtype == RAD_I5;
+        out->t = w;
+        out->bits = i5 ? 5 : 2;
+        out->cols = k;
+        out->row_bytes = rad_dtype_bytes(w.dtype, w.shape[1]);
+        if (out->row_bytes <= 0) return RAD_E_SHAPE;
+        /* The raw codes are two's complement (Q5_0) or offset by one (Q2_0). */
+        for (int c = 0; c < (1 << out->bits); ++c)
+            out->tab[c] = i5 ? (float)(c < 16 ? c : c - 32) : (float)(c - 1);
+        return 1;
+    }
     if (w.dtype != RAD_U4 && w.dtype != RAD_U5) return 0;
     const RadPlanesHeader* h = rad_planes_header(w.data);
     const RadPlanesEntry *ec = nullptr, *et = nullptr;
@@ -389,14 +428,21 @@ static int cb_codes(const RadTensor& w, int64_t n, int64_t k, CbTensor* out) {
     const void* tab = h ? rad_planes_find(w.data, "table", &et) : nullptr;
     if (!codes || !tab || h->n_planes != 2) return RAD_E_DTYPE;
     const int bits = ec->dtype == RAD_U4 ? 4 : ec->dtype == RAD_U5 ? 5 : 0;
+    /* A rotated codebook's table is f32; IQ4_NL's is the sixteen signed bytes it indexes. */
+    const bool i8tab = et->dtype == RAD_I8;
     if (!bits || ec->kind != RAD_PLANE_TILED || ec->block[0] != 1 || ec->block[1] != 1 ||
-        et->kind != RAD_PLANE_TABLE || et->dtype != RAD_F32 ||
-        et->rows * et->cols != ((int64_t)1 << bits))
+        et->kind != RAD_PLANE_TABLE || (et->dtype != RAD_F32 && !i8tab) ||
+        et->rows * et->cols != ((int64_t)1 << bits) || (i8tab && bits != 4))
         return RAD_E_DTYPE;
     if (ec->rows < n || ec->cols < k) return RAD_E_SHAPE;
     out->t = w;
     out->t.data = const_cast<void*>(codes);
-    std::memcpy(out->tab, tab, sizeof(float) << bits);
+    if (i8tab) {
+        const int8_t* lv = (const int8_t*)tab;
+        for (int c = 0; c < 16; ++c) out->tab[c] = (float)lv[c];
+    } else {
+        std::memcpy(out->tab, tab, sizeof(float) << bits);
+    }
     out->cols = ec->cols;
     out->row_bytes = ec->row_bytes;
     out->bits = bits;
@@ -456,7 +502,11 @@ static TileFn pick_cb_tile(uint32_t da) {
 
 static int moe_gemm_impl(const RadArgs* a, bool quant, int ncls = 2) {
     const int n_opd = quant ? (ncls == 4 ? 13 : 9) : 5;
-    if (!have(a, n_opd)) return RAD_E_INVAL;
+    /* The activation scale is optional (the A16 experts carry none), so every other operand in
+     * the prefix must be present rather than all of them. */
+    if (!a || !a->t || a->n_t < n_opd) return RAD_E_INVAL;
+    for (int i = 0; i < n_opd; ++i)
+        if (!(quant && i == 1) && !rad_arg_in(a, i)) return RAD_E_INVAL;
     const RadTensor* A      = &a->t[0];
     const RadTensor* as_    = quant ? t_in(a, 1) : nullptr;
     const RadTensor* W      = &a->t[quant ? 2 : 1];

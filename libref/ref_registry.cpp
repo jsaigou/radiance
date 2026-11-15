@@ -2277,8 +2277,15 @@ static int ref_check_dtypes(const char* op, const RadArgs* a) {
         /* IQ4_XS's 6-bit scale: read in ref_embed_lookup_iq4xs through rad_load_f32, not ld_dt. */
         const bool iq4xs_scale = t.dtype == RAD_I6 && role == RAD_OPD_WEIGHT &&
                                  std::strcmp(op, "embed_lookup_iq4xs") == 0;
+        /* Q5_0 and Q2_0's expert codes: plain i5 / u2 planes the groups' codebook path decodes
+         * through its own table, as the unrotated GGUF forms store them (ref_moe.cpp's cb_codes).
+         * ld_dt has no i5 or u2 case for the same reason it has no u4 one. */
+        const bool q50_codes = (t.dtype == RAD_I5 || t.dtype == RAD_U2) &&
+                               (role == RAD_OPD_WEIGHT || role == RAD_OPD_WTAB) &&
+                               (std::strcmp(op, "moe_gemm_q") == 0 ||
+                                std::strcmp(op, "moe_gemm_q_mod4") == 0);
         if (role != RAD_OPD_OUT && !ref_readable(t.dtype) && !ref_joined_weight(t, role) &&
-            !iq4_codes && !iq4xs_scale)
+            !iq4_codes && !iq4xs_scale && !q50_codes)
             return RAD_E_DTYPE;
         if ((role == RAD_OPD_OUT || role == RAD_OPD_INOUT) && !ref_storable(t.dtype))
             return RAD_E_DTYPE;
@@ -2356,7 +2363,9 @@ int ref_unrelayout_gemm_q_m2(const RadParam*, int, int, const RadEncoding*, cons
 
 #define DT_FLOAT "bf16 f16 f32 fp8_e4m3 fp8_e5m2 i8 i32, chosen per operand from its own dtype"
 #define DT_ANY   "any dtype rad_types.h names, per operand"
-#define DT_FLOAT_CB DT_FLOAT "; or u4 / u5 codes into an f32 table, joined (w4nl* / w5nl*)"
+#define DT_FLOAT_CB DT_FLOAT "; or codebook experts: u4 / u5 codes into an f32 table, joined " \
+                            "(w4nl* / w5nl*), IQ4_NL's u4 codes into an i8 table, or Q5_0's " \
+                            "i5 / Q2_0's u2 codes"
 
 static const RadKernelInfo kKernels[] = {
 SIMPLE("ref_rmsnorm", "rmsnorm", "norm", "root-mean-square norm with a gain", DT_FLOAT,

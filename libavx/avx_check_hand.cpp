@@ -1443,26 +1443,37 @@ constexpr float kW5nl[32] = { 0.8125f, 2.5f, 4.0f, 5.5f, 7.5f, 9.0f, 11.0f, 12.0
                               -0.8125f, -2.5f, -4.0f, -5.5f, -7.5f, -9.0f, -11.0f, -12.0f,
                               -14.0f, -16.0f, -18.0f, -20.0f, -22.0f, -24.0f, -26.0f, -30.0f };
 
-struct Form { const char* dtype; int bits; int64_t group; uint32_t sdt; bool level; };
+/* `a16` selects the unrotated GGUF forms: bf16 activations, no activation scale, f16 weights
+ * scales, and either an implicit table (Q5_0, Q2_0) or IQ4_NL's i8 one. */
+struct Form { const char* dtype; int bits; int64_t group; uint32_t sdt; bool level; bool a16;
+              uint32_t cdt; uint32_t tdt; };
 constexpr Form kForms[] = {
-    { "w4nla8h",   4, 128, RAD_BF16,   false },
-    { "w4nl64a8h", 4, 64,  RAD_F8E4M3, true },
-    { "w4nl32a8h", 4, 32,  RAD_F8E4M3, true },
-    { "w5nl64a8h", 5, 64,  RAD_F8E4M3, true },
+    { "w4nla8h",   4, 128, RAD_BF16,   false, false, RAD_U4, RAD_F32 },
+    { "w4nl64a8h", 4, 64,  RAD_F8E4M3, true,  false, RAD_U4, RAD_F32 },
+    { "w4nl32a8h", 4, 32,  RAD_F8E4M3, true,  false, RAD_U4, RAD_F32 },
+    { "w5nl64a8h", 5, 64,  RAD_F8E4M3, true,  false, RAD_U5, RAD_F32 },
+    { "iq4nl32a16",4, 32,  RAD_F16,    false, true,  RAD_U4, RAD_I8  },
+    { "q50a16",    5, 32,  RAD_F16,    false, true,  RAD_I5, 0       },
+    { "q20a16",    2, 64,  RAD_F16,    false, true,  RAD_U2, 0       },
 };
 
-/* The encoding libquant writes for the form: codes, scale, its fixed level, then the table. */
+/* The encoding libquant writes for the form: codes, scale, its fixed level, then the table. The
+ * unrotated forms have no transform, and Q5_0/Q2_0 no table. */
 RadEncoding encoding(const Form& f) {
     RadEncoding e;
     rad_enc_clear(&e);
     rad_enc_copy_str(e.scheme, "affine");
-    rad_enc_copy_str(e.transform, "fwht128");
-    rad_enc_add_plane(&e, "codes", f.bits == 5 ? RAD_U5 : RAD_U4, 1, 1);
+    rad_enc_copy_str(e.transform, f.a16 ? "" : "fwht128");
+    rad_enc_add_plane(&e, "codes", f.cdt, 1, 1);
     rad_enc_add_plane(&e, "scale", f.sdt, 1, f.group);
     if (f.level) rad_enc_add_plane(&e, "scale.1", RAD_F32, 0, 0);
-    rad_enc_add_table(&e, "table", RAD_F32, 1, (int64_t)1 << f.bits);
+    if (f.tdt) rad_enc_add_table(&e, "table", f.tdt, 1, (int64_t)1 << f.bits);
     return e;
 }
+
+/* kvalues_iq4nl, IQ4_NL's sixteen levels in code order (libquant/lq_grid.cpp). */
+constexpr int8_t kIq4Nl[16] = { -127, -104, -83, -65, -49, -35, -22, -10,
+                                1,    13,   25,  38,  53,  69,  89, 113 };
 
 uint64_t mix(uint64_t s, uint64_t i) {
     uint64_t x = s * 0x9E3779B97F4A7C15ull + i;
@@ -1502,7 +1513,11 @@ Planes draw(const Form& f, const RadEncoding& e, int64_t n, int64_t k, uint64_t 
             rad_store_f32(w.p[is].data() + r * rad_enc_row_bytes(f.sdt, sc), f.sdt, c, v);
         }
     if (il >= 0) rad_store_f32(w.p[il].data(), RAD_F32, 0, 0x1p-13f);
-    std::memcpy(w.p[it].data(), f.bits == 5 ? kW5nl : kW4nl, sizeof(float) << f.bits);
+    if (it >= 0) {
+        if (f.tdt == RAD_I8) std::memcpy(w.p[it].data(), kIq4Nl, sizeof kIq4Nl);
+        else std::memcpy(w.p[it].data(), f.bits == 5 ? kW5nl : kW4nl,
+                         sizeof(float) << f.bits);
+    }
     return w;
 }
 
@@ -1654,7 +1669,9 @@ int run_case(const Check& ck, const Case& cs) {
 
     /* The experts' planes and each library's stored bytes. */
     const RadEncoding enc = encoding(f);
-    const std::vector<int> sel_c = { rad_enc_find(&enc, "codes"), rad_enc_find(&enc, "table") };
+    const std::vector<int> sel_c =
+        f.tdt ? std::vector<int>{ rad_enc_find(&enc, "codes"), rad_enc_find(&enc, "table") }
+              : std::vector<int>{ rad_enc_find(&enc, "codes") };
     const std::vector<int> sel_s = f.level ? std::vector<int>{ rad_enc_find(&enc, "scale"),
                                                                 rad_enc_find(&enc, "scale.1") }
                                            : std::vector<int>{ rad_enc_find(&enc, "scale") };
@@ -1706,13 +1723,18 @@ int run_case(const Check& ck, const Case& cs) {
     if (all_bytes[0] != all_bytes[1])
         return fail(std::string("libref and ") + lib.info->name + " store different bytes");
 
-    /* The activation (E4M3 codes and an f32 scale per 128), the routing, and the output. */
+    /* The activation, the routing, and the output. The rotated forms take E4M3 codes and an f32
+     * scale per 128; the unrotated ones a bf16 activation and no scale (the A16 path). */
     const int64_t SG = (K + 127) / 128;
-    std::vector<uint8_t> aq((size_t)(AR * K)), asb((size_t)(AR * SG * 4)), yb((size_t)(T * N * 2));
-    for (int64_t i = 0; i < AR * K; ++i)
-        rad_store_f32(aq.data(), RAD_F8E4M3, i,
-                      ((float)(mix(77, (uint64_t)i) % 2001) / 1000.0f - 1.0f) * 6.0f);
-    for (int64_t i = 0; i < AR * SG; ++i)
+    /* A16 activations are bf16, two bytes an element; the rotated arm's are E4M3 codes. */
+    std::vector<uint8_t> aq((size_t)rad_dtype_bytes(f.a16 ? (uint32_t)RAD_BF16
+                                                          : (uint32_t)RAD_F8E4M3, AR * K)),
+        asb((size_t)(f.a16 ? 0 : AR * SG * 4)), yb((size_t)(T * N * 2));
+    for (int64_t i = 0; i < AR * K; ++i) {
+        const float v = ((float)(mix(77, (uint64_t)i) % 2001) / 1000.0f - 1.0f) * 6.0f;
+        rad_store_f32(aq.data(), f.a16 ? (uint32_t)RAD_BF16 : (uint32_t)RAD_F8E4M3, i, v);
+    }
+    for (int64_t i = 0; i < AR * SG && !f.a16; ++i)
         rad_store_f32(asb.data(), RAD_F32, i, 0.01f + 0.004f * (float)(i % 9));
     for (int64_t i = 0; i < T * N; ++i) rad_store_f32(yb.data(), RAD_BF16, i, 7.0f);
     std::vector<uint8_t> sb((size_t)T * 4), ob((size_t)(ne + 1) * 4);
@@ -1733,8 +1755,8 @@ int run_case(const Check& ck, const Case& cs) {
     };
     auto launch = [&](const RadKernelInfo* k, Io& io, const RadTensor* tabs) {
         std::vector<RadTensor> t((size_t)(nc == 4 ? 13 : 9));
-        t[0] = tensor(io.a.data(), RAD_F8E4M3, { AR, K });
-        t[1] = tensor(io.as.data(), RAD_F32, { AR, SG });
+        t[0] = tensor(io.a.data(), f.a16 ? (uint32_t)RAD_BF16 : (uint32_t)RAD_F8E4M3, { AR, K });
+        t[1] = f.a16 ? RadTensor{} : tensor(io.as.data(), RAD_F32, { AR, SG });
         t[2] = tabs[0]; t[3] = tabs[1];
         t[4] = tensor(io.s.data(), RAD_I32, { T });
         t[5] = tensor(io.o.data(), RAD_I32, { ne + 1 });
@@ -1775,35 +1797,45 @@ int run_case(const Check& ck, const Case& cs) {
         return fail(std::string(lib.info->name) + " against libref: " + why);
     const double rel_lib = rel;
 
-    /* libref over the logical form: table entries as E4M3 codes, scale times level as bf16, the
-     * stacked form. */
+    /* libref over the logical form: the decoded weight and its scales, the stacked form. The
+     * rotated forms use table entries as E4M3 codes and scale times level as bf16; the unrotated
+     * ones f16 (the levels are exact there, and so are their f16 scales), which is the host decode
+     * libhalo's selftest compares its kernel to. */
+    const uint32_t LDT = f.a16 ? (uint32_t)RAD_F16 : (uint32_t)RAD_F8E4M3;
+    const uint32_t LST = f.a16 ? (uint32_t)RAD_F16 : (uint32_t)RAD_BF16;
     {
         std::vector<std::vector<uint8_t>> lc(nc), ls(nc);
         RadTensor tabs[8];
         for (int q = 0; q < nc; ++q) {
             const int64_t nq = (ne + nc - 1 - q) / nc, n = Nq[q], k = Kq[q];
             const int64_t g = f.group, sg = (k + g - 1) / g;
-            lc[(size_t)q].assign((size_t)(nq * n * k), 0);
-            ls[(size_t)q].assign((size_t)(nq * n * sg * 2), 0);
+            lc[(size_t)q].assign((size_t)rad_dtype_bytes(LDT, nq * n * k), 0);
+            ls[(size_t)q].assign((size_t)rad_dtype_bytes(LST, nq * n * sg), 0);
             for (int64_t e = q, x = 0; e < ne; e += nc, ++x) {
                 const Planes& w = ex[(size_t)e];
                 const int ic = sel_c[0], is = sel_s[0];
                 const float lv = f.level ? rad_load_f32(w.p[sel_s[1]].data(), RAD_F32, 0) : 1.0f;
-                const float* tab = (const float*)w.p[sel_c[1]].data();
+                const float* tab = f.tdt == RAD_F32 ? (const float*)w.p[sel_c[1]].data() : nullptr;
+                const int8_t* tab8 = f.tdt == RAD_I8 ? (const int8_t*)w.p[sel_c[1]].data() : nullptr;
                 const int64_t rbc = rad_enc_row_bytes(enc.plane[ic].dtype, k);
                 const int64_t rbs = rad_enc_row_bytes(f.sdt, sg);
                 for (int64_t r = 0; r < n; ++r) {
-                    for (int64_t c = 0; c < k; ++c)
-                        rad_store_f32(lc[(size_t)q].data(), RAD_F8E4M3, (x * n + r) * k + c,
-                                      tab[(int)rad_load_f32(w.p[ic].data() + r * rbc,
-                                                            enc.plane[ic].dtype, c)]);
+                    for (int64_t c = 0; c < k; ++c) {
+                        const int code = (int)rad_load_f32(w.p[ic].data() + r * rbc,
+                                                           enc.plane[ic].dtype, c);
+                        const float v = tab ? tab[code]
+                                        : tab8 ? (float)tab8[code]
+                                        : !std::strcmp(f.dtype, "q20a16") ? (float)(code - 1)
+                                                                          : (float)code;
+                        rad_store_f32(lc[(size_t)q].data(), LDT, (x * n + r) * k + c, v);
+                    }
                     for (int64_t c = 0; c < sg; ++c)
-                        rad_store_f32(ls[(size_t)q].data(), RAD_BF16, (x * n + r) * sg + c,
+                        rad_store_f32(ls[(size_t)q].data(), LST, (x * n + r) * sg + c,
                                       rad_load_f32(w.p[is].data() + r * rbs, f.sdt, c) * lv);
                 }
             }
-            tabs[2 * q] = tensor(lc[(size_t)q].data(), RAD_F8E4M3, { nq, n, k });
-            tabs[2 * q + 1] = tensor(ls[(size_t)q].data(), RAD_BF16, { nq, n, sg });
+            tabs[2 * q] = tensor(lc[(size_t)q].data(), LDT, { nq, n, k });
+            tabs[2 * q + 1] = tensor(ls[(size_t)q].data(), LST, { nq, n, sg });
         }
         Io il;
         make_io(il);
@@ -1815,9 +1847,11 @@ int run_case(const Check& ck, const Case& cs) {
 
 #ifdef AVX_CHECK_CORE_DECODER
     /* The core's decoder. The rotation undone on both sides where it tiles K; otherwise both stay
-     * in the rotated basis, where the product is the same. */
+     * in the rotated basis, where the product is the same. The unrotated forms are held to the
+     * host decode above instead: part of their level meaning is outside the encoding (Q2_0's
+     * levels are code - 1), which the decoder does not carry. */
     double rel_or = 0, rel_oa = 0;
-    {
+    if (!f.a16) {
         bool rot = true;
         for (int q = 0; q < nc; ++q) rot = rot && Kq[q] % 128 == 0;
         std::vector<std::vector<float>> W((size_t)ne);
@@ -1880,8 +1914,12 @@ int run_case(const Check& ck, const Case& cs) {
     }
     if (ck.verbose) {
 #ifdef AVX_CHECK_CORE_DECODER
-        std::printf("  %-22s %-46s rel_l2=%.3e, vs decoder %.3e / %.3e ok\n", op, name, rel_lib,
-                    rel_or, rel_oa);
+        if (f.a16)
+            std::printf("  %-22s %-46s rel_l2=%.3e ok (stored form against the host decode)\n",
+                        op, name, rel_lib);
+        else
+            std::printf("  %-22s %-46s rel_l2=%.3e, vs decoder %.3e / %.3e ok\n", op, name,
+                        rel_lib, rel_or, rel_oa);
 #else
         std::printf("  %-22s %-46s rel_l2=%.3e ok (no core decoder in this build)\n", op, name,
                     rel_lib);
@@ -1961,7 +1999,8 @@ int codebook_cases(const Check& ck, int* run) {
           160, false },
     };
     int fails = 0;
-    for (int fm = 0; fm < 4; ++fm)
+    const int nforms = (int)(sizeof cb::kForms / sizeof cb::kForms[0]);
+    for (int fm = 0; fm < nforms; ++fm)
         for (cb::Case c : kCases) {
             c.form = fm;
             const char* op = c.ncls == 4 ? "moe_gemm_q_mod4" : "moe_gemm_q";

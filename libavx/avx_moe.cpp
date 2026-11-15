@@ -202,6 +202,13 @@ AVX_KERNEL(moe_scatter) {
  * view, arrive in the joined form of abi/rad_planes.h, which the registry rows' layout hooks ask
  * for; the planes accepted and refused are libref's (libref/ref_moe.cpp).
  *
+ * The three unrotated forms are served as GGUF stores them, with bf16 activations and f16 scales
+ * (`iq4nl32a16`, `q50a16`, `q20a16`). IQ4_NL joins its u4 codes with a sixteen-entry *i8* table
+ * and an f16 scale per 32 of K. Q5_0's codes are a plain signed-i5 plane (the code is the level)
+ * and Q2_0's a plain u2 plane (the level is code - 1), each with an f16 scale per 32 or 64 of K;
+ * their tables are implicit, so these two are a single plane stored as it is. Nothing here rotates
+ * the activation, and the A16 forms carry no activation scale.
+ *
  * Arithmetic: each activation row is multiplied by its own scale as it is packed, and the weight's
  * scale is applied to the table (one register multiply a group) or, in AVX-512's line decode, to
  * each lane's partial sum once a line; the dot runs over all of K with one horizontal sum per
@@ -278,9 +285,26 @@ static const RadPlanesHeader* cb_joined(const RadTensor& t) {
     return rad_planes_header(t.data);
 }
 
-/* An expert's codes from its joined form: 1, 0 for a plain plane (any dtype but u4 and u5),
- * RAD_E_DTYPE for planes these kernels do not read, RAD_E_SHAPE for codes not covering [n, k]. */
+/* An expert's codes: 1 with `out` filled, or 0 for a plain plane these kernels do not read as a
+ * codebook. The u4/u5 forms are always joined (only their table says what a code means); Q5_0 and
+ * Q2_0 arrive as a plain i5 or u2 plane, whose code is the level (Q5_0) or the level plus one
+ * (Q2_0), so their tables are implicit. RAD_E_DTYPE for joined planes these kernels do not read,
+ * RAD_E_SHAPE for codes not covering [n, k]. */
 static int cb_codes(const RadTensor& w, int64_t n, int64_t k, CbExp* out) {
+    if (w.dtype == RAD_I5 || w.dtype == RAD_U2) {
+        if (!w.data || w.rank < 2 || w.shape[0] < n || w.shape[1] < k) return RAD_E_SHAPE;
+        if (rad_planes_header(w.data)) return RAD_E_DTYPE;   /* stored as a single plane */
+        const bool i5 = w.dtype == RAD_I5;
+        out->codes = (const uint8_t*)w.data;
+        out->row_bytes = rad_dtype_bytes(w.dtype, w.shape[1]);
+        out->n = n;
+        out->k = k;
+        out->bits = i5 ? 5 : 2;
+        /* The raw codes are two's complement (Q5_0) or offset by one (Q2_0). */
+        for (int c = 0; c < (1 << out->bits); ++c)
+            out->tab[c] = i5 ? (float)(c < 16 ? c : c - 32) : (float)(c - 1);
+        return out->row_bytes > 0 ? 1 : RAD_E_SHAPE;
+    }
     if (w.dtype != RAD_U4 && w.dtype != RAD_U5) return 0;
     const RadPlanesHeader* h = rad_planes_header(w.data);
     const RadPlanesEntry *ec = nullptr, *et = nullptr;
@@ -288,9 +312,12 @@ static int cb_codes(const RadTensor& w, int64_t n, int64_t k, CbExp* out) {
     const void* tab = h ? rad_planes_find(w.data, "table", &et) : nullptr;
     if (!codes || !tab || h->n_planes != 2) return RAD_E_DTYPE;
     const int bits = ec->dtype == RAD_U4 ? 4 : ec->dtype == RAD_U5 ? 5 : 0;
+    /* A rotated codebook's table is f32; IQ4_NL's is the sixteen signed bytes the GGUF plane
+     * indexes, converted to the levels the decode multiplies. */
+    const bool i8tab = et->dtype == RAD_I8;
     if (!bits || ec->kind != RAD_PLANE_TILED || ec->block[0] != 1 || ec->block[1] != 1 ||
-        et->kind != RAD_PLANE_TABLE || et->dtype != RAD_F32 ||
-        et->rows * et->cols != ((int64_t)1 << bits))
+        et->kind != RAD_PLANE_TABLE || (et->dtype != RAD_F32 && !i8tab) ||
+        et->rows * et->cols != ((int64_t)1 << bits) || (i8tab && bits != 4))
         return RAD_E_DTYPE;
     if (ec->rows < n || ec->cols < k) return RAD_E_SHAPE;
     out->codes = (const uint8_t*)codes;
@@ -298,7 +325,12 @@ static int cb_codes(const RadTensor& w, int64_t n, int64_t k, CbExp* out) {
     out->n = n;
     out->k = k;
     out->bits = bits;
-    std::memcpy(out->tab, tab, sizeof(float) << bits);
+    if (i8tab) {
+        const int8_t* lv = (const int8_t*)tab;
+        for (int c = 0; c < 16; ++c) out->tab[c] = (float)lv[c];
+    } else {
+        std::memcpy(out->tab, tab, sizeof(float) << bits);
+    }
     return 1;
 }
 
@@ -896,8 +928,11 @@ static int moe_codebook(const CbCall& c) {
 #if AVX_LEVEL == 3
         if (path == kCbLines && !cb_lines(x)) path = kCbChunks;
 #endif
+        /* The chunk decode exists only for four- and five-bit codes; Q2_0's two-bit plane takes
+         * the generic table decode. */
         if (path == kCbChunks &&
-            (k % kCbCH != 0 || x.group % kCbCH != 0 || x.bits != ex[0].bits))
+            (k % kCbCH != 0 || x.group % kCbCH != 0 || x.bits != ex[0].bits ||
+             (x.bits != 4 && x.bits != 5)))
             path = kCbGeneric;
     }
 
@@ -976,7 +1011,11 @@ static int moe_codebook(const CbCall& c) {
  * be invisible to a checker that sizes the operand one way. */
 static int moe_gemm_impl(const RadArgs* a, bool quant, int ncls = 2) {
     const int n_opd = quant ? (ncls == 4 ? 13 : 9) : 5;
-    if (!rad_args_have(a, n_opd)) return RAD_E_INVAL;
+    /* The activation scale is optional (the A16 experts carry none), so every other operand in
+     * the prefix must be present rather than all of them. */
+    if (!a || !a->t || a->n_t < n_opd) return RAD_E_INVAL;
+    for (int i = 0; i < n_opd; ++i)
+        if (!(quant && i == 1) && !rad_arg_in(a, i)) return RAD_E_INVAL;
     const RadTensor* A = &a->t[0];
     const RadTensor* as_ = quant ? rad_arg_in(a, 1) : nullptr;
     const RadTensor* W = &a->t[quant ? 2 : 1];
@@ -1039,8 +1078,10 @@ static int moe_gemm_impl(const RadArgs* a, bool quant, int ncls = 2) {
     const int64_t y_rs = row_stride(Y, N);
     const int64_t y_cs = Y->rank >= 2 ? Y->stride[Y->rank - 1] : 1;
 
-    /* u4 or u5 codes are the codebook experts' joined form, which only their own path reads. */
-    if (quant && (Wq[0]->dtype == RAD_U4 || Wq[0]->dtype == RAD_U5)) {
+    /* u4 or u5 codes are the codebook experts' joined form, which only their own path reads;
+     * Q5_0's i5 and Q2_0's u2 are the same experts' plain stored planes. */
+    if (quant && (Wq[0]->dtype == RAD_U4 || Wq[0]->dtype == RAD_U5 ||
+                  Wq[0]->dtype == RAD_I5 || Wq[0]->dtype == RAD_U2)) {
         CbCall c;
         c.A = A; c.sorted = sorted; c.off = off; c.Y = Y;
         for (int q = 0; q < 4; ++q) {

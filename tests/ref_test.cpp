@@ -4884,11 +4884,15 @@ TEST(op_moe_gemm_q_mod4) {
  * description (core/runtime/oracle.cpp). The final case is one last-class expert at K = 128 whose
  * 64-wide halves scale by 2 and 3 under one 0.5 activation scale; any other grid reads differently. */
 TEST(op_moe_gemm_q_scale_grid_by_dtype) {
-    struct Want { const char* dt; int64_t rows, cols; };
-    /* N 256, K 512, group 128; the last class at N 128, K 256. */
-    const Want wants[] = { { "fp8a8", 2, 4 },      { "w4a8", 256, 4 },     { "w4a8h", 256, 4 },
-                           { "w4nla8h", 256, 4 },  { "w4nl64a8h", 256, 8 }, { "w5nl64a8h", 256, 8 },
-                           { "w4nl32a8h", 256, 16 }, { "mxfp4a8", 256, 16 } };
+    struct Want { const char* dt; int64_t rows, cols; bool f16; };
+    /* N 256, K 512, group 128; the last class at N 128, K 256. The unrotated GGUF forms carry
+     * f16 scales: one per 32 of K for IQ4_NL and Q5_0, one per 64 for Q2_0. */
+    const Want wants[] = { { "fp8a8", 2, 4, false },      { "w4a8", 256, 4, false },
+                           { "w4a8h", 256, 4, false },    { "w4nla8h", 256, 4, false },
+                           { "w4nl64a8h", 256, 8, false }, { "w5nl64a8h", 256, 8, false },
+                           { "w4nl32a8h", 256, 16, false }, { "mxfp4a8", 256, 16, false },
+                           { "iq4nl32a16", 256, 16, true }, { "q50a16", 256, 16, true },
+                           { "q20a16", 256, 8, true } };
     for (const char* op : { "moe_gemm_q", "moe_gemm_q_mod4" }) {
         const RadKernelInfo* k = kern(op);
         REQUIRE(k != nullptr && k->opd_shape != nullptr);
@@ -4904,7 +4908,8 @@ TEST(op_moe_gemm_q_scale_grid_by_dtype) {
             RadOpdDesc d{}, dl{};
             REQUIRE_EQ(k->opd_shape(r->p, r->n_p, 3, &d), RAD_OK);
             REQUIRE_EQ(k->opd_shape(r->p, r->n_p, last, &dl), RAD_OK);
-            CHECK_EQ(d.dtype, !std::strcmp(w.dt, "mxfp4a8") ? (uint32_t)RAD_U8 : (uint32_t)RAD_BF16);
+            CHECK_EQ(d.dtype, !std::strcmp(w.dt, "mxfp4a8") ? (uint32_t)RAD_U8
+                             : w.f16 ? (uint32_t)RAD_F16 : (uint32_t)RAD_BF16);
             CHECK_EQ(d.rank, 3u);
             CHECK_EQ(d.shape[0], four ? 2LL : 4LL);
             if (d.shape[1] != w.rows || d.shape[2] != w.cols)
@@ -4988,6 +4993,257 @@ TEST(op_moe_gemm_q_scale_grid_by_dtype) {
                 CHECK_EQ(k->opd_shape(r->p, r->n_p, opd, &d), RAD_E_UNSUPPORTED);
             }
         }
+    }
+}
+
+/* The three unrotated GGUF expert encodings, host-side: libref must read the same planes libhalo
+ * serves at W4 = 6/7/8. IQ4_NL's u4 codes index a sixteen-entry i8 table; Q5_0's signed i5 codes
+ * name their level; Q2_0's u2 codes name level - 1. All carry f16 scales (per 32 of K, per 64 for
+ * Q2_0) and bf16 activations, so there is no activation scale. The expected values are a host
+ * decode of the same canonical planes, as libhalo's selftest computes them, summed in double. */
+TEST(op_moe_gemm_q_unrotated_codebooks) {
+    struct Form { const char* dtype; uint32_t cdt; uint32_t tdt; int bits; int64_t gs; };
+    const Form forms[] = {
+        { "iq4nl32a16", RAD_U4, RAD_I8, 4, 32 },
+        { "q50a16",     RAD_I5, 0,      5, 32 },
+        { "q20a16",     RAD_U2, 0,      2, 64 },
+    };
+    static const int8_t kIq4Nl[16] = { -127, -104, -83, -65, -49, -35, -22, -10,
+                                       1,    13,   25,  38,  53,  69,  89, 113 };
+    const RadKernelInfo* k = kern("moe_gemm_q");
+    REQUIRE(k != nullptr && k->layout != nullptr && k->relayout != nullptr);
+
+    const int64_t ne = 4, top_k = 2, M = 3, NT = M * top_k;
+    const int64_t Nc[2] = { 8, 8 }, Kc[2] = { 64, 64 };
+    const int64_t N = 8, K = 64, ne0 = ne / 2, ne1 = ne / 2;
+
+    /* The routing: slot (t, j) goes to expert (2t + j) % ne, sorted by expert as moe_scatter
+     * leaves it. */
+    std::vector<int64_t> sorted, offs;
+    auto expert_of = [&](int64_t i) { return (2 * (i / top_k) + i % top_k) % ne; };
+    for (int64_t e = 0; e < ne; ++e) {
+        offs.push_back((int64_t)sorted.size());
+        for (int64_t i = 0; i < NT; ++i)
+            if (expert_of(i) == e) sorted.push_back(i);
+    }
+    offs.push_back((int64_t)sorted.size());
+    while ((int64_t)sorted.size() < NT) sorted.push_back(-1);
+
+    /* The activation is bf16, exact in f32: small quarters. */
+    T act(RAD_BF16, { M, K });
+    for (int64_t i = 0; i < M * K; ++i)
+        st_dt(RAD_BF16, act.t.data, i, (float)(((i * 17 + 5) % 97) - 48) * 0.25f);
+
+    for (const Form& f : forms) {
+        RadEncoding enc;
+        rad_enc_clear(&enc);
+        rad_enc_copy_str(enc.scheme, "affine");
+        rad_enc_copy_str(enc.transform, "");
+        const int ic = rad_enc_add_plane(&enc, "codes", f.cdt, 1, 1);
+        const int is = rad_enc_add_plane(&enc, "scale", RAD_F16, 1, f.gs);
+        const int it = f.tdt ? rad_enc_add_table(&enc, "table", f.tdt, 1, 16) : -1;
+        const std::vector<int> sel_c = it >= 0 ? std::vector<int>{ ic, it } : std::vector<int>{ ic };
+        const std::vector<int> sel_s = { is };
+        const RadParam p[] = { RadParam{ "dtype", RAD_P_STR, 0, 0, f.dtype, 0 } };
+
+        /* The description the oracle and rad-kbench size the weight from: its codes dtype and
+         * the f16 scale plane's grid. */
+        {
+            A pa;
+            pa.i("M", M).i("N", Nc[0]).i("K", Kc[0]).i("N_odd", Nc[1]).i("K_odd", Kc[1])
+              .i("n_expert", ne).i("top_k", top_k).i("group", 128).s("a_order", "token")
+              .s("dtype", f.dtype);
+            const RadArgs* r = pa.get();
+            RadOpdDesc dw{}, ds{};
+            REQUIRE_EQ(k->opd_shape(r->p, r->n_p, 2, &dw), RAD_OK);
+            CHECK_EQ(dw.dtype, f.cdt);
+            CHECK_EQ(dw.shape[0], ne0);
+            CHECK_EQ(dw.shape[1], Nc[0]);
+            CHECK_EQ(dw.shape[2], Kc[0]);
+            REQUIRE_EQ(k->opd_shape(r->p, r->n_p, 3, &ds), RAD_OK);
+            CHECK_EQ(ds.dtype, (uint32_t)RAD_F16);
+            CHECK_EQ(ds.shape[1], Nc[0]);
+            CHECK_EQ(ds.shape[2], Kc[0] / f.gs);
+        }
+
+        struct Enc {
+            std::vector<uint8_t> codes, scale, table;
+            int64_t rbc = 0, rbs = 0;
+        };
+        std::vector<Enc> ex((size_t)ne);
+        std::vector<std::vector<uint8_t>> stored_c[2], stored_s[2];
+        std::vector<void*> cptr[2], sptr[2];
+        uint32_t cdt[2] = { 0, 0 };
+        const char* err = "";
+        for (int64_t e = 0; e < ne; ++e) {
+            const int c = (int)(e % 2);
+            const int64_t n = Nc[c], kk = Kc[c], ng = (kk + f.gs - 1) / f.gs;
+            Enc& E = ex[(size_t)e];
+            E.rbc = rad_enc_row_bytes(f.cdt, kk);
+            E.rbs = rad_enc_row_bytes(RAD_F16, ng);
+            E.codes.assign((size_t)(n * E.rbc), 0);
+            E.scale.assign((size_t)(n * E.rbs), 0);
+            if (f.tdt) { E.table.assign(16, 0); std::memcpy(E.table.data(), kIq4Nl, 16); }
+            const double base = f.bits == 4 ? 127.0 : f.bits == 5 ? 16.0 : 2.0;
+            for (int64_t r = 0; r < n; ++r)
+                for (int64_t g = 0; g < ng; ++g) {
+                    double amax = 0;
+                    for (int64_t j = 0; j < f.gs; ++j) {
+                        const double v = (double)(((e * 7 + r * 31 + (g * f.gs + j) * 17) % 61) - 30) /
+                                         37.0;
+                        amax = std::max(amax, std::fabs(v));
+                    }
+                    const double s = amax > 0 ? amax / base : 1.0;
+                    const int64_t so = r * E.rbs + g * 2;
+                    st_dt(RAD_F16, E.scale.data() + so, 0, (float)s);
+                    const float sf = ld_dt(RAD_F16, E.scale.data() + so, 0);
+                    for (int64_t j = 0; j < f.gs; ++j) {
+                        const float v = (float)(((e * 7 + r * 31 + (g * f.gs + j) * 17) % 61) - 30) /
+                                        37.0f;
+                        int code;
+                        if (f.bits == 4) {
+                            code = 0;
+                            for (int q = 1; q < 16; ++q)
+                                if (std::fabs(v / sf - (float)kIq4Nl[q]) <
+                                    std::fabs(v / sf - (float)kIq4Nl[code])) code = q;
+                        } else if (f.bits == 5) {
+                            code = (int)std::max(-16.0f, std::min(15.0f, std::nearbyint(v / sf)));
+                        } else {
+                            code = (int)std::max(-1.0f, std::min(2.0f, std::nearbyint(v / sf))) + 1;
+                        }
+                        rad_store_code(E.codes.data() + r * E.rbc, f.cdt, g * f.gs + j, code);
+                    }
+                }
+
+            /* Store each view the way the row's layout hooks ask. */
+            auto store = [&](int opd, const std::vector<int>& sel,
+                             const std::vector<std::vector<uint8_t>>& pl, int64_t cols,
+                             std::vector<uint8_t>* out, uint32_t* dt) {
+                std::vector<RadTensor> pt(sel.size());
+                for (size_t s = 0; s < sel.size(); ++s) {
+                    pt[s] = RadTensor{};
+                    pt[s].data = const_cast<uint8_t*>(pl[s].data());
+                    pt[s].dtype = enc.plane[sel[s]].dtype;
+                    pt[s].rank = 2;
+                    pt[s].shape[0] = s == 0 ? n : 1;
+                    pt[s].shape[1] = s == 0 ? cols : 16;
+                    pt[s].stride[0] = pt[s].shape[1];
+                    pt[s].stride[1] = 1;
+                }
+                RadLayout L{};
+                int rc = k->layout(p, 1, opd, &enc, sel.data(), pt.data(), (int)sel.size(), &L);
+                if (rc == RAD_E_UNSUPPORTED) {
+                    *out = pl[0];
+                    *dt = pt[0].dtype;
+                    return;
+                }
+                if (rc < 0) { err = "the layout hook refused a codebook view"; return; }
+                out->assign((size_t)L.bytes, 0);
+                if (k->relayout(p, 1, opd, &enc, sel.data(), pt.data(), (int)sel.size(),
+                                out->data(), L.bytes) != RAD_OK) {
+                    err = "the relayout hook refused a codebook view";
+                    return;
+                }
+                *dt = L.dtype;
+            };
+            const int ow = c ? 6 : 2, os = c ? 7 : 3;
+            std::vector<uint8_t> bc, bs;
+            uint32_t dtc = 0, dts = 0;
+            store(ow, sel_c, { E.codes, E.table }, kk, &bc, &dtc);
+            store(os, sel_s, { E.scale }, ng, &bs, &dts);
+            if (err[0]) break;
+            if (dts != RAD_F16) err = "the scale view is not the f16 plane";
+            /* IQ4_NL joins codes and table; Q5_0 and Q2_0 store the single code plane as it
+             * is; every one of the three stores the f16 scale plane as it is. */
+            if (f.tdt ? bc.size() <= E.codes.size() : bc.size() != E.codes.size())
+                err = "the codes view was not stored as the encoding asks";
+            if (bs.size() != E.scale.size()) err = "the scale view was not stored as it is";
+            if (err[0]) break;
+            stored_c[c].push_back(bc);
+            stored_s[c].push_back(bs);
+            cptr[c].push_back(stored_c[c].back().data());
+            sptr[c].push_back(stored_s[c].back().data());
+            cdt[c] = dtc;
+        }
+        if (err[0]) { CHECK(false); fprintf(stderr, "    %s: %s\n", f.dtype, err); continue; }
+
+        RadTensor w0{}, s0{}, w1{}, s1{};
+        auto wt = [](std::vector<void*>& ptr, uint32_t dt, int64_t rows, int64_t n, int64_t cols) {
+            RadTensor t{};
+            t.data = ptr.data();
+            t.dtype = dt;
+            t.rank = 3;
+            t.shape[0] = rows; t.shape[1] = n; t.shape[2] = cols;
+            t.stride[0] = 0; t.stride[1] = cols; t.stride[2] = 1;
+            return t;
+        };
+        w0 = wt(cptr[0], cdt[0], ne0, Nc[0], Kc[0]);
+        s0 = wt(sptr[0], RAD_F16, ne0, Nc[0], Kc[0] / f.gs);
+        w1 = wt(cptr[1], cdt[1], ne1, Nc[1], Kc[1]);
+        s1 = wt(sptr[1], RAD_F16, ne1, Nc[1], Kc[1] / f.gs);
+
+        T sorted_t(RAD_I32, { NT }); sorted_t.n(sorted);
+        T off_t(RAD_I32, { ne + 1 }); off_t.n(offs);
+        T y(RAD_BF16, { NT, N });
+        A a;
+        a.ts.push_back(act.t);
+        a.ts.push_back(RadTensor{});
+        a.ts.push_back(w0);
+        a.ts.push_back(s0);
+        a.ts.push_back(sorted_t.t);
+        a.ts.push_back(off_t.t);
+        a.ts.push_back(w1);
+        a.ts.push_back(s1);
+        a.ts.push_back(y.t);
+        a.i("M", M).i("N", Nc[0]).i("K", Kc[0]).i("N_odd", Nc[1]).i("K_odd", Kc[1])
+         .i("n_expert", ne).i("top_k", top_k).i("group", 128).s("a_order", "token")
+         .s("dtype", f.dtype);
+        const int rc = run("moe_gemm_q", a);
+        if (rc != RAD_OK) {
+            fprintf(stderr, "    %s: launch %d\n", f.dtype, rc);
+            CHECK_EQ(rc, RAD_OK);
+            continue;
+        }
+
+        /* The host decode of the same planes, summed in double. */
+        double worst = 0;
+        for (int64_t i = 0; i < NT; ++i) {
+            const int64_t flat = sorted[(size_t)i];
+            int64_t e = 0;
+            while (e + 1 < ne && offs[(size_t)(e + 1)] <= i) ++e;
+            const int c = (int)(e % 2);
+            const int64_t n = Nc[c], kk = Kc[c], ng = kk / f.gs;
+            const int64_t tok = flat < 0 ? -1 : flat / top_k;
+            const Enc& E = ex[(size_t)e];
+            for (int64_t col = 0; col < N; ++col) {
+                double want = 0.0;
+                if (tok >= 0 && col < n) {
+                    const int64_t r = col;
+                    for (int64_t g = 0; g < ng; ++g) {
+                        double part = 0.0;
+                        for (int64_t j = 0; j < f.gs; ++j) {
+                            const int64_t kk2 = g * f.gs + j;
+                            const int code = (int)rad_load_f32(E.codes.data() + r * E.rbc,
+                                                              f.cdt, kk2);
+                            const double lv = f.tdt == RAD_I8
+                                                  ? (double)((const int8_t*)E.table.data())[code]
+                                              : f.bits == 2 ? (double)(code - 1)
+                                                            : (double)code;
+                            part += lv * (double)rad_load_f32(act.t.data, RAD_BF16,
+                                                              tok * K + kk2);
+                        }
+                        want += part * (double)rad_load_f32(E.scale.data() + r * E.rbs,
+                                                            RAD_F16, g);
+                    }
+                }
+                const double got = y.at(i * N + col);
+                const double d = std::fabs(got - want) / (1.0 + std::fabs(want));
+                if (d > worst) worst = d;
+                CHECK(d <= 1e-2);
+            }
+        }
+        if (worst > 1e-2)
+            std::fprintf(stderr, "    %s: worst relative error %.3e\n", f.dtype, worst);
     }
 }
 

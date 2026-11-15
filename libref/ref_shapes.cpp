@@ -2105,23 +2105,38 @@ int ref_moe_gemm_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
 /* The weight scale grid `dtype` names, as weight rows and K elements per scale. Block-fp8 experts
  * (fp8a8) carry the checkpoint's one scale per 128x128 tile (`group` = 128). The 4-bit formats
  * (docs/MOE-W4.md) carry one per row per K group: all of `group` for w4a8, w4a8h and w4nla8h, half
- * for w4nl64a8h and w5nl64a8h, a quarter for w4nl32a8h. These are the served format names
- * (arch/common/rad_block_moe_fp8.h, kServed). Any other dtype returns { 0, 0 } and the description
- * declines rather than guess a grid.
+ * for w4nl64a8h and w5nl64a8h, a quarter for w4nl32a8h. The unrotated GGUF forms are fixed
+ * regardless of `group`: IQ4_NL and Q5_0 carry an f16 scale per 32 of K and Q2_0 one per 64.
+ * These are the served format names (arch/common/rad_block_moe_fp8.h, kServed). Any other dtype
+ * returns { 0, 0 } and the description declines rather than guess a grid. `sdt` is the scale's
+ * stored dtype, 0 where the description's activation dtype is used.
  *
  * The grid matters beyond extents: re-laid weights are inverted into the tensor described here
  * before the oracle reads them (core/runtime/oracle.cpp), so the wrong grid leaves the scales
  * nothing to invert into. The arithmetic (ref_gemm.h) derives the group from the extents. */
-struct MoeScaleGrid { int64_t rows, k; };
+struct MoeScaleGrid { int64_t rows, k; uint32_t sdt; };
 static MoeScaleGrid moe_scale_grid(const RadParam* p, int n_p, int64_t g) {
     const char* d = gs(p, n_p, "dtype");
     auto is = [&](const char* s) { return d && std::strcmp(d, s) == 0; };
-    if (is("fp8a8") || is("fp8a8f32")) return { g, g };
-    if (is("mxfp4a8")) return { 1, 32 };
-    if (is("w4a8") || is("w4a8h") || is("w4nla8h")) return { 1, g };
-    if (is("w4nl64a8h") || is("w5nl64a8h")) return { 1, g / 2 };
-    if (is("w4nl32a8h")) return { 1, g / 4 };
-    return { 0, 0 };
+    if (is("fp8a8") || is("fp8a8f32")) return { g, g, 0 };
+    if (is("mxfp4a8")) return { 1, 32, 0 };
+    if (is("w4a8") || is("w4a8h") || is("w4nla8h")) return { 1, g, 0 };
+    if (is("w4nl64a8h") || is("w5nl64a8h")) return { 1, g / 2, 0 };
+    if (is("w4nl32a8h")) return { 1, g / 4, 0 };
+    /* The unrotated GGUF forms: f16 scales at a fixed group, no dependence on `group`. */
+    if (is("iq4nl32a16") || is("q50a16")) return { 1, 32, (uint32_t)RAD_F16 };
+    if (is("q20a16")) return { 1, 64, (uint32_t)RAD_F16 };
+    return { 0, 0, 0 };
+}
+
+/* The codes' stored dtype for the unrotated GGUF dtypes, 0 where the caller's default (E4M3
+ * codes or mxfp4's e2m1) applies. */
+static uint32_t moe_code_dtype(const char* d) {
+    if (!d) return 0;
+    if (!std::strcmp(d, "iq4nl32a16")) return (uint32_t)RAD_U4;
+    if (!std::strcmp(d, "q50a16")) return (uint32_t)RAD_I5;
+    if (!std::strcmp(d, "q20a16")) return (uint32_t)RAD_U2;
+    return 0;
 }
 
 /* The quantised arm: the same planes plus two scale streams, the activation's per row per K group
@@ -2153,17 +2168,23 @@ int ref_moe_gemm_q_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* ou
     const int64_t AR = sorted_a_order(p, n_p) ? M * k : M;
     const char* kind = gs(p, n_p, "dtype");
     const bool mx = kind && !std::strcmp(kind, "mxfp4a8");
-    const auto SD = kind && !std::strcmp(kind, "fp8a8f32") ? (uint32_t)RAD_F32 : D;
+    /* The unrotated GGUF experts: IQ4_NL's u4 codes, Q5_0's signed i5 and Q2_0's u2, with f16
+     * scales per 32 or 64 of K. The codes are stored as the container has them; only IQ4_NL's view
+     * joins a table. */
+    const uint32_t SD = sg.sdt ? sg.sdt
+                      : kind && !std::strcmp(kind, "fp8a8f32") ? (uint32_t)RAD_F32 : D;
+    const uint32_t WDT = mx ? (uint32_t)RAD_FP4E2M1
+                        : moe_code_dtype(kind) ? moe_code_dtype(kind) : (uint32_t)RAD_F8E4M3;
     o.t((uint32_t)RAD_F8E4M3, { AR, K });             /* a -- E4M3 codes, see `a_order` */
     o.t((uint32_t)RAD_F32, { AR, (K + g - 1) / g });   /* a_scale */
     /* w -- the even experts; mxfp4a8 carries e2m1 codes with an E8M0 byte per (row, 32 of K) */
-    o.t(mx ? (uint32_t)RAD_FP4E2M1 : (uint32_t)RAD_F8E4M3, { ne0, N0, K0 });
+    o.t(WDT, { ne0, N0, K0 });
     if (mx) o.t_idx_dt(RAD_U8, { ne0, N0, (K0 + 31) / 32 }, 0, 127, 0);    /* w_scale */
     else    o.t(SD, { ne0, (N0 + sg.rows - 1) / sg.rows, (K0 + sg.k - 1) / sg.k });
     o.t_idx({ M * k }, M * k, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* sorted_tok */
     o.t_idx({ ne + 1 }, M * k + 1, -1, (uint32_t)RAD_OPD_F_IDX_PREFIX);   /* expert_offset */
     /* w_odd -- the odd experts */
-    o.t(mx ? (uint32_t)RAD_FP4E2M1 : (uint32_t)RAD_F8E4M3, { ne1, N1, K1 });
+    o.t(WDT, { ne1, N1, K1 });
     if (mx) o.t_idx_dt(RAD_U8, { ne1, N1, (K1 + 31) / 32 }, 0, 127, 0);    /* w_odd_scale */
     else    o.t(SD, { ne1, (N1 + sg.rows - 1) / sg.rows, (K1 + sg.k - 1) / sg.k });
     o.t(D, { M * k, N });                             /* y -- in sorted order */
@@ -2195,11 +2216,15 @@ int ref_moe_gemm_q_mod4_shape(const RadParam* p, int n_p, int operand, RadOpdDes
     const int64_t AR = sorted_a_order(p, n_p) ? M * k : M;
     const char* kind = gs(p, n_p, "dtype");
     const bool mx = kind && !std::strcmp(kind, "mxfp4a8");
+    const uint32_t SD = sg.sdt ? sg.sdt
+                      : kind && !std::strcmp(kind, "fp8a8f32") ? (uint32_t)RAD_F32 : D;
+    const uint32_t WDT = mx ? (uint32_t)RAD_FP4E2M1
+                        : moe_code_dtype(kind) ? moe_code_dtype(kind) : (uint32_t)RAD_F8E4M3;
     auto cls = [&](int q) {
         const int64_t nq = (ne + 3 - q) / 4;
-        o.t(mx ? (uint32_t)RAD_FP4E2M1 : (uint32_t)RAD_F8E4M3, { nq, Nq[q], Kq[q] });
+        o.t(WDT, { nq, Nq[q], Kq[q] });
         if (mx) o.t_idx_dt(RAD_U8, {nq, Nq[q], (Kq[q] + 31) / 32}, 0, 127, 0);
-        else o.t(D, { nq, (Nq[q] + sg.rows - 1) / sg.rows, (Kq[q] + sg.k - 1) / sg.k });
+        else o.t(SD, { nq, (Nq[q] + sg.rows - 1) / sg.rows, (Kq[q] + sg.k - 1) / sg.k });
     };
     o.t((uint32_t)RAD_F8E4M3, { AR, K });             /* a -- E4M3 codes, see `a_order` */
     o.t((uint32_t)RAD_F32, { AR, (K + g - 1) / g });   /* a_scale */
