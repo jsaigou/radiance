@@ -122,6 +122,11 @@ struct Model {
     Geom           g{};
     GdnFP8::Config gcfg{};
     MoeFP8::Config moecfg{};
+    /* One expert format per trunk layer. A UD map may mix unrotated (IQ2_S/Q2_0) and rotated
+     * (w3nl/w4nl/w5nl) layers; the shared buffers are sized from any layer that needs them, and
+     * each layer's connection/MoE block follows its own flags. */
+    std::vector<MoeFP8::Config> moecfgs;
+    bool any_rot = false, any_bf16 = false;   /* any trunk layer's expert family */
     /* The MTP head's own expert format, probed like the trunk's. A mirror map may store the kept
      * MTP layer in another form than the trunk (the fast and mirror recipes write `blk.48` at
      * w4nl64 while the UD trunk is unrotated), and the head's connection rotator and the block's
@@ -490,6 +495,25 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                             "model.language_model.layers.0.mlp.experts", &ps));
             RAD_ARCH_TRY(MoeFP8::probe(b, nm, 0, ps, &mc));
         }
+        /* A UD map may choose the format per layer (the size policy keeps IQ2_S/Q2_0 on some
+         * layers and the rotated codebooks on the rest). Probe every trunk layer so its own
+         * connection and MoE block follow the stored form; the shared dimensions stay in
+         * `moecfg`. The probe is declaration-time metadata only. */
+        m.moecfgs.assign((size_t)g.n_layer, mc);
+        m.moecfgs[0] = mc;
+        for (int64_t l = 1; l < g.n_layer; ++l) {
+            MoeFP8::Src ps{};
+            RAD_ARCH_TRY(moe_expert_sources(
+                b, nm, "format",
+                nm.ckpt("model.language_model.layers.%lld.mlp.experts", (long long)l), &ps));
+            m.moecfgs[(size_t)l].probed_expert = mc.probed_expert;
+            RAD_ARCH_TRY(MoeFP8::probe(b, nm, (int)l, ps, &m.moecfgs[(size_t)l]));
+        }
+        m.any_rot = m.any_bf16 = false;
+        for (const MoeFP8::Config& c : m.moecfgs) {
+            m.any_rot  = m.any_rot  || c.expert_rot;
+            m.any_bf16 = m.any_bf16 || c.expert_bf16;
+        }
         /* Plain experts mean a container converted without a quantising recipe, so every linear
          * is plain too: the blocks issue bf16 GEMMs over bf16 activations and nothing quantises
          * (Geom::w_bf16). Each linear refuses a quantised encoding then. The converse is allowed:
@@ -803,7 +827,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
      * linear: the trunk's are, and the routed experts then read the rotated copy or the bf16
      * plane. When experts read the plain E4M3 codes, the connections keep those and the int8
      * linears quantise for themselves. */
-    m.hccfg.codes_i8 = (m.trunk_i8 && (m.moecfg.expert_rot || m.moecfg.expert_bf16)) ? 1 : 0;
+    m.hccfg.codes_i8 = (m.trunk_i8 && (m.any_rot || m.any_bf16)) ? 1 : 0;
     m.a_x.q8_fed     = m.hccfg.codes_i8 != 0;
     m.b_inj = decl_b(b, nm.f("hc_inj"), g.act_dtype, {T, m.hccfg.hc});
 
@@ -924,7 +948,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     }
     /* Either arm's rotated experts read this pair: the trunk's, or a kept MTP layer stored in a
      * rotated form beside an unrotated trunk. */
-    if (m.moecfg.expert_rot || m.mtpcfg.expert_rot)
+    if (m.any_rot || m.mtpcfg.expert_rot)
         RAD_ARCH_TRY(m.a_hr.declare_qs(b, nm, g, "moe_hr", g.n_embd));
     m.b_edn     = decl_b(b, nm.f("moe_edn"),    g.act_dtype, {ER, g.n_embd});
     m.b_emoe    = decl_b(b, nm.f("moe_out"),    g.act_dtype, {T, g.n_embd});
@@ -1256,14 +1280,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                                 pre, (long long)l);
         /* The rotated expert plane's input codes come out of this read, beside the plain ones
          * the shared arm takes, so the routed arm declares no quantiser of its own. */
+        const MoeFP8::Config& lmc = m.moecfgs[(size_t)l];
         HyperConn::Config fcfg = m.hccfg;
         HyperConn::Wire   fw   = hw;
-        if (m.moecfg.expert_rot) { fcfg.rotate = 1; fw.rq = m.a_hr.q; fw.rs = m.a_hr.s; }
+        if (lmc.expert_rot) { fcfg.rotate = 1; fw.rq = m.a_hr.q; fw.rs = m.a_hr.s; }
         RAD_ARCH_TRY(lay.hc_ffn.declare(b, nm, g, nm.f("blk.%lld.ffn_hc", (long long)l),
                                         fcfg, fw, ffns));
 
         MoeFP8::Src ms{};
-        ms.cfg              = m.moecfg;
+        ms.cfg              = lmc;
         ms.router           = nm.ckpt("%s.%lld.mlp.gate.weight", pre, (long long)l);
         RAD_ARCH_TRY(moe_expert_sources(b, nm, "layer",
                                         nm.ckpt("%s.%lld.mlp.experts", pre, (long long)l), &ms));
