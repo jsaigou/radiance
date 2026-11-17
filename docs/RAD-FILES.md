@@ -68,5 +68,10 @@ size mean 0.2090 / median 0.0547 / top-1 83.53%. The mean and p99 carry a long t
 - The source weights keep their own licences, and so do Unsloth's quantisation maps and importance matrices; a published `.rad` is a derivative of
   both. Check each upstream licence and attribute it before redistributing a container. `core/server/systemone.cpp` and `data/vectors/` in this
   repository carry their own terms (see `NOTICE`).
+- A `.rad` embeds its recipe verbatim, so a recipe option that names a local path (the GPTQ `calib=` directory, for one) travels with the file. The engine ignores it at load. Before sharing,
+  search the first 20 MiB (everything before the weight data) for local paths and user names, then replace each occurrence **in place with a string of exactly the same length**: the recipe lives in the
+  container's string blob, addressed by offset, so equal-length edits move nothing. Work on a copy, confirm with `cmp -l` that the only differences are those bytes, and load the copy and compare its
+  output with the original's at temperature 0. We did this for the Qwen3.6 GPTQ container (4 occurrences, 140 differing bytes, identical output on six prompts including a 10K-token one). The model
+  cards for the containers we publish are in [`hf-cards/`](hf-cards/).
 - Record, for every published container, the fork commit, the recipe, the source model revision, the UD file revision and the SHA-256 of the `.rad`.
   `ud_map verify` prints the hashes.
