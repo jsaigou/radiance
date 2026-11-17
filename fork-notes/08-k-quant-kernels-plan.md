@@ -70,6 +70,13 @@ The end-to-end bar is lower than the W4/W5 container's (2.2x prefill) on purpose
 **Effort (Estimated, focused work, GPU benches included):** phase 0 hours; phase 1 two to four days; phase 2 one to two; phase 3 about a week; phase 4 a week (mixing and two more expert forms); phase 5 two days. Roughly three weeks for the whole mirror, but
 **phases 0 to 2 are the useful decision point**: they answer whether K-quants can run at Radiance speed at all, in under a week.
 
+## 5a. Phase 0 result (2026-11-17): the A8 hypothesis is false on gfx1151
+
+`tools/wmma_peak/wmma_peak.hip` (four independent accumulators per wave, no memory traffic, 40 CUs, `-O3`, ROCm TheRock 10.1) measures **f16 WMMA 54.9 TFLOPs and `iu8` WMMA 55.3 TOPS**: the same rate, not twice.
+The gate "iu8 >= 1.5x f16" fails, so **phase 3 (the A8 form) is dropped**, and the reason in section 3 for expecting A8 to beat the f16 forms (integer WMMA at twice the matrix throughput) does not hold on this part.
+Cross-check through PyTorch (`torch._int_mm` against a bf16 matmul, hipBLASLt, 4096-row GEMMs): bf16 35 to 39 TFLOPs, int8 23 to 34 TOPS: int8 is slower there.
+What remains of the A8 idea is only its smaller staged bytes (half the LDS traffic of bf16 activations), not compute. Section 3's prefill gap for the unrotated A16 forms stands as the cost of a K-quant port.
+
 ## 6. Decision requested
 
 Approve phases 0 to 2 (kernel and bench work in the fork, GPU time on the reference machine under the shared lock, no host changes). Everything after phase 2 is decided from those measurements.
