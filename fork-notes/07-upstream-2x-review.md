@@ -8,9 +8,9 @@ and `v2.1.0` releases). This is an unofficial fork; see [`../UNOFFICIAL-FORK.md`
 This fork stays on the **1.17.0 base**. Upstream 2.0.0 is a redesign we cannot adopt without rebuilding what we run:
 
 - whole-model formats move from FP8 and MXFP4 to **IQ8R** and **IQR-V4**, and the KV cache from FP8 to **int8** (`kv-cache-dtype: i8`); containers whose weights
-  are block FP8 are refused at startup by the name of the first such weight, which is every container this fork's plugins serve;
+  are block FP8 are refused at startup by the name of the first such weight. That includes the stock FP8 containers and our Qwen3.6 W4/W5 containers (block-FP8 trunk);
 - the command-line flags are removed in favour of one YAML file (`radiance --config FILE`), which breaks launchers that build an argument vector;
-- the plugin ABI moves from 38 to 40 and out-of-tree plugins must be rebuilt;
+- the plugin ABI is bumped (39 in 2.0.0, 40 in 2.1.0) and out-of-tree plugins must be rebuilt;
 - a trial merge conflicts in 11 files, including the core of our work (`rad_block_moe_fp8.h`, `qwen4exp_fp8.cpp`, `checkpoint.cpp`, `ref_shapes.cpp`).
 
 **Compatibility policy.** Our additions are additive. A stock `.rad` built for upstream 1.17.0 (FP8 trunk and experts, the published Qwen3.6 and

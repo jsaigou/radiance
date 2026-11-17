@@ -17,6 +17,9 @@ Records added with the kernel work (not bug reports): `06-moe-unrot-bench.md` (u
 (the Q6_K dense wiring the architecture plugin needed), and `flashnext-ud-fit-runbook.md` with `flashnext-ud-mirror.*` (the Flash-Next mirror plan, fit model and
 build runbook). The kernel and container work is summarised in [`../docs/FORK-KERNELS.md`](../docs/FORK-KERNELS.md) and [`../docs/RAD-FILES.md`](../docs/RAD-FILES.md).
 
+`07-upstream-2x-review.md` records the review of upstream 2.0/2.1: why this fork stays on the 1.17.0 base, the compatibility policy for stock `.rad` files,
+the twelve fixes taken with `cherry-pick -x`, and what each taught us.
+
 Unrelated observation: with the FP8 KV cache, speculative decoding at temperature 0 is not bit-identical to non-speculative decoding
 (synonym-level divergence after a few hundred characters). `GUIDE.md` says greedy text matches; this may just be summation order across
 different split counts.
