@@ -635,6 +635,22 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         }
     }
 
+    /* The per-layer configs were copied from `moecfg` and probed before the rank split above, so each
+     * still holds the whole-model geometry (and, at world > 1, none of the slices). Geometry belongs
+     * to the rank and formats to the layer: give every layer this rank's split and keep what each
+     * probe found. Without this a layer's block rejects a width the split made legal (an expert is
+     * 320 columns per rank at two ranks, which is not whole 128-wide scale blocks until the class
+     * slices are applied), a regression that single-rank serving never shows. */
+    for (MoeFP8::Config& lc : m.moecfgs) {
+        lc.n_expert     = m.moecfg.n_expert;
+        lc.n_expert_all = m.moecfg.n_expert_all;
+        lc.expert_base  = m.moecfg.expert_base;
+        lc.n_ff_exp     = m.moecfg.n_ff_exp;
+        for (int q = 0; q < 2; ++q) { lc.ff_lo[q] = m.moecfg.ff_lo[q]; lc.ff_hi[q] = m.moecfg.ff_hi[q]; }
+        for (int q = 0; q < 4; ++q) { lc.ff_lo4[q] = m.moecfg.ff_lo4[q]; lc.ff_hi4[q] = m.moecfg.ff_hi4[q]; }
+        lc.calib        = m.moecfg.calib;
+    }
+
     /* ---- the n-gram embedding's layer and the indexer's geometry, each noted where it changes
      * what this build computes. */
     {
