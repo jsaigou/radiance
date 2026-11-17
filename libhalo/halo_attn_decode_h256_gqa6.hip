@@ -1,5 +1,5 @@
 /* NOTICE OF CHANGE (Apache-2.0 section 4(b)): this file was modified in the UNOFFICIAL fork
- * github.com/jsaigou/radiance, not by the original authors. The original project is
+ * github.com/jsaigou/radiance-strix, not by the original authors. The original project is
  * https://codeberg.org/StillDeadcode/radiance . The change is in decode_scratch(): the declare-time
  * sweep now also covers q_len (see UNOFFICIAL-FORK.md and fork-notes/01-*). */
 /* Derived from libr4d/r4d_attn_decode_h256_gqa6.hip by the libhalo rename transform (2026-10-26),

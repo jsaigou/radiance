@@ -4,6 +4,8 @@
 > project site <https://radiance.stilldeadco.de/>). Official releases, documentation, support and issue tracking are
 > there. **If you want Radiance, go there.** The README below the line is the original author's, unchanged.
 >
+> **Name.** Formerly `jsaigou/radiance`, renamed to **`radiance-strix`** (2026-11-17) because this fork is about AMD Strix Halo. Old URLs redirect. The engine is still `radiance`.
+>
 > **This repository is unofficial.** It is maintained by a third party, is not affiliated with or endorsed by the
 > original author, and comes with no support from them. Please do not report problems with this fork to the original
 > author.

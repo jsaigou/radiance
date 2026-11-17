@@ -1,6 +1,6 @@
 # Q6_K dense: architecture declarations still needed (not committed)
 
-Branch: `kernel-q6k-dense` (jsaigou/radiance, PUBLIC fork). Kernel/shims are in
+Branch: `kernel-q6k-dense` (jsaigou/radiance-strix, PUBLIC fork). Kernel/shims are in
 `libhalo/halo_gemm_q6ka16.hip`, the stored form in `halo_q6k.*`. Nothing in `arch/` was changed.
 
 ## Names the architecture must declare

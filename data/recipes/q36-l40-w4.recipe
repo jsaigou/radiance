@@ -21,7 +21,7 @@
 # descriptor this conversion targets (see tools/rad_convert.cpp, "The quantisation descriptor ...
 # is derived from quantization_config"). Plan-only reports the same size as the RTN recipe,
 # 20.92 GiB (the UD GGUF is 21.65 GiB, the FP8 .rad 34.6 GiB).
-# Repo: jsaigou/radiance (PUBLIC, unofficial fork), local branch q36-w4w5-pilot.
+# Repo: jsaigou/radiance-strix (PUBLIC, unofficial fork), local branch q36-w4w5-pilot.
 
 # MTP layer 40 at w4nl (draft-only; the main model is unchanged)
 blk.40.ffn_gate_up_exps.*.weight   gptq table=w4nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* scale2_value=0.0001220703125 transform=fwht128 rule=search cd=3 calib=$CALIB

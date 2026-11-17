@@ -29,7 +29,7 @@ Qwen3.6-35B-A3B quantised to 21.01 GiB for the Radiance engine on AMD Strix Halo
 
 **1. Build the engine (once, roughly 10 to 20 minutes)**
 ```
-git clone --branch strix-halo-r2 https://github.com/jsaigou/radiance.git && cd radiance
+git clone --branch strix-halo-r2 https://github.com/jsaigou/radiance-strix.git && cd radiance-strix
 export ROCM_PATH=/path/to/rocm-10.1 PATH=$ROCM_PATH/bin:$PATH LD_LIBRARY_PATH=$ROCM_PATH/lib
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DRAD_GPU_TARGETS=gfx1151 -DCMAKE_PREFIX_PATH=$ROCM_PATH
 cmake --build build -j8
@@ -72,8 +72,8 @@ mapped to the nearest formats the engine serves fast), with credit to Unsloth ([
 
 Rounding: round to nearest with a searched scale, no calibration. Built from `data/recipes/q36-w4w5-rtn.recipe` in the fork.
 
-Tooling, recipes and the measurements behind this card are public in the fork: [`docs/RAD-FILES.md`](https://github.com/jsaigou/radiance/blob/unofficial-fixes/docs/RAD-FILES.md) and
-[`docs/FORK-KERNELS.md`](https://github.com/jsaigou/radiance/blob/unofficial-fixes/docs/FORK-KERNELS.md).
+Tooling, recipes and the measurements behind this card are public in the fork: [`docs/RAD-FILES.md`](https://github.com/jsaigou/radiance-strix/blob/unofficial-fixes/docs/RAD-FILES.md) and
+[`docs/FORK-KERNELS.md`](https://github.com/jsaigou/radiance-strix/blob/unofficial-fixes/docs/FORK-KERNELS.md).
 
 ## Quality (measured by us, on our own sets)
 
@@ -87,7 +87,7 @@ Our earlier pilot measured 63.7 tokens a second for this RTN variant at speculat
 
 About 34 GiB of memory for 4 sequences of up to 262,144 tokens with an FP8 KV cache.
 
-The engine is the unofficial fork **https://github.com/jsaigou/radiance** at tag **`strix-halo-r2`** (commit `a16657e`) or a later commit on the same line. Upstream Radiance 2.x does not serve this container (it replaced the formats this one uses). Tested only on gfx1151 with ROCm 10.1.
+The engine is the unofficial fork **https://github.com/jsaigou/radiance-strix** at tag **`strix-halo-r2`** (commit `a16657e`) or a later commit on the same line. Upstream Radiance 2.x does not serve this container (it replaced the formats this one uses). Tested only on gfx1151 with ROCm 10.1.
 
 ## Provenance
 

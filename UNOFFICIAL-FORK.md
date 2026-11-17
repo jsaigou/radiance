@@ -6,6 +6,9 @@ documentation, support and bug reports. This fork is not affiliated with or endo
 
 All credit for Radiance belongs to Deadcode and the radiance contributors listed in [`NOTICE`](NOTICE).
 
+> **Renamed 2026-11-17:** this repository was `jsaigou/radiance` and is now **`jsaigou/radiance-strix`**, to say what it is for: bringing Radiance's improvements to AMD Strix Halo. Old links and `git remote` URLs redirect
+> to the new name. The engine binary and everything in it are still called `radiance`.
+
 ## Why this fork exists
 
 We run Radiance on AMD Strix Halo (Ryzen AI MAX+ 395, Radeon 8060S, gfx1151) and found some bugs while evaluating it.

@@ -31,7 +31,7 @@ Qwen3.8-Flash-Next, a 256K-context mixture-of-experts model, reduced to 84.37 Gi
 
 **1. Build the engine (once, roughly 10 to 20 minutes)**
 ```
-git clone --branch strix-halo-r2 https://github.com/jsaigou/radiance.git && cd radiance
+git clone --branch strix-halo-r2 https://github.com/jsaigou/radiance-strix.git && cd radiance-strix
 export ROCM_PATH=/path/to/rocm-10.1 PATH=$ROCM_PATH/bin:$PATH LD_LIBRARY_PATH=$ROCM_PATH/lib
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DRAD_GPU_TARGETS=gfx1151 -DCMAKE_PREFIX_PATH=$ROCM_PATH
 cmake --build build -j8
@@ -74,8 +74,8 @@ the importance matrix.
 This is the per-layer **size policy**, a different quantisation from Unsloth's file and not a lossless copy: IQ3_XXS tensors become `w3nl64a8h`, IQ4_NL/IQ4_XS become `w4nl64a8h`, Q5_0 becomes `w5nl64a8h`, native IQ2_S/Q2_0 are kept on layers 0, 8, 9 and 10
 (44 rotated layers and 4 native), the token embedding is IQ4_XS, the MTP layer `w4nl64`, and the vision tower bf16. The result is 84.37 GiB.
 
-Tooling, recipes and the measurements behind this card are public in the fork: [`docs/RAD-FILES.md`](https://github.com/jsaigou/radiance/blob/unofficial-fixes/docs/RAD-FILES.md) and
-[`docs/FORK-KERNELS.md`](https://github.com/jsaigou/radiance/blob/unofficial-fixes/docs/FORK-KERNELS.md).
+Tooling, recipes and the measurements behind this card are public in the fork: [`docs/RAD-FILES.md`](https://github.com/jsaigou/radiance-strix/blob/unofficial-fixes/docs/RAD-FILES.md) and
+[`docs/FORK-KERNELS.md`](https://github.com/jsaigou/radiance-strix/blob/unofficial-fixes/docs/FORK-KERNELS.md).
 
 ## Quality (measured by us, on our own sets)
 
@@ -92,7 +92,7 @@ A request through our router answered correctly in 1.4 s for a short prompt and 
 
 **Memory:** about 93 GiB of unified memory for the container plus three 131K sequences; with the operating system and other services the machine used 114 of 123.5 GiB. It needs a 128 GB class machine and is not meant for smaller ones.
 
-The engine is the unofficial fork **https://github.com/jsaigou/radiance** at tag **`strix-halo-r2`** (commit `a16657e`) or a later commit on the same line. Upstream Radiance 2.x does not serve this container (it replaced the formats this one uses). Tested only on gfx1151 with ROCm 10.1.
+The engine is the unofficial fork **https://github.com/jsaigou/radiance-strix** at tag **`strix-halo-r2`** (commit `a16657e`) or a later commit on the same line. Upstream Radiance 2.x does not serve this container (it replaced the formats this one uses). Tested only on gfx1151 with ROCm 10.1.
 
 ## Provenance
 

@@ -1,5 +1,5 @@
 /* NOTICE OF CHANGE (Apache-2.0 section 4(b)): this file was modified in the UNOFFICIAL fork
- * github.com/jsaigou/radiance, not by the original authors. The original project is
+ * github.com/jsaigou/radiance-strix, not by the original authors. The original project is
  * https://codeberg.org/StillDeadcode/radiance . The change is in halo_attn_prefill_merge(): the
  * split-KV merge no longer touches token rows outside the launch's own sequence range (see
  * UNOFFICIAL-FORK.md and fork-notes/05-*). */

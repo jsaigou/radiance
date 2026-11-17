@@ -1,7 +1,7 @@
 # Flash-Next UD-faithful (mirror) plan, size/fit model and build runbook (L8)
 
 Status: **plan and tooling only; no container was built and no GPU lock was taken.** Repo
-`jsaigou/radiance` (PUBLIC, unofficial fork), branch `ud-fit` (base `f26e2dc`, from
+`jsaigou/radiance-strix` (PUBLIC, unofficial fork), branch `ud-fit` (base `f26e2dc`, from
 `ud-map-fast`). The mirror path already existed in `tools/ud_map/ud_map.py`; this lane records
 its Flash-Next result, the fit model, the blocker order and the lead's runbook.
 

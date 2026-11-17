@@ -1,6 +1,6 @@
 # ud_map end-to-end on Qwen3.6-35B-A3B (measured)
 
-Repo: `jsaigou/radiance` (PUBLIC, unofficial fork), branch `ud-map-eval`, local only.
+Repo: `jsaigou/radiance-strix` (PUBLIC, unofficial fork), branch `ud-map-eval`, local only.
 Inputs: the UD map `/opt/tohil/models/Qwen3.6-35B-A3B-MTP-UD-Q4_K_XL.gguf`, the bf16
 source `/opt/tohil/models/_safetensors-src/Qwen3.6-35B-A3B`, the calibration
 directory `~/radiance-test/calib/hessians`, and the existing calibration corpus.
