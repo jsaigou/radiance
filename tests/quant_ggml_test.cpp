@@ -147,7 +147,10 @@ TEST(the_reader_names_the_planes_the_quantiser_writes) {
     REQUIRE(q != nullptr);
     for (const ggml_planes::Type& t : ggml_planes::kTypes) {
         Opts o;
-        o.s("type", gguf_dtype(t.ggml)->name);
+        /* Id 42 is llama.cpp's Q2_0 (64-value blocks of 18 bytes), which the reader's copy serves, but the
+         * core's GGUF dtype table still names 42 `rad4_q8` (32-value blocks of 34 bytes, a Radiance-private
+         * use of the id), so name it here rather than ask the table. */
+        o.s("type", t.ggml == 42 ? "q2_0" : gguf_dtype(t.ggml)->name);
         const RadQuantWeight qw = weight_of("w", 4, 512, nullptr);
         RadEncoding written, read;
         REQUIRE_EQ(q->encoding(o.data(), o.n(), &qw, &written), RAD_OK);

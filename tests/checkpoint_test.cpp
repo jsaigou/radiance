@@ -2381,7 +2381,10 @@ TEST(a_gguf_q8_0_q4_k_or_q6_k_tensor_is_imported_as_its_planes) {
     const GTensor g = k_blocks("g", 12, 2, 512, 1), u = k_blocks("u", 12, 3, 512, 2);
     const GTensor s = k_blocks("s", 12, 2, 256, 3), k6 = k_blocks("k6", 14, 2, 256, 4);
     const GTensor q5{ "t.q5_k", 13, { 256, 1 }, std::vector<uint8_t>(176, 0) };
-    write_gguf(path, llama_kvs(15), { q8, g, u, s, k6, q5 });
+    /* A type the reader does not import (Q3_K, 110 bytes a block), for the refusal below: Q5_K used to
+     * be that type until this fork's reader began importing it as planes. */
+    const GTensor q3{ "t.q3_k", 11, { 256, 1 }, std::vector<uint8_t>(110, 0) };
+    write_gguf(path, llama_kvs(15), { q8, g, u, s, k6, q5, q3 });
     Checkpoint ck;
     REQUIRE_EQ(ck.open(path), RAD_OK);
     Program prog;
@@ -2392,6 +2395,7 @@ TEST(a_gguf_q8_0_q4_k_or_q6_k_tensor_is_imported_as_its_planes) {
     prog.name_map.push_back(map("mix", RAD_MAP_CONCAT, { "s", "k6" }));
     prog.name_map.push_back(map("across", RAD_MAP_CONCAT, { "g", "s" }, {}, 1));
     prog.name_map.push_back(map("t.q5_k", RAD_MAP_COPY, { "t.q5_k" }));
+    prog.name_map.push_back(map("t.q3_k", RAD_MAP_COPY, { "t.q3_k" }));
     std::string why;
 
     /* Q8_0: the codes plane is each block's quants and the scale plane its d, byte for byte. */
@@ -2463,6 +2467,15 @@ TEST(a_gguf_q8_0_q4_k_or_q6_k_tensor_is_imported_as_its_planes) {
         check_planes_decode_by_definition(w);
     }
 
+    /* Q5_K is imported as its planes (this fork's reader; upstream refuses it). */
+    {
+        CkptWeight w;
+        REQUIRE_EQ(ckpt_resolve(ck, prog, "t.q5_k", false, &w, &why), RAD_OK);
+        CHECK(w.imported && w.ggml_blocks);
+        CHECK(!w.trivial);
+        REQUIRE(rad_enc_valid(&w.enc));
+    }
+
     /* What it does not import keeps the GGUF reason. */
     {
         CkptWeight w;
@@ -2472,7 +2485,7 @@ TEST(a_gguf_q8_0_q4_k_or_q6_k_tensor_is_imported_as_its_planes) {
         REQUIRE_EQ(ckpt_resolve(ck, prog, "across", false, &w, &why), RAD_OK);
         CHECK(!w.imported && !w.ggml_blocks && !w.trivial);
         CHECK(has(w.why, "joined along a column"));
-        REQUIRE_EQ(ckpt_resolve(ck, prog, "t.q5_k", false, &w, &why), RAD_OK);
+        REQUIRE_EQ(ckpt_resolve(ck, prog, "t.q3_k", false, &w, &why), RAD_OK);
         CHECK(!w.imported && !w.ggml_blocks && !w.trivial);
         CHECK(has(w.why, "GGUF"));
     }

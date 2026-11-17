@@ -12441,14 +12441,14 @@ struct ArchCases {
             qwen35moe_fp8::step, 3, {}, 0x325d0299495a0dd8ull);
         add("qwen4exp_fp8", [this](RadBuilder* b) {
                 auto c = q4_ctx(0, 1); return qwen4exp_fp8::declare(b, &q4, &c); },
-            qwen4exp_fp8::step, 3, {}, 0x9454e9dff6db286bull);
+            qwen4exp_fp8::step, 3, {}, 0xcce3f15507099d86ull);
         add("qwen4exp_fp8, two ranks", [this](RadBuilder* b) {
                 auto c = q4_ctx(0, 2); return qwen4exp_fp8::declare(b, &q4, &c); },
-            nullptr, 3, { "ar_hc_write" }, 0xdb9da55c4fee69abull);
+            nullptr, 3, { "ar_hc_write" }, 0xdd4bd5906e5c5ac6ull);
         add("qwen4exp_fp8, four-bit experts", [this](RadBuilder* b) {
                 b->encs = { { "ffn_gate_up_exps", w4 }, { "ffn_down_exps", w4 } };
                 auto c = q4_ctx(0, 1); return qwen4exp_fp8::declare(b, &q4, &c); },
-            qwen4exp_fp8::step, 3, {}, 0x0ae8abfcf9200c50ull);
+            qwen4exp_fp8::step, 3, {}, 0xfa887e4bd13b33d1ull);
         /* The cache dtype stated rather than left to the plugin's default. The streamed store and
          * the prologue that folds it are declared only where the vocabulary has them, and both are
          * written at the KV group's dtype -- bf16 being the copy-only one, and it is what
@@ -12460,7 +12460,7 @@ struct ArchCases {
                 auto c = q4_ctx(0, 1);
                 c.kv_dtype = RAD_BF16;
                 return qwen4exp_fp8::declare(b, &q4, &c); },
-            qwen4exp_fp8::step, 3, {}, 0x9454e9dff6db286bull);
+            qwen4exp_fp8::step, 3, {}, 0xcce3f15507099d86ull);
         add("llama_fp8 + DSpark", [this](RadBuilder* b) {
                 auto c = dspark_ctx(0, 1); return llama_fp8::declare(b, lla.meta(), &c); },
             llama_fp8::step, 7, {}, 0xdcf36a1d31aba73cull);
@@ -13175,12 +13175,17 @@ TEST(a_4096_budget_without_a_span_is_the_pinned_graph_and_steps) {
         int world, rank;
         uint64_t graph, steps;
     };
+/* The qwen4exp_fp8 pins below were refreshed for this fork's per-layer format probe: the plugin now maps a
+ * `probe.format.<layer>.experts.0` name for every layer instead of layer 0 only (so a container may mix expert
+ * formats by layer). Compared against stock 451b136 with a full dump of every recorded op, buffer, weight, KV
+ * group, binding and drafter, the declared graph is identical for the stock configuration; only those name maps
+ * are added, and the step pins (what each step issues) are unchanged. The other architectures' pins are untouched. */
     const Case cases[] = {
-        { "qwen4exp_fp8", 1, 0, 0x32869dce302eb0e0ull, 0x26a9e2c23cf85696ull },
-        { "qwen4exp_fp8", 2, 0, 0xf0b6701dd7cbb37aull, 0x889c6b36c014609full },
-        { "qwen4exp_fp8", 2, 1, 0x4bc19e44d0743e49ull, 0x959ef6b7c6f57d8bull },
-        { "qwen4exp_fp8", 4, 0, 0xea29df78a9297c5cull, 0xfbe74f2b9d7020bfull },
-        { "qwen4exp_fp8", 4, 3, 0x1e4ba87a0d9619f4ull, 0x36df57cac613c6cfull },
+        { "qwen4exp_fp8", 1, 0, 0xc4bcc165e402e465ull, 0x26a9e2c23cf85696ull },
+        { "qwen4exp_fp8", 2, 0, 0x8ddc5f3e9d1f979full, 0x889c6b36c014609full },
+        { "qwen4exp_fp8", 2, 1, 0x7824e3ce9d55e424ull, 0x959ef6b7c6f57d8bull },
+        { "qwen4exp_fp8", 4, 0, 0x7bc29d3c568290a1ull, 0xfbe74f2b9d7020bfull },
+        { "qwen4exp_fp8", 4, 3, 0x1faa77556a063f89ull, 0x36df57cac613c6cfull },
         { "qwen35_fp8", 1, 0, 0x0f08ba5027cba71aull, 0xa7ec3cf6252cd441ull },
         { "qwen35_fp8", 2, 1, 0xe7780f241685a18bull, 0xdd5d65ef158c4136ull },
         { "qwen35moe_fp8", 1, 0, 0xb1e6173bd121dc2aull, 0x2b5989b2a6dbc7dfull },
