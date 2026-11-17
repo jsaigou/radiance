@@ -50,3 +50,49 @@ The scheduler's `stuck-exit` watchdog and its load fix are 2.1.0 features and ar
 2. Audit our new gather kernels (`embed_lookup_iq4xs`, `embed_lookup_q`) for token ids outside the vocabulary, since the gather validates an index plane
    by shape in the style the anchor-row fix describes.
 3. Re-test a stock FP8 container after any further merge from upstream, as the compatibility check above requires.
+
+## Test status and the regression the comparison found (2026-11-17)
+
+The 150 "fast" tests were run on three trees on the same machine (gfx1151, HIP build, no device visible to the test processes):
+
+| Tree | Failing |
+|---|---|
+| stock upstream `451b136` | 6: `convert_test`, `plugin_test`, `mm_test`, `spark25_convert_test`, `avx_check`, `avx_check_general` |
+| this fork before today's work | those 6 plus `arch_test`, `checkpoint_test`, `quant_ggml_test`, `shipped_plugins_test` |
+| this fork now | **the same 6 as stock** |
+
+The six that fail on stock are not ours: the `libhalo`/`libavx` schema mismatch of note 02 (`op 'mla_attn' has two different schemas`), the video-decode
+test, and an `avx_check` case in which `libref` refuses an int4-experts case with f16 scales per 128.
+
+The four that were ours:
+
+1. **A real regression: multi-rank block-FP8 experts in `qwen4exp_fp8`.** The per-layer MoE configs (added so one container can mix native and rotated
+   layers) were copied from the model config and probed before the tensor-parallel split was computed, and the split was written only to the model
+   config. At one rank nothing is split, so single-APU serving never showed it. At two or more ranks every layer's block saw whole-model geometry and
+   refused a legal width (`an expert is 320x2560 per rank, which is not a whole number of 128x128 scale blocks`). Upstream's own `arch_test` cases for a
+   sizing declare and for Flash-Next at four ranks caught it: eight refusals here, none on stock. Fixed by giving every layer the rank's geometry after the
+   split (commit `48310d6`), each layer keeping the format its own probe found.
+2. **`arch_test` graph pins for `qwen4exp_fp8`.** A full text dump of every recorded op, buffer, weight, KV group, binding, name map and drafter field, taken
+   on stock and on this fork, is identical for 19 of 23 architectures. For the four `qwen4exp_fp8` cases the ops, buffers, weights and KV groups are identical
+   and only name maps are added (one `probe.format.<layer>.experts.0` per layer instead of layer 0 only). The step pins, which fingerprint what each step
+   issues, did not change. The graph pins were refreshed on that evidence.
+3. **`checkpoint_test`**: this fork's reader imports Q5_K as planes, so the old "Q5_K is refused" case now uses Q3_K, and Q5_K has a positive case.
+4. **`quant_ggml_test` and `shipped_plugins_test`**: the core's GGUF dtype table calls id 42 `rad4_q8` (32-value blocks of 34 bytes) while llama.cpp's id 42
+   is Q2_0 (64-value blocks of 18 bytes); the test now names Q2_0 explicitly, and treats it like Q8_0 for the imatrix test because llama.cpp's Q2_0 quantiser
+   has no imatrix path. The shipped-plugin list gains the `qwen35moe` GGUF import plugin.
+
+**Known latent issue:** `core/text/gguf.cpp` still maps GGUF type id 42 to `rad4_q8`. This fork's container build never reads a type-42 tensor from a GGUF
+(the exact-mirror containers are built from the bf16 weights through the quantiser), so it has not mattered, but a GGUF import of a Q2_0 tensor through
+the core's table would use the wrong block size.
+
+### Verified by loading real containers on the pinned build (`upstream-picks`)
+
+Served through the scheduler, answers checked at temperature 0 (arithmetic, a factual question, code, and a hidden code in a ~10K-token prompt):
+
+| Container | Result |
+|---|---|
+| Stock `qwen3.6-35b-a3b-fp8.rad` (published FP8 container, 34.6 GiB) | loads, `n_ctx` 262144 verified, all four checks correct |
+| Qwen3.6 W4/W5 RTN (21 GiB) | loads, all four checks correct |
+| Qwen3.6 W4/W5 GPTQ (21 GiB) | loads, all four checks correct |
+| Qwen3.8-Flash-Next size container (84.37 GiB, 3 x 131K) | loads, `n_ctx` 131072 verified, all four checks correct, identical output before and after the fix |
+

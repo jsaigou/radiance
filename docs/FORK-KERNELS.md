@@ -95,4 +95,6 @@ answers in roughly 10-25% of concurrent requests. Fixed in `halo_attn_prefill_h2
   container has a long tail (mean 0.21-0.22, median 0.055-0.059 over 1.58 M positions); no paired task loss was seen in English.
 - The offline verifier applies one generic RMSE gate that Unsloth's own IQ3_XXS tensors fail (0.283 against bf16), so it reports FAIL on the
   exact container. That is a verifier-policy issue, not a decoder failure; per-format tolerances are not yet written.
+- The core's GGUF dtype table still names type id 42 `rad4_q8`, while llama.cpp's id 42 is Q2_0. Containers are built from bf16 weights, so this has not mattered,
+  but importing a Q2_0 tensor from a GGUF through that table would use the wrong block size.
 - Everything was measured on one gfx1151 machine.
