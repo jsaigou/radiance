@@ -20,6 +20,45 @@ Qwen3.8-Flash-Next, a 256K-context mixture-of-experts model, reduced to 84.37 Gi
 > **Unofficial.** This is a `.rad` container for the **Radiance** inference engine, built and tested by a third party. It is **not** a transformers, GGUF or llama.cpp
 > model and will not load in them. It needs the engine fork described below. The original Radiance project is at <https://codeberg.org/StillDeadcode/radiance>.
 
+## Quick start (read this first)
+
+**This file does not run in llama.cpp, Ollama, vLLM or transformers.** It is a Radiance container: it needs the Radiance engine, in our unofficial fork, built for your GPU.
+
+**You need**
+- An AMD Strix Halo machine (Ryzen AI MAX+ 395, Radeon 8060S, gfx1151) with **128 GB** of memory. About 93 GiB is used for the container plus three 131,072-token sequences, and the machine ran at 114 of 123.5 GiB with the system and other services. This is **not** for smaller machines, and it is the only hardware we have tested.
+- Linux with ROCm 10.1 (the TheRock build) and the kernel parameter `amdgpu.cwsr_enable=1` (the engine refuses to start without it; changing it needs a reboot).
+- `git`, `cmake`, `ninja` and a C++ compiler.
+
+**1. Build the engine (once, roughly 10 to 20 minutes)**
+```
+git clone --branch strix-halo-r2 https://github.com/jsaigou/radiance.git && cd radiance
+export ROCM_PATH=/path/to/rocm-10.1 PATH=$ROCM_PATH/bin:$PATH LD_LIBRARY_PATH=$ROCM_PATH/lib
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DRAD_GPU_TARGETS=gfx1151 -DCMAKE_PREFIX_PATH=$ROCM_PATH
+cmake --build build -j8
+```
+
+**2. Download the container**
+```
+hf download jsaigou/Qwen3.8-Flash-Next-UD-Size-radiance flash-size.rad --local-dir .
+```
+
+**3. Run it**
+```
+RADIANCE_HOME=$PWD/build/radiance_home RADIANCE_KERNELS=libhalo \
+  build/bin/radiance --model flash-size.rad --served-model-name qwen38-flash-next \
+  --host 127.0.0.1 --port 8080 --tp 1 --max-model-len 131072 --max-num-seqs 3 --num-speculative-tokens 2 --kv-cache-dtype k6_v4
+```
+
+**4. Talk to it (OpenAI-compatible)**
+```
+curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model": "qwen38-flash-next", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 200}'
+```
+
+The flags set three sequences of up to 131,072 tokens each, speculation depth 2 and a `k6_v4` KV cache. Fewer or shorter sequences use less memory, but we have only measured the settings shown here.
+
+If it will not start: check `cat /sys/module/amdgpu/parameters/cwsr_enable` prints `1`, that the build used `RAD_GPU_TARGETS=gfx1151`, and that you built tag `strix-halo-r2` (or later on the same line), not upstream's 2.x.
+
 ## What is in this repository
 
 | File | Size | SHA-256 |
@@ -49,17 +88,11 @@ On 835 English prompts (ARC, GSM8K, MMLU, tool-calling): 784 correct (93.9%) aga
 Direct runs of the engine, three simultaneous sequences of 131,072 tokens each, speculation depth 2, `k6_v4` KV cache: **91.2 tokens a second** in aggregate. Other measured points on the same container: 2 x 131K 66.2 tok/s, 2 x 262K 55.1, 3 x 262K 76.5.
 A request through our router answered correctly in 1.4 s for a short prompt and in 20 s for a 10K-token one (including thinking).
 
-## Running it
-
-Requires the unofficial Radiance fork **https://github.com/jsaigou/radiance**, tag **`strix-halo-r2`** (commit `a16657e`) or a later commit on the same line, built for your GPU (instructions in the fork's
-`UNOFFICIAL-FORK.md`). Upstream Radiance 2.x does not serve this container (it replaced the formats this one uses). Tested only on gfx1151 with ROCm 10.1.
-
-```
-RADIANCE_HOME=<build>/radiance_home RADIANCE_KERNELS=libhalo \
-  radiance --model flash-size.rad --tp 1 --max-model-len 131072 --max-num-seqs 3 --num-speculative-tokens 2 --kv-cache-dtype k6_v4
-```
+## Notes on running
 
 **Memory:** about 93 GiB of unified memory for the container plus three 131K sequences; with the operating system and other services the machine used 114 of 123.5 GiB. It needs a 128 GB class machine and is not meant for smaller ones.
+
+The engine is the unofficial fork **https://github.com/jsaigou/radiance** at tag **`strix-halo-r2`** (commit `a16657e`) or a later commit on the same line. Upstream Radiance 2.x does not serve this container (it replaced the formats this one uses). Tested only on gfx1151 with ROCm 10.1.
 
 ## Provenance
 

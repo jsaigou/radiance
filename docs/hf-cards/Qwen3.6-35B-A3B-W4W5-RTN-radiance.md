@@ -18,6 +18,45 @@ Qwen3.6-35B-A3B quantised to 21.01 GiB for the Radiance engine on AMD Strix Halo
 > **Unofficial.** This is a `.rad` container for the **Radiance** inference engine, built and tested by a third party. It is **not** a transformers, GGUF or llama.cpp
 > model and will not load in them. It needs the engine fork described below. The original Radiance project is at <https://codeberg.org/StillDeadcode/radiance>.
 
+## Quick start (read this first)
+
+**This file does not run in llama.cpp, Ollama, vLLM or transformers.** It is a Radiance container: it needs the Radiance engine, in our unofficial fork, built for your GPU.
+
+**You need**
+- An AMD Strix Halo machine (Ryzen AI MAX+ 395, Radeon 8060S, gfx1151) with enough unified memory for about **34 GiB** in use (four 262,144-token sequences, the settings below). We have only tested a 128 GB machine, so we cannot say how much less memory works.
+- Linux with ROCm 10.1 (the TheRock build) and the kernel parameter `amdgpu.cwsr_enable=1` (the engine refuses to start without it; changing it needs a reboot).
+- `git`, `cmake`, `ninja` and a C++ compiler.
+
+**1. Build the engine (once, roughly 10 to 20 minutes)**
+```
+git clone --branch strix-halo-r2 https://github.com/jsaigou/radiance.git && cd radiance
+export ROCM_PATH=/path/to/rocm-10.1 PATH=$ROCM_PATH/bin:$PATH LD_LIBRARY_PATH=$ROCM_PATH/lib
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DRAD_GPU_TARGETS=gfx1151 -DCMAKE_PREFIX_PATH=$ROCM_PATH
+cmake --build build -j8
+```
+
+**2. Download the container**
+```
+hf download jsaigou/Qwen3.6-35B-A3B-W4W5-RTN-radiance qwen3.6-35b-a3b-w4w5-rtn.rad --local-dir .
+```
+
+**3. Run it**
+```
+RADIANCE_HOME=$PWD/build/radiance_home RADIANCE_KERNELS=libhalo \
+  build/bin/radiance --model qwen3.6-35b-a3b-w4w5-rtn.rad --served-model-name qwen36-35b-a3b-rtn \
+  --host 127.0.0.1 --port 8080 --tp 1 --max-model-len 262144 --max-num-seqs 4 --num-speculative-tokens 2 --kv-cache-dtype fp8
+```
+
+**4. Talk to it (OpenAI-compatible)**
+```
+curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model": "qwen36-35b-a3b-rtn", "messages": [{"role": "user", "content": "Hello"}], "max_tokens": 200}'
+```
+
+The flags set four sequences of up to 262,144 tokens, speculation depth 2 and an FP8 KV cache. Lower `--max-num-seqs` or `--max-model-len` to use less memory.
+
+If it will not start: check `cat /sys/module/amdgpu/parameters/cwsr_enable` prints `1`, that the build used `RAD_GPU_TARGETS=gfx1151`, and that you built tag `strix-halo-r2` (or later on the same line), not upstream's 2.x.
+
 ## What is in this repository
 
 | File | Size | SHA-256 |
@@ -44,17 +83,11 @@ Against the published FP8 container over 1,575,352 text positions: mean KL diver
 
 Our earlier pilot measured 63.7 tokens a second for this RTN variant at speculation depth 2, against 58.6 for the published FP8 container, on its own harness. The figures below were measured on the GPTQ variant, which has the same format and kernels, end to end through a router at depth 2: single-stream decode about 76 (prose) to 78 (code) tokens a second; a 38K-token prompt prefills in 13.5 s (llama.cpp with Unsloth's UD GGUF takes 29.6 s on the same machine); three concurrent streams give 171 tokens a second in aggregate (69 for llama.cpp). Single-stream decode is within 3 to 8% of llama.cpp. The published FP8 container decodes about 9% slower than this format at the same depth in our earlier pilot.
 
-## Running it
-
-Requires the unofficial Radiance fork **https://github.com/jsaigou/radiance**, tag **`strix-halo-r2`** (commit `a16657e`) or a later commit on the same line, built for your GPU (instructions in the fork's
-`UNOFFICIAL-FORK.md`). Upstream Radiance 2.x does not serve this container (it replaced the formats this one uses). Tested only on gfx1151 with ROCm 10.1.
-
-```
-RADIANCE_HOME=<build>/radiance_home RADIANCE_KERNELS=libhalo \
-  radiance --model qwen3.6-35b-a3b-w4w5-rtn.rad --tp 1 --max-model-len 262144 --max-num-seqs 4 --num-speculative-tokens 2 --kv-cache-dtype fp8
-```
+## Notes on running
 
 About 34 GiB of memory for 4 sequences of up to 262,144 tokens with an FP8 KV cache.
+
+The engine is the unofficial fork **https://github.com/jsaigou/radiance** at tag **`strix-halo-r2`** (commit `a16657e`) or a later commit on the same line. Upstream Radiance 2.x does not serve this container (it replaced the formats this one uses). Tested only on gfx1151 with ROCm 10.1.
 
 ## Provenance
 
