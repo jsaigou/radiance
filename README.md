@@ -24,6 +24,7 @@
 > | Kernels and formats | 3-bit experts, IQ3_XXS / IQ2_S / IQ4_NL / IQ4_XS / Q5_0 / Q2_0 expert GEMMs, Q8_0 and Q6_K dense, a faster MoE decode kernel: [`docs/FORK-KERNELS.md`](docs/FORK-KERNELS.md) |
 > | Tooling | build `.rad` files from bf16 weights using an Unsloth Dynamic GGUF as the map: [`docs/RAD-FILES.md`](docs/RAD-FILES.md) |
 > | Strix Halo guide | platform, unified-memory behaviour, measured results: [`docs/STRIX-HALO.md`](docs/STRIX-HALO.md) |
+> | Containers | `.rad` files we built, on Hugging Face under [`jsaigou`](https://huggingface.co/jsaigou): see [`docs/hf-cards/`](docs/hf-cards/) |
 >
 > Bugs we found but did **not** fix are described in [`fork-notes/`](fork-notes/). See
 > [`UNOFFICIAL-FORK.md`](UNOFFICIAL-FORK.md) for details. Everything is Apache-2.0 like the original; `LICENSE` and `NOTICE`

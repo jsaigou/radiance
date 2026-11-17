@@ -56,6 +56,11 @@ size mean 0.2090 / median 0.0547 / top-1 83.53%. The mean and p99 carry a long t
 | W4/W5 RTN (`q36-w4w5-rtn.recipe`) | 21.01 GiB | gate/up `w4nl64a8h`, down `w5nl64a8h`, block-FP8 trunk | smaller than Unsloth's UD (21.65 GiB) and the FP8 container (34.63 GiB) |
 | W4/W5 GPTQ (`q36-w4w5-gptq.recipe`) | built, loaded and measured | same, calibrated | |
 
+### Published containers (Hugging Face, account `jsaigou`)
+
+[`Qwen3.6-35B-A3B-W4W5-RTN-radiance`](https://huggingface.co/jsaigou/Qwen3.6-35B-A3B-W4W5-RTN-radiance), [`Qwen3.6-35B-A3B-W4W5-GPTQ-radiance`](https://huggingface.co/jsaigou/Qwen3.6-35B-A3B-W4W5-GPTQ-radiance)
+and [`Qwen3.8-Flash-Next-UD-Size-radiance`](https://huggingface.co/jsaigou/Qwen3.8-Flash-Next-UD-Size-radiance). The Flash-Next mirror and fast containers are not published.
+
 ## Verifier caveat
 
 `ud_map verify` applies one generic RMSE gate. Unsloth's own IQ3_XXS tensors sit at 0.283 RMSE against bf16 and fail it, so the exact container reports
