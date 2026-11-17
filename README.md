@@ -54,6 +54,23 @@ To support the development of radiance: [Patreon](https://patreon.com/StillDeadC
 
 ## Models
 
+### Built for Strix Halo (this fork)
+
+Containers made in this fork for AMD Strix Halo (gfx1151), using Unsloth's Dynamic quantisations as the map of which tensors take which precision. They need **this fork's engine**
+(tag `strix-halo-r2` or later; not upstream 2.x). Each card opens with a quick start: build, download, run, test. How they were made: [`docs/RAD-FILES.md`](docs/RAD-FILES.md);
+kernels and formats: [`docs/FORK-KERNELS.md`](docs/FORK-KERNELS.md); measurements and platform notes: [`docs/STRIX-HALO.md`](docs/STRIX-HALO.md).
+
+| model | container | get it | memory |
+|---|---|---|---|
+| Qwen3.8-Flash-Next: Unsloth-Dynamic size policy (44 rotated and 4 native expert layers), MTP, vision | `flash-size.rad` (84.37 GiB) | [download](https://huggingface.co/jsaigou/Qwen3.8-Flash-Next-UD-Size-radiance) | about 93 GiB with three 131K sequences; a 128 GB machine |
+| Qwen3.6-35B-A3B: 4/5-bit experts, GPTQ-calibrated, MTP | `qwen3.6-35b-a3b-w4w5-gptq.rad` (21 GiB) | [download](https://huggingface.co/jsaigou/Qwen3.6-35B-A3B-W4W5-GPTQ-radiance) | about 34 GiB with four 262K sequences |
+| Qwen3.6-35B-A3B: 4/5-bit experts, round to nearest, MTP | `qwen3.6-35b-a3b-w4w5-rtn.rad` (21 GiB) | [download](https://huggingface.co/jsaigou/Qwen3.6-35B-A3B-W4W5-RTN-radiance) | about 34 GiB with four 262K sequences |
+
+Measured on one Strix Halo machine (128 GB): the Qwen3.6 container prefills a 38K-token prompt in 13.5 s against 29.6 s for llama.cpp with Unsloth's own GGUF, runs three streams at 171 tok/s
+aggregate against 69, and decodes a single stream within 3 to 8% of it. Details and caveats are on each card.
+
+### Upstream's models (the two-R9700 setups upstream targets)
+
 | model | container | get it | compose file |
 |---|---|---|---|
 | Qwen3.8-Flash-Next: 4-bit experts, int8 trunk, MTP, vision | `qwen3.8-next-flash-fp8-iq4r-moe.rad` (114 GiB) | [download](https://huggingface.co/StillDeadcode/qwen3.8-next-flash-fp8-iq4r-moe) | `flashnext.yaml` |
