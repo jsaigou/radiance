@@ -1854,12 +1854,40 @@ def _load_ref_classes():
     return route_b.Safetensors, rad_verify.Gguf
 
 
-def _policy_verdict(passed, kp_weights=0):
-    """PASS / PARTIAL / FAIL. PARTIAL means every plane the Python decoder could read passed, but
-    some weights carry plugin-private planes it honestly cannot decode (checked by the engine)."""
+def tensor_class(hash_equal_gguf, hash_equal_source, has_source, has_gguf, kept=False, derived=False):
+    """What kind of evidence a weight can have, so each class is judged by the right rule.
+    EXACT: the planes decode bit-identically to the UD GGUF (or, for a plain copy, to the source).
+    DERIVED / KEPT: the plan says the GGUF does not carry it; judged against the source only.
+    UNVERIFIABLE: nothing to compare with (reported, never silently passed).
+    REQUANT: everything else, judged numerically against whichever references exist."""
+    if hash_equal_gguf or (hash_equal_source and not has_gguf):
+        return "EXACT"
+    if derived:
+        return "DERIVED"
+    if kept:
+        return "KEPT"
+    if not has_source and not has_gguf:
+        return "UNVERIFIABLE"
+    return "REQUANT"
+
+
+def error_bound(tol, ud_rmse, slack=1.5):
+    """The relative-RMSE a requantised weight may show. A fixed cap alone fails tensors whose
+    *reference* GGUF is itself far from bf16 (Unsloth's IQ3_XXS sit near 0.28), so the bound
+    follows the UD file's own error against the source: max(cap, slack * that error)."""
+    return tol if ud_rmse is None else max(tol, slack * ud_rmse)
+
+
+UNVERIFIABLE_MAX_FRACTION = 0.01  # of container bytes; more than this and "unverifiable" hides a bad --source
+
+
+def _policy_verdict(passed, kp_weights=0, unverifiable=0):
+    """PASS / PARTIAL / FAIL. PARTIAL means every weight that could be checked passed, but some
+    carry plugin-private planes the Python decoder honestly cannot read (checked by the engine) or
+    have no reference at all (UNVERIFIABLE; listed in the report)."""
     if not passed:
         return "FAIL"
-    return "PARTIAL" if kp_weights else "PASS"
+    return "PARTIAL" if (kp_weights or unverifiable) else "PASS"
 
 
 def _policy_line(policy, verdict, n_decoded, kp_weights, kp_bytes, kp_dtypes, out=None):
@@ -1948,6 +1976,7 @@ def verify(args):
     kp_dtypes = collections.Counter()
     meta_weights = meta_equal = meta_bytes = 0
     src_num = src_den = gg_num = gg_den = 0.0
+    unverifiable, unverifiable_bytes = [], 0
     t0 = time.time()
     for i, name in enumerate(names):
         e = rf.by_name[name]
@@ -2043,7 +2072,7 @@ def verify(args):
             missing_src += 1
         if ga is None and gg is not None:
             missing_gg += 1
-        rnum = rden = gnum = gden = 0.0
+        rnum = rden = gnum = gden = unum = 0.0
         rh = hashlib.sha256()
         sh = hashlib.sha256()
         gh = hashlib.sha256()
@@ -2059,6 +2088,8 @@ def verify(args):
             rden = float((sa.astype(np.float64) ** 2).sum()) if sa is not None else 0
             gnum = float(((rad_all.astype(np.float64) - ga.astype(np.float64)) ** 2).sum()) if ga is not None else 0
             gden = float((ga.astype(np.float64) ** 2).sum()) if ga is not None else 0
+            unum = float(((ga.astype(np.float64) - sa.astype(np.float64)) ** 2).sum()) \
+                if (ga is not None and sa is not None) else 0
         else:
             for r0 in range(0, nrows, chunk):
                 nr = min(chunk, nrows - r0)
@@ -2074,6 +2105,8 @@ def verify(args):
                     gh.update(np.ascontiguousarray(g, "<f4").tobytes())
                     gd = g.astype(np.float64)
                     gnum += float(((d.astype(np.float64) - gd) ** 2).sum()); gden += float((gd ** 2).sum())
+                    if sa is not None:
+                        unum += float(((gd - sa[r0:r0 + nr].astype(np.float64)) ** 2).sum())
         e_rmse = (np.sqrt(rnum / rden) if rden > 0 else (0.0 if sa is not None else None))
         g_rmse = (np.sqrt(gnum / gden) if gden > 0 else (0.0 if ga is not None else None))
         if sa is not None:
@@ -2086,25 +2119,34 @@ def verify(args):
             hash_n += 1; hash_ok += 1 if eq_src else 0
         draft = name == "mtp.draft_head.weight"
         tol = args.draft_tol if draft else args.tol
+        ud_rmse = (float(np.sqrt(unum / rden)) if (ga is not None and sa is not None and rden > 0) else None)
+        klass = tensor_class(eq_gg, eq_src, sa is not None, ga is not None,
+                             kept=name in kept_set, derived=name in derived_set)
+        bound = error_bound(tol, ud_rmse, getattr(args, "ud_slack", 1.5))
         bad = []
-        if sa is None and not getattr(args, "allow_missing", False):
-            bad.append("no source reference")
-        elif e_rmse is not None and e_rmse > tol:
-            bad.append(f"source RMSE {e_rmse:.3f} > {tol:.3f}")
-        if (ga is None and gg is not None and not draft and not name.startswith("v.")
-                and name not in kept_set and name not in derived_set
-                and not getattr(args, "skip_gguf", False)):
-            bad.append("no GGUF reference")
-        elif g_rmse is not None and g_rmse > tol:
-            bad.append(f"GGUF RMSE {g_rmse:.3f} > {tol:.3f}")
+        if klass == "EXACT":
+            pass  # bit-identical to its reference: the error against bf16 is the reference's own
+        elif klass == "UNVERIFIABLE":
+            unverifiable.append(name); unverifiable_bytes += e.bytes
+        else:
+            if e_rmse is not None and e_rmse > bound:
+                bad.append(f"source RMSE {e_rmse:.3f} > {bound:.3f}")
+            if (ga is None and gg is not None and not draft and not name.startswith("v.")
+                    and name not in kept_set and name not in derived_set
+                    and not getattr(args, "skip_gguf", False)):
+                bad.append("no GGUF reference")
+            elif g_rmse is not None and g_rmse > bound:
+                bad.append(f"GGUF RMSE {g_rmse:.3f} > {bound:.3f}")
         rec = dict(name=name, role=role, encoding=enc, bytes=e.bytes, shape=list(e.shape),
                    sampled_rows=(check_rows if big else None),
+                   cls=klass, rmse_ud_vs_source=ud_rmse, bound=bound,
                    rmse_source=e_rmse, rmse_gguf=g_rmse, sha256_rad=rh.hexdigest(),
                    sha256_source=sh.hexdigest() if sa is not None else None,
                    sha256_gguf=gh.hexdigest() if ga is not None else None,
                    hash_equal_source=eq_src, hash_equal_gguf=eq_gg,
                    note="; ".join(x for x in (snote, gnote, sa_note, ga_note) if x) or None,
-                   status="FAIL" if bad else "ok", why=bad)
+                   status="FAIL" if bad else ("UNVERIFIABLE" if klass == "UNVERIFIABLE" else "ok"),
+                   why=bad)
         if bad:
             fails.append(rec)
         rows.append(rec)
@@ -2136,7 +2178,12 @@ def verify(args):
         passed = not fails and not missing_plan
     if getattr(args, "skip_gguf", False):
         passed = not any(r["status"] == "FAIL" for r in rows) and not missing_plan
-    verdict = _policy_verdict(passed, kp_weights)
+    if unverifiable and unverifiable_bytes > UNVERIFIABLE_MAX_FRACTION * max(1, tot):
+        passed = False
+        print(f"policy: {len(unverifiable)} unverifiable weight(s) are {unverifiable_bytes/max(1,tot):.1%} "
+              f"of the container (limit {UNVERIFIABLE_MAX_FRACTION:.0%}); is --source/--gguf the right pair?")
+    verdict = _policy_verdict(passed, kp_weights, len(unverifiable))
+    by_class = collections.Counter(r.get("cls", "?") for r in rows)
     kp_names = [d for d, _ in kp_dtypes.most_common()]
     report = dict(tool="ud_map verify", rad=args.rad, source=args.source,
                   gguf=(args.gguf if isinstance(args.gguf, list) else [args.gguf]) if args.gguf else None,
@@ -2157,6 +2204,9 @@ def verify(args):
                   missing_source=missing_src, missing_gguf=missing_gg,
                   missing_plan=missing_plan,
                   failures=[r["name"] for r in fails], pass_=passed, verdict=verdict,
+                  by_class=dict(by_class), ud_slack=getattr(args, "ud_slack", 1.5),
+                  unverifiable=dict(weights=len(unverifiable), bytes=unverifiable_bytes,
+                                    names=unverifiable[:64]),
                   by_role={k: dict(n=v[0], bytes=v[1]) for k, v in sorted(by_role.items())},
                   by_encoding={k: dict(n=v[0], bytes=v[1]) for k, v in sorted(by_enc.items())},
                   tensors=rows, seconds=round(time.time() - t0, 1))
@@ -2180,6 +2230,10 @@ def verify(args):
         for r in fails[:12]:
             print("  FAIL", r["name"], "; ".join(r["why"]),
                   f"src={r['rmse_source']} gguf={r['rmse_gguf']}")
+    print("by class: " + ", ".join(f"{k} {v}" for k, v in sorted(by_class.items())))
+    if unverifiable:
+        print(f"unverifiable: {len(unverifiable)} weight(s), {unverifiable_bytes} B, no source and no "
+              f"GGUF reference: {', '.join(unverifiable[:8])}{' ...' if len(unverifiable) > 8 else ''}")
     if kp_weights:
         print(f"kernel-private: {kp_weights} weight(s), {kp_bytes/2**30:.3f} GiB, "
               f"dtypes {', '.join(kp_names)}; not Python-decoded, checked by the engine")
@@ -2731,6 +2785,9 @@ def main():
     v.add_argument("--kernels")
     v.add_argument("--tol", type=float, default=0.20)
     v.add_argument("--draft-tol", type=float, default=0.75)
+    v.add_argument("--ud-slack", dest="ud_slack", type=float, default=1.5,
+                   help="a requantised weight may show up to max(--tol, slack x the UD file's own "
+                        "relative error against the source)")
     v.add_argument("--policy", choices=["auto", "lossless", "quantised"], default="auto")
     v.add_argument("--skip-gguf", action="store_true")
     v.add_argument("--allow-missing", action="store_true")

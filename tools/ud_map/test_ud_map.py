@@ -457,6 +457,38 @@ class Types(unittest.TestCase):
             self.assertIn(ty, ud_map.FAST_EXPERTS, ty)
 
 
+class VerifyClasses(unittest.TestCase):
+    def test_exact_planes_are_judged_by_hash_not_by_error(self):
+        # Unsloth's IQ3_XXS sits near 0.283 against bf16; reproducing it exactly is the pass.
+        self.assertEqual(ud_map.tensor_class(True, False, True, True), "EXACT")
+
+    def test_plain_copy_of_the_source_is_exact(self):
+        self.assertEqual(ud_map.tensor_class(None, True, True, False), "EXACT")
+
+    def test_plan_classes_win_over_requant(self):
+        self.assertEqual(ud_map.tensor_class(False, False, True, False, kept=True), "KEPT")
+        self.assertEqual(ud_map.tensor_class(False, False, True, True, derived=True), "DERIVED")
+
+    def test_no_reference_is_unverifiable_not_ok(self):
+        self.assertEqual(ud_map.tensor_class(None, None, False, False), "UNVERIFIABLE")
+
+    def test_gguf_only_is_still_checked(self):
+        self.assertEqual(ud_map.tensor_class(False, None, False, True), "REQUANT")
+
+    def test_bound_follows_the_reference_error(self):
+        self.assertEqual(ud_map.error_bound(0.20, None), 0.20)
+        self.assertEqual(ud_map.error_bound(0.20, 0.05), 0.20)      # a good reference never tightens below the cap
+        self.assertAlmostEqual(ud_map.error_bound(0.20, 0.283), 1.5 * 0.283)
+        # a requantisation twice as bad as an already-poor reference is still caught
+        self.assertGreater(2 * 0.283, ud_map.error_bound(0.20, 0.283))
+
+    def test_verdict_is_partial_with_unverifiable_weights(self):
+        self.assertEqual(ud_map._policy_verdict(True, 0, 0), "PASS")
+        self.assertEqual(ud_map._policy_verdict(True, 0, 8), "PARTIAL")
+        self.assertEqual(ud_map._policy_verdict(True, 3, 0), "PARTIAL")
+        self.assertEqual(ud_map._policy_verdict(False, 0, 8), "FAIL")
+
+
 class Grade(unittest.TestCase):
     def test_multiple_choice(self):
         self.assertTrue(ud_map._grade({"kind": "mc", "expected": "D"}, {"text": "D"}))
