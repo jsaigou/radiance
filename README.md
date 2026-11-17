@@ -8,17 +8,22 @@
 > original author, and comes with no support from them. Please do not report problems with this fork to the original
 > author.
 >
-> **Why it exists.** We run Radiance on AMD Strix Halo (gfx1151), found a few bugs, and fixed one. We did not want to
-> create an account on Codeberg just to file them, so rather than keep the fixes private we publish them here, with the
-> findings written up, so that other Strix Halo users (and the original author, if useful) can find them.
+> **Why it exists.** We run Radiance on AMD Strix Halo (gfx1151), found a few bugs, fixed two, and then added the kernels, formats and
+> tooling needed to serve Unsloth-Dynamic-style mixed-precision models there. We did not want to create an account on Codeberg just to
+> file the bugs, so rather than keep the work private we publish it here, written up, so that other Strix Halo users (and the original
+> author, if useful) can find it.
 >
-> **How it differs from the original.** It contains **bug fixes that are not in the original**, and nothing else:
+> **How it differs from the original.** It contains **bug fixes, new kernels and formats, and tooling that are not in the original**:
 >
 > | | |
 > |---|---|
 > | `main` branch | an exact mirror of the original (no changes), with all release tags |
-> | `unofficial-fixes` branch (default) | the original at commit `451b136` plus the fixes below, this banner, and notes under [`fork-notes/`](fork-notes/) |
+> | `unofficial-fixes` branch (default) | the original at commit `451b136` plus everything below, this banner, and notes under [`fork-notes/`](fork-notes/) |
 > | Fix 1 | MTP speculation depth 3 aborted with "scratch buffer absent or too small" on Strix Halo (`libhalo/halo_attn_decode_h256_gqa6.hip`) |
+> | Fix 2 | `libhalo` prefill split-KV merge overwrote decode rows in mixed steps (silent corruption under concurrency) |
+> | Kernels and formats | 3-bit experts, IQ3_XXS / IQ2_S / IQ4_NL / IQ4_XS / Q5_0 / Q2_0 expert GEMMs, Q8_0 and Q6_K dense, a faster MoE decode kernel: [`docs/FORK-KERNELS.md`](docs/FORK-KERNELS.md) |
+> | Tooling | build `.rad` files from bf16 weights using an Unsloth Dynamic GGUF as the map: [`docs/RAD-FILES.md`](docs/RAD-FILES.md) |
+> | Strix Halo guide | platform, unified-memory behaviour, measured results: [`docs/STRIX-HALO.md`](docs/STRIX-HALO.md) |
 >
 > Bugs we found but did **not** fix are described in [`fork-notes/`](fork-notes/). See
 > [`UNOFFICIAL-FORK.md`](UNOFFICIAL-FORK.md) for details. Everything is Apache-2.0 like the original; `LICENSE` and `NOTICE`

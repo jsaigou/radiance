@@ -13,6 +13,10 @@ original author. This is an unofficial fork: see [`../UNOFFICIAL-FORK.md`](../UN
 | 04 | Silent output corruption with 2+ concurrent sequences (earlier thought to need another process on the GPU: it does not) | **fixed** by note 05; this note records the symptom and how it was narrowed |
 | 05 | `libhalo` prefill split-KV merge overwrites decode rows in a mixed step (the cause of 04) | **fixed** on branch `unofficial-fixes` |
 
+Records added with the kernel work (not bug reports): `06-moe-unrot-bench.md` (unrotated-MoE kernel bench and its logs under `bench-logs/`), `q6k-dense-arch-note.md`
+(the Q6_K dense wiring the architecture plugin needed), and `flashnext-ud-fit-runbook.md` with `flashnext-ud-mirror.*` (the Flash-Next mirror plan, fit model and
+build runbook). The kernel and container work is summarised in [`../docs/FORK-KERNELS.md`](../docs/FORK-KERNELS.md) and [`../docs/RAD-FILES.md`](../docs/RAD-FILES.md).
+
 Unrelated observation: with the FP8 KV cache, speculative decoding at temperature 0 is not bit-identical to non-speculative decoding
 (synonym-level divergence after a few hundred characters). `GUIDE.md` says greedy text matches; this may just be summation order across
 different split counts.
