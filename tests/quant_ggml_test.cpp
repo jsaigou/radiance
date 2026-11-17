@@ -188,7 +188,8 @@ TEST(the_imatrix_reaches_the_search) {
     NEED_LIBQUANT();
     /* With importances the search minimises the importance-weighted error, so every type that
      * has a search must lower it measurably (2.5-25% on this weight). q8_0 has no search
-     * (llama.cpp rounds to nearest either way) and must not change at all. */
+     * (llama.cpp rounds to nearest either way) and must not change at all; nor does q2_0, whose
+     * llama.cpp quantiser has no imatrix path. */
     const int64_t R = 32, C = 1024;
     const std::vector<float> w = draw(R * C, 11, 10.0f);
     const std::vector<float> imp = importance(C, 12);
@@ -198,7 +199,7 @@ TEST(the_imatrix_reaches_the_search) {
         Quantised b = quantise_ggml(t.name, R, C, w, imp.data(), 8);
         REQUIRE_EQ(a.status, RAD_OK);
         REQUIRE_EQ(b.status, RAD_OK);
-        if (!std::strcmp(t.name, "q8_0")) {
+        if (!std::strcmp(t.name, "q8_0") || !std::strcmp(t.name, "q2_0")) {
             CHECK(a.planes == b.planes);
             continue;
         }
