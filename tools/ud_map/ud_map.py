@@ -1414,7 +1414,7 @@ def decode_entry(rf, e, row0=0, nrows=None):
     radfile.KernelPrivateDtype so verify() can report it as kernel-private rather than FAIL or
     silently mis-decode it."""
     import numpy as np
-    from radfile import plane_values, KernelPrivateDtype
+    from radfile import plane_values, KernelPrivateDtype, dt_name
     enc = e.enc
     if enc.kernel_private_planes():
         raise KernelPrivateDtype([p.dtype for p in enc.kernel_private_planes()])
@@ -1451,6 +1451,10 @@ def decode_entry(rf, e, row0=0, nrows=None):
         q = np.where(sg != 0, -q, q)
     if "zero" in roles:
         q = q - _plane_float(rf, e, "zero", rows, cols, row0, nrows)
+    elif table is None and "grid" not in roles and dt_name(enc.planes[roles.index("codes")].dtype) == "u2":
+        # llama.cpp's Q2_0 (ggml type 42) stores 0..3 and decodes d * (code - 1) (ud_repack's
+        # decode_q2_0); the container keeps the raw codes and the kernel applies the offset.
+        q = q - 1
     lv = 0
     while True:
         r = "scale" if lv == 0 else f"scale.{lv}"
