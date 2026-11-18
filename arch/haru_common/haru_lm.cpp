@@ -121,8 +121,11 @@ int HaruLm::declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* 
     const int64_t v_dim    = gc.v_dim();
 
     /* The KV cache's dtype is the checkpoint's for the f32 test path (the reference's cache is
-     * the model dtype, modeling_qwen3_5.py:785-793) and the deployment's default otherwise. */
-    const uint32_t kvd = rad_kv_cache_dtype(ctx, wd == RAD_F32 ? RAD_F32 : RAD_BF16);
+     * the model dtype, modeling_qwen3_5.py:785-793) and the deployment's setting otherwise.
+     * rad_kv_cache_dtype() cannot express the first: the engine always fills ctx->kv_dtype
+     * (bf16 by default), so its fallback never applies and a bf16 cache cost the f32 goldens
+     * about 2e-4 at the full-attention layer. */
+    const uint32_t kvd = wd == RAD_F32 ? (uint32_t)RAD_F32 : rad_kv_cache_dtype(ctx, RAD_BF16);
     g.kv_dtype = rad_dtype_name(kvd);
 
     /* ---- the three groups, as qwen35_bf16.cpp:227-254. */
@@ -442,7 +445,7 @@ int HaruLm::declare_attn(RadBuilder* b, int l, Layer& lay) {
 
 /* ================================================================== gated delta net */
 int HaruLm::declare_gdn(RadBuilder* b, int l, Layer& lay) {
-    Gdn& d = lay.g;
+    Gdn& d = lay.d;
     const char* pre = "lm.layers";
     const int64_t v_dim    = gc.v_dim();
     const int64_t conv_dim = gc.conv_dim();
@@ -676,7 +679,7 @@ void HaruLm::step_attn(RadCtx* c, const RadBatch* batch, const Layer& lay) const
 }
 
 void HaruLm::step_gdn(RadCtx* c, const RadBatch* batch, const Layer& lay) const {
-    const Gdn& d = lay.g;
+    const Gdn& d = lay.d;
     const RadKVGroupBatch* st = kv_batch(batch, kv_state);
     const RadKVGroupBatch* cv = kv_batch(batch, kv_conv);
     const int32_t* st_idx = st ? st->state_index : nullptr;
