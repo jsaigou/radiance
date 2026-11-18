@@ -14,6 +14,13 @@ namespace rad {
 namespace mm { struct Item; }
 namespace server {
 
+/* Whether a request carries the server's API key, in any form the transport accepts:
+ * `Authorization: Bearer`, `X-Api-Key`, or the browser WebSocket subprotocol
+ * `openai-insecure-api-key.<key>`. An empty key admits every request. Shared by the transport's
+ * gate and the socket routes that re-check it in process. */
+bool api_key_ok(const std::string& authorization, const std::string& x_api_key,
+                const std::string& websocket_protocols, const std::string& key);
+
 /* ------------------------------------------------------------------ per-choice state */
 
 struct Server::Generation {

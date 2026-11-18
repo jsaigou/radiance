@@ -21,7 +21,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -77,50 +76,6 @@ std::string step_message(uint32_t seq, const DuplexReply& r) {
         append_le32(&out, u);
     }
     return out;
-}
-
-/* Compared in time independent of where they differ, as the transport's key check is. */
-bool same_secret(const std::string& got, const std::string& key) {
-    if (got.size() != key.size()) return false;
-    unsigned char d = 0;
-    for (size_t i = 0; i < key.size(); ++i) d |= (unsigned char)(got[i] ^ key[i]);
-    return d == 0;
-}
-
-/* A browser cannot set a header on a WebSocket: OpenAI's browser clients offer the key as
- * `openai-insecure-api-key.<key>` in Sec-WebSocket-Protocol. */
-bool offers_key(const std::string& protocols, const std::string& key) {
-    static const std::string kPrefix = "openai-insecure-api-key.";
-    size_t i = 0;
-    while (i <= protocols.size()) {
-        size_t j = protocols.find(',', i);
-        if (j == std::string::npos) j = protocols.size();
-        size_t a = i, b = j;
-        while (a < b && protocols[a] == ' ') ++a;
-        while (b > a && protocols[b - 1] == ' ') --b;
-        if (b - a >= kPrefix.size() && protocols.compare(a, kPrefix.size(), kPrefix) == 0 &&
-            same_secret(protocols.substr(a + kPrefix.size(), b - a - kPrefix.size()), key))
-            return true;
-        i = j + 1;
-    }
-    return false;
-}
-
-/* The transport's key semantics, checked again here so an in-process dispatch sees the same
- * answer and an upgrade that passed the gate by its subprotocol is not refused. */
-bool has_key(const HttpRequest& req, const std::string& key) {
-    if (key.empty()) return true;
-    const std::string auth = req.header("Authorization");
-    const size_t sp = auth.find(' ');
-    const size_t cred = sp == std::string::npos ? sp : auth.find_first_not_of(' ', sp);
-    const bool bearer = cred != std::string::npos && sp == 6 &&
-                        std::equal(auth.begin(), auth.begin() + 6, "bearer",
-                                   [](char a, char b) {
-                                       return std::tolower((unsigned char)a) == b;
-                                   });
-    return (bearer && same_secret(auth.substr(cred), key)) ||
-           same_secret(req.header("X-Api-Key"), key) ||
-           offers_key(req.header("Sec-WebSocket-Protocol"), key);
 }
 
 json error_event(const char* code, const std::string& message) {
@@ -202,7 +157,8 @@ void Server::init_duplex_tenants() {
 /* ------------------------------------------------------------------ GET /duplex/v1/info */
 
 HttpResponse Server::handle_duplex_info(const HttpRequest& req) {
-    if (!has_key(req, opt_.api_key)) {
+    if (!api_key_ok(req.header("Authorization"), req.header("X-Api-Key"),
+                    req.header("Sec-WebSocket-Protocol"), opt_.api_key)) {
         ApiError e;
         e.status = 401;
         e.type = "authentication_error";
@@ -281,7 +237,9 @@ void Server::handle_duplex(const HttpRequest& req, WsConn& ws) {
         ws.send(json_dump(error_event(code, message)));
         ws.close(close_code, code);
     };
-    if (!has_key(req, opt_.api_key)) return refuse("bad_request", "invalid api key", 1008);
+    if (!api_key_ok(req.header("Authorization"), req.header("X-Api-Key"),
+                    req.header("Sec-WebSocket-Protocol"), opt_.api_key))
+        return refuse("bad_request", "invalid api key", 1008);
     if (stopping_.load()) return refuse("internal", "the server is shutting down", 1001);
 
     DuplexSession s;
