@@ -20,7 +20,7 @@ torch 2.15.0 in float32.
 ```
 gen_haru_tiny.py         builds the checkpoint, tokenizer and golden exchange
 check_haru_golden.py     four PASS/FAIL checks; exits non-zero on failure
-golden.safetensors       486 float32/int64 tensors (1,110,964 bytes)
+golden.safetensors       486 float32/int64 tensors (1,110,964 bytes of payload)
 golden_meta.json         sampling config, seeds, reference commit, hashes
 haru_tiny/config.json    HF-style Haru config (same schema as the real one)
 haru_tiny/model.safetensors  model.state_dict(), float32, real key names
