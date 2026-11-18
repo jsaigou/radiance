@@ -966,9 +966,9 @@ int Ctx::lane_join(int from, int to) {
  * field added to RadBatch changes its size: decide whether the key must read it, then update the
  * size here. The ABI-35 host mirrors are used by issue-time split selection; unsupported dynamic
  * geometries fail closed via the pass-key contract, while Qwen keys its full-group maximum in the
- * architecture callback. `agen_b`, `vgen_b` and `sgen_b` are set only on generator passes, which are
- * never recorded (below). */
-static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 480,
+ * architecture callback. `agen_b`, `vgen_b`, `sgen_b` and `dup_b` are set only on generator passes,
+ * which are never recorded (below). */
+static_assert(sizeof(void*) != 8 || sizeof(RadBatch) == 488,
               "RadBatch changed: check that Ctx::pass_key reads every new field a pass depends on");
 static_assert(sizeof(void*) != 8 || sizeof(RadKVGroupBatch) == 88,
               "RadKVGroupBatch changed: check that Ctx::pass_key reads every new field");
@@ -992,8 +992,8 @@ uint64_t Ctx::pass_key(const RadBatch* b) const {
      * sequence from their counts), and such a step samples a prompt's first token, which is not
      * the repeating decode pass. */
     if (b->n_plugin_words > 0) return 0;
-    /* A generator pass is shaped by what RadBatch::gen_b, agen_b, vgen_b or sgen_b carries, which
-     * no key below reads. */
+    /* A generator pass is shaped by what RadBatch::gen_b, agen_b, vgen_b, sgen_b or dup_b carries,
+     * which no key below reads. A duplex tenant's passes (RAD_GEN_PASS_DUPLEX_*) set `gen`. */
     if (b->gen) return 0;
     uint64_t h = 0x9e3779b97f4a7c15ull;
     auto mix = [&](uint64_t v) {
