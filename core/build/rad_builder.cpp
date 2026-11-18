@@ -2135,7 +2135,7 @@ int Builder::declare_duplex_tenant(const RadDuplexDecl* d) {
     }
     if (d->max_ref_frames > 0 &&
         (d->ref_rate <= 0 || d->ref_hop <= 0 || d->ref_hop != d->samples_per_frame)) {
-        err(RAD_E_INVAL, "declare_duplex_tenant '%s': max_ref_frames %lld needs a reference rate "
+        err(RAD_E_INVAL, "declare_duplex_tenant '%s': max_ref_frames %lld needs ref_rate "
                          "(%lld Hz) and ref_hop %lld equal to samples_per_frame %lld", nm,
             (long long)d->max_ref_frames, (long long)d->ref_rate, (long long)d->ref_hop,
             (long long)d->samples_per_frame);
