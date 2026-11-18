@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstddef>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -255,15 +256,15 @@ TEST(the_audio_embedding_matches_the_goldens) {
         std::vector<float> in;
         in.reserve(1 + 2 * latent + 2);
         in.push_back((float)toks[i]);
-        in.insert(in.end(), model_latents.begin() + (long)(i * latent),
-                  model_latents.begin() + (long)((i + 1) * latent));
-        in.insert(in.end(), user_latents.begin() + (long)(i * latent),
-                  user_latents.begin() + (long)((i + 1) * latent));
+        in.insert(in.end(), model_latents.begin() + (std::ptrdiff_t)(i * latent),
+                  model_latents.begin() + (std::ptrdiff_t)((i + 1) * latent));
+        in.insert(in.end(), user_latents.begin() + (std::ptrdiff_t)(i * latent),
+                  user_latents.begin() + (std::ptrdiff_t)((i + 1) * latent));
         in.push_back((float)model_mask[i]);
         in.push_back((float)user_mask[i]);
 
-        const std::vector<float> want(want_all.begin() + (long)(i * latent),
-                                      want_all.begin() + (long)((i + 1) * latent));
+        const std::vector<float> want(want_all.begin() + (std::ptrdiff_t)(i * latent),
+                                      want_all.begin() + (std::ptrdiff_t)((i + 1) * latent));
         std::vector<float> out;
         if (!lane->run(in, want.size(), &out, &why)) {
             fprintf(stderr, "    prompt row %zu: %s\n", i, why.c_str());
