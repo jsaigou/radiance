@@ -13,7 +13,6 @@ One package owns each file, so parallel work does not conflict:
 |---|---|
 | `haru_codec.{h,cpp}` | VibeVoice causal codec, encoder and decoder, streaming per-lane state |
 | `haru_head.{h,cpp}`, `haru_proj.{h,cpp}` | MeanFlow head; the two audio-input projectors |
-| `haru_map.{h,cpp}` | checkpoint tensor name map and conversion recipe helpers |
 | `haru_lm.{h,cpp}` | language model trunk (reuses the qwen35 hybrid blocks) |
 
 Goldens for all of them are in `tests/data/haru/` (a tiny random-weight Haru run on CPU by the public reference).

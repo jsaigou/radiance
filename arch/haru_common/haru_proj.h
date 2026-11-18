@@ -52,6 +52,17 @@ struct HaruProj {
     rad_op op_gemm1_u = 0, op_gemm2_u = 0, op_norm_u = 0;
     rad_op op_mask = 0, op_add_h = 0;
 
+    /* unscale: raw = z / latent_scale - latent_bias. The reciprocal is Newton's iteration on
+     * the device (no host read of a weight). The assumed range is latent_scale in [0.5, 2.0];
+     * r0 = 0.75 and six steps take the relative error below f32 rounding in that range. A
+     * checkpoint outside it would need a different seed/step count; the value is not
+     * host-readable at declare, so this is documented, not checked. */
+    rad_op op_mul_1 = 0, op_add_1 = 0, op_mulw_scale1 = 0;
+    rad_op op_scale_row = 0, op_mul_d = 0;
+    rad_op op_fill_r0 = 0, op_fill_two = 0, op_fill_minus1 = 0;
+    rad_buf b_r0 = 0, b_r1 = 0, b_u = 0, b_v = 0, b_s = 0, b_two = 0, b_minus1 = 0;
+    rad_buf b_bias_d = 0, b_neg_bias_d = 0, b_recip_d = 0, b_unscaled = 0;
+
     rad_buf b_x = 0, b_x2 = 0, b_y = 0, b_mask = 0;
     rad_buf b_fc1 = 0, b_norm = 0;
     rad_buf b_bias = 0, b_scaled = 0, b_scaled2 = 0, b_ones = 0;
@@ -65,6 +76,9 @@ struct HaruProj {
      * 0 or 1; `out` is [1, hidden]. */
     void issue(RadCtx* c, RadOperand token, RadOperand model_latent, RadOperand user_latent,
                RadOperand model_mask, RadOperand user_mask, RadOperand out) const;
+
+    /* normalized [1, latent] -> raw codec space [1, latent]: z / latent_scale - latent_bias. */
+    void unscale(RadCtx* c, RadOperand normalized, RadOperand out) const;
 };
 
 }  /* namespace arch */

@@ -118,8 +118,11 @@ int codec_declare(RadBuilder* b, const CodecGeometry& g, rad_buf audio_in, rad_b
  * (the values are constant; repeating it is harmless). */
 int codec_prepare(RadCtx* c, const Codec& k);
 
-/* Zeros one lane's whole state arena (both stacks). Call on RAD_DUPLEX_F_FIRST, before the frame;
- * a lane index is reused after close, so this is the reset. */
+/* Zeros one lane's whole state arena (both stacks). The assembled duplex tenant calls this in its
+ * PROMPT pass: once before encoding the reference frames and once before decoding model frame 0,
+ * so the live encoder/decoder starts from zero exactly as the reference's streaming codec does.
+ * Do NOT call it on RAD_DUPLEX_F_FIRST: that would erase the decoder state frame 0 produced before
+ * the first live STEP. A lane index is reused after close, so the PROMPT reset is the reset. */
 int codec_reset_lane(RadCtx* c, const Codec& k, int64_t lane);
 
 /* Streaming encode: copies the lane's first `n_samples` (<= frame_samples) from audio_in and runs

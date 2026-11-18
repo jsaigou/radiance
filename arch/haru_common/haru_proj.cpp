@@ -6,6 +6,7 @@
 #include "haru_proj.h"
 
 #include <cstdio>
+#include <utility>
 
 namespace rad {
 namespace arch {
@@ -52,6 +53,17 @@ int HaruProj::declare(RadBuilder* b, rad_weight tokens) {
     PROJ_BUF(b_scaled, "proj.scaled", D);
     PROJ_BUF(b_scaled2, "proj.scaled2", D);
     PROJ_BUF(b_ones, "proj.ones", D);
+    PROJ_BUF(b_r0, "proj.r0", 1);
+    PROJ_BUF(b_r1, "proj.r1", 1);
+    PROJ_BUF(b_u, "proj.u", 1);
+    PROJ_BUF(b_v, "proj.v", 1);
+    PROJ_BUF(b_s, "proj.s", 1);
+    PROJ_BUF(b_two, "proj.two", 1);
+    PROJ_BUF(b_minus1, "proj.minus1", 1);
+    PROJ_BUF(b_bias_d, "proj.bias_d", D);
+    PROJ_BUF(b_neg_bias_d, "proj.neg_bias_d", D);
+    PROJ_BUF(b_recip_d, "proj.recip_d", D);
+    PROJ_BUF(b_unscaled, "proj.unscaled", D);
 
     RAD_ARCH_TRY(plain_weight(b, "latent_scale", { 1 }, &latent_scale));
     RAD_ARCH_TRY(plain_weight(b, "latent_bias", { 1 }, &latent_bias));
@@ -129,6 +141,44 @@ int HaruProj::declare(RadBuilder* b, rad_weight tokens) {
             RAD_OP(b, "add",
                    RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", H), RAD_STR("dtype", "f32")),
                    RAD_NOWEIGHTS));
+
+    PROJ_OP(op_mul_1,
+            RAD_OP(b, "mul",
+                   RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", 1), RAD_STR("dtype", "f32")),
+                   RAD_NOWEIGHTS));
+    PROJ_OP(op_add_1,
+            RAD_OP(b, "add",
+                   RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", 1), RAD_STR("dtype", "f32")),
+                   RAD_NOWEIGHTS));
+    PROJ_OP(op_mulw_scale1,
+            RAD_OP(b, "mul_weight",
+                   RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", 1), RAD_STR("dtype", "f32"),
+                              RAD_INT("scalar", 1)),
+                   RAD_WEIGHTS(latent_scale)));
+    PROJ_OP(op_scale_row,
+            RAD_OP(b, "scale_rows",
+                   RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", D), RAD_STR("act", "none"),
+                              RAD_STR("dtype", "f32")),
+                   RAD_NOWEIGHTS));
+    PROJ_OP(op_mul_d,
+            RAD_OP(b, "mul",
+                   RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", D), RAD_STR("dtype", "f32")),
+                   RAD_NOWEIGHTS));
+    PROJ_OP(op_fill_r0,
+            RAD_OP(b, "fill",
+                   RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", 1), RAD_STR("dtype", "f32"),
+                              RAD_F64("value", 0.75)),
+                   RAD_NOWEIGHTS));
+    PROJ_OP(op_fill_two,
+            RAD_OP(b, "fill",
+                   RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", 1), RAD_STR("dtype", "f32"),
+                              RAD_F64("value", 2.0)),
+                   RAD_NOWEIGHTS));
+    PROJ_OP(op_fill_minus1,
+            RAD_OP(b, "fill",
+                   RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", 1), RAD_STR("dtype", "f32"),
+                              RAD_F64("value", -1.0)),
+                   RAD_NOWEIGHTS));
     return RAD_OK;
 }
 
@@ -168,6 +218,32 @@ void HaruProj::issue(RadCtx* c, RadOperand token, RadOperand model_latent, RadOp
               RAD_B(b_x2), out);
 
     (void)H;
+}
+
+void HaruProj::unscale(RadCtx* c, RadOperand normalized, RadOperand out) const {
+    if (!c) return;
+    /* r = 1 / latent_scale, by Newton's iteration from 0.75. The assumed range is [0.5, 2.0];
+     * after six steps the relative error is below f32 rounding at both ends of that range. */
+    RAD_ISSUE_N(c, op_fill_r0, 1, RAD_B(b_r0));
+    RAD_ISSUE_N(c, op_fill_two, 1, RAD_B(b_two));
+    RAD_ISSUE_N(c, op_fill_minus1, 1, RAD_B(b_minus1));
+    rad_buf cur = b_r0, nxt = b_r1;
+    for (int i = 0; i < 6; ++i) {
+        RAD_ISSUE_N(c, op_mulw_scale1, 1, RAD_B(cur), RAD_W(latent_scale), RAD_B(b_u)); /* s r */
+        RAD_ISSUE_N(c, op_mul_1, 1, RAD_B(b_u), RAD_B(b_minus1), RAD_B(b_v));      /* -s r */
+        RAD_ISSUE_N(c, op_add_1, 1, RAD_B(b_two), RAD_B(b_v), RAD_B(b_s));          /* 2 - s r */
+        RAD_ISSUE_N(c, op_mul_1, 1, RAD_B(cur), RAD_B(b_s), RAD_B(nxt));            /* r (2-sr) */
+        std::swap(cur, nxt);
+    }
+
+    /* Broadcast the scalar reciprocal across the latent; broadcast -bias the same way. */
+    RAD_ISSUE_N(c, op_fill_d, 1, RAD_B(b_ones));
+    RAD_ISSUE_N(c, op_scale_row, 1, RAD_B(b_ones), RAD_B(cur), RAD_NONE, RAD_B(b_recip_d));
+    RAD_ISSUE_N(c, op_mulw_bias, 1, RAD_B(b_ones), RAD_W(latent_bias), RAD_B(b_bias_d));
+    RAD_ISSUE_N(c, op_scale_row, 1, RAD_B(b_bias_d), RAD_B(b_minus1), RAD_NONE,
+                RAD_B(b_neg_bias_d));
+    RAD_ISSUE_N(c, op_mul_d, 1, normalized, RAD_B(b_recip_d), RAD_B(b_unscaled));
+    RAD_ISSUE_N(c, op_add_d, 1, RAD_B(b_unscaled), RAD_B(b_neg_bias_d), out);
 }
 
 #undef PROJ_OP
