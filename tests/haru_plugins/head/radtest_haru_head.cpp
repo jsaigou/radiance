@@ -43,7 +43,7 @@ struct Model {
     rad_buf audio_in = 0, audio_out = 0, status = 0;
     rad_buf mark = 0, token_i32 = 0;
     rad_kvgroup kv = 0;
-    rad_op op_attn = 0, op_mark = 0, op_status = 0, op_cast = 0;
+    rad_op op_attn = 0, op_mark = 0, op_status = 0, op_zero = 0, op_cast = 0;
     rad_weight embed_tokens = 0;
     HaruHead head;
     HaruProj proj;
@@ -111,12 +111,17 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     };
     m.op_status = rad_decl_op(b, "fill", status_p, (int)(sizeof(status_p) / sizeof(status_p[0])),
                               nullptr, 0);
+    const RadParam zero_p[] = {
+        RAD_RANGE("M", 1, 1), RAD_INT("n", (int)kSamples), RAD_STR("dtype", "f32"),
+    };
+    m.op_zero = rad_decl_op(b, "fill", zero_p, (int)(sizeof(zero_p) / sizeof(zero_p[0])),
+                            nullptr, 0);
     const RadParam cast_p[] = {
         RAD_RANGE("M", 1, 1), RAD_INT("n", 1), RAD_STR("from", "f32"), RAD_STR("to", "i32"),
     };
     m.op_cast = rad_decl_op(b, "cast", cast_p, (int)(sizeof(cast_p) / sizeof(cast_p[0])),
                             nullptr, 0);
-    if (!m.op_mark || !m.op_status || !m.op_cast) return RAD_E_NOKERNEL;
+    if (!m.op_mark || !m.op_status || !m.op_zero || !m.op_cast) return RAD_E_NOKERNEL;
 
     /* Geometry from the checkpoint's free-form keys. The nested `lm` and `head` objects arrive as
      * "lm.<key>" and "head.<key>". */
@@ -193,6 +198,8 @@ static void step(RadCtx* c, const RadBatch* batch) {
         const int64_t lane = d->lane_h[i];
         const int64_t base = lane * kSamples;
         RAD_ISSUE_N(c, m.op_status, 1, RAD_B_N(m.status, lane, 1));
+        /* The tunnel's unused tail is zero, so a reply carries only the tensor it computed. */
+        RAD_ISSUE_N(c, m.op_zero, 1, RAD_B_N(m.audio_out, base, kSamples));
 
         if (m.mode == MD_EMBED) {
             const int64_t D = m.proj.g.latent;
