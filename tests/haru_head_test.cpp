@@ -73,6 +73,7 @@ std::string prepare_model(const char* tenant) {
         std::ofstream out(dst + "/config.json");
         if (!out) return std::string();
         out << c.dump(2) << "\n";
+        out.close();
         if (!out) return std::string();
     } catch (const std::exception&) {
         return std::string();
