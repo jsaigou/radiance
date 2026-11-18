@@ -5,6 +5,7 @@
 #include "engine_priv.h"
 #include "gen/driver.h"
 #include "gen/audio_driver.h"
+#include "gen/duplex_driver.h"
 #include "gen/video_driver.h"
 #include "gen/shape_driver.h"
 #include "kld.h"
@@ -20,6 +21,7 @@
 #include "sample/accept.h"
 #include "sched/scheduler.h"
 #include "server/adapters.h"
+#include "server/duplex_engine.h"
 #include "server/server.h"
 #include "server/sink.h"
 #include "server/liveview.h"
@@ -2046,21 +2048,22 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     }
     embedding_ = ranks_[0]->program.pooled_buf != RAD_NULL_HANDLE;
     const bool audio_gen = ranks_[0]->program.is_audio_generator();
+    const bool duplex_gen = ranks_[0]->program.is_duplex_tenant();
     const bool video_gen = ranks_[0]->program.is_video_generator();
     const bool shape_gen = ranks_[0]->program.is_shape_generator();
     const bool generator = ranks_[0]->program.is_pass_driven();
     if (ranks_[0]->program.logits_buf == RAD_NULL_HANDLE && !embedding_ && !generator) {
         RAD_ERR("the '%s' plugin declared no logits buffer (rad_declare_logits), no pooled output "
                 "(rad_declare_pooled) and no generator (rad_declare_generator, "
-                "rad_declare_audio_generator, rad_declare_video_generator, "
-                "rad_declare_shape_generator), so a step produces "
+                "rad_declare_audio_generator, rad_declare_duplex_tenant, "
+                "rad_declare_video_generator, rad_declare_shape_generator), so a step produces "
                 "nothing anyone can read. An encoder-only plugin cannot serve.",
                 plugins_.arch_plugin.c_str());
         return RAD_E_UNSUPPORTED;
     }
     if (generator) {
-        const char* const what = audio_gen ? "audio" : video_gen ? "video"
-                               : shape_gen ? "shapes" : "images";
+        const char* const what = audio_gen ? "audio" : duplex_gen ? "duplex conversations"
+                               : video_gen ? "video" : shape_gen ? "shapes" : "images";
         if (cfg_.kld() || cfg_.n_spec > 0) {
             RAD_ERR("the '%s' plugin makes %s: --kld and speculative decoding have no tokens to "
                     "work on", plugins_.arch_plugin.c_str(), what);
@@ -2068,6 +2071,7 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         }
         for (size_t i = 1; i < ranks_.size(); ++i)
             if (ranks_[i]->program.is_audio_generator() != audio_gen ||
+                ranks_[i]->program.is_duplex_tenant() != duplex_gen ||
                 ranks_[i]->program.is_video_generator() != video_gen ||
                 ranks_[i]->program.is_shape_generator() != shape_gen ||
                 !ranks_[i]->program.is_pass_driven()) {
@@ -2078,6 +2082,9 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         prefix_off_why_ = audio_gen
             ? "an audio generator: a prompt is read by its own request's frames and by nothing "
               "after them"
+            : duplex_gen
+            ? "a duplex tenant: a lane's prompt is read by its own live frames and keeps that "
+              "lane's KV"
             : video_gen
             ? "a video generator: a prompt is read by its own request's steps and keeps no KV"
             : shape_gen
@@ -2264,6 +2271,21 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
         auto d = std::make_unique<gen::AudioDriver>();
         RAD_TRY(d->init(ranks_[0]->program, kv_iface_.get(), gio));
         aud_gen_ = d.get();
+        gen_ = std::move(d);
+        RAD_TRY(rad_dev_set(ranks_[0]->device));
+    } else if (duplex_gen) {
+        /* A lane reserves the whole context it may grow to. --duplex-max-ctx is that bound; a
+         * declaration whose prompt is longer still gets its prompt admitted. */
+        std::vector<gen::DuplexDriver::RankIO> gio;
+        for (auto& rk : ranks_)
+            gio.push_back({ rk->device, rk->ctx.stream(), &rk->program });
+        int64_t bound = std::max<int64_t>(ranks_[0]->program.duplex.max_prompt,
+                                          cfg_.duplex_max_ctx);
+        /* --max-model-len overrides the lane bound, as it overrides the KV plan's context. */
+        if (cfg_.max_ctx > 0) bound = cfg_.max_ctx;
+        auto d = std::make_unique<gen::DuplexDriver>();
+        RAD_TRY(d->init(ranks_[0]->program, kv_iface_.get(), gio, bound));
+        dup_gen_ = d.get();
         gen_ = std::move(d);
         RAD_TRY(rad_dev_set(ranks_[0]->device));
     } else if (generator) {
@@ -2848,6 +2870,7 @@ int Engine::run_server() {
     o.embedding_model = embedding_;
     o.image_model = img_gen_ != nullptr;
     o.audio_model = aud_gen_ != nullptr;
+    o.duplex_model = dup_gen_ != nullptr;
     o.video_model = vid_gen_ != nullptr;
     o.shape_model = shp_gen_ != nullptr;
     o.decision_type = rad_meta_gets(&meta_, "decision.type", "");
@@ -3441,6 +3464,42 @@ int Engine::run_server() {
                      ? fmt("played %lld frames at a time as they are made",
                            (long long)ad.voc_chunk).c_str()
                      : fmt("%lld steps a window by default", (long long)in.default_steps).c_str());
+    }
+
+    /* A duplex tenant's endpoint: the driver's lane operations and the declared prompt, frame
+     * geometry and limits. The server renders and tokenises the card/reference prompt, then calls
+     * open/step/flush/close one lane at a time. */
+    server::EngineDuplexBridge duplex_bridge;
+    if (dup_gen_) {
+        const Program& pg = ranks_[0]->program;
+        const RadDuplexDecl& dd = pg.duplex;
+        server::DuplexGenInfo in;
+        in.name = pg.dup_str.name;
+        in.tmpl = pg.dup_str.tmpl;
+        in.text = dd.text != 0;
+        in.max_lanes = dd.max_lanes;
+        in.max_prompt = dd.max_prompt;
+        in.max_ref_frames = dd.max_ref_frames;
+        in.ref_rate = dd.ref_rate;
+        in.ref_hop = dd.ref_hop;
+        in.sample_rate = dd.sample_rate;
+        in.samples_per_frame = dd.samples_per_frame;
+        in.channels = dd.channels;
+        in.frame_rate_num = dd.frame_rate_num;
+        in.frame_rate_den = dd.frame_rate_den;
+        in.latent_dim = dd.latent_dim;
+        duplex_bridge.init(dup_gen_, in,
+                           { (int)cfg_.duplex_open_timeout_ms,
+                             (int)cfg_.duplex_step_timeout_ms });
+        d.duplex = &duplex_bridge;
+        if (cfg_.served_model_name.empty() && !in.name.empty()) {
+            o.model_id = in.name;
+            decide("--served-model-name", o.model_id, "a duplex tenant: its own name");
+        }
+        RAD_INFO("duplex: '%s', %lld Hz, %lld samples a frame, up to %lld lanes, %lld rows a lane",
+                 in.name.c_str(), (long long)in.sample_rate,
+                 (long long)in.samples_per_frame, (long long)in.max_lanes,
+                 (long long)std::max<int64_t>(dd.max_prompt, cfg_.duplex_max_ctx));
     }
 
     /* A video generator's endpoints: the driver's queue and the declared prompt, sizes and

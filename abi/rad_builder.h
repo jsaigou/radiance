@@ -1583,6 +1583,83 @@ typedef struct RadShapeGenDecl {
 
 int rad_declare_shape_generator(RadBuilder* b, const RadShapeGenDecl* d);
 
+/* ================================================================== the duplex tenant */
+/* A program that is one conversation's model: a prompt of card tokens and reference frames fills
+ * a lane's state, then every live step consumes one audio frame and produces one audio frame and
+ * optionally one text token. The core drives the passes (RadBatch::gen, RadDuplexBatch):
+ *
+ *   RAD_GEN_PASS_DUPLEX_PROMPT  the card tokens and reference frames of one or more lanes, as an
+ *                               ordinary causal prefill into the KV groups. A row whose
+ *                               RadDuplexBatch::ref_frame is >= 0 is a reference frame and the
+ *                               plugin embeds its projected frame in place of the placeholder
+ *                               token; -1 is a card/text row.
+ *   RAD_GEN_PASS_DUPLEX_STEP    one live frame a lane: the plugin reads the client's samples from
+ *                               the declaration's `audio_in`, runs one row, and writes the
+ *                               model's samples to `audio_out`, an optional token id to
+ *                               `text_out`, and `status`.
+ *
+ * A program declares exactly one of this, the other generators, logits or pooled vectors. The
+ * driver and the server bridge are follow-ups; the declaration is accepted so a plugin can state
+ * the tenant without a batch to run it yet. */
+enum { RAD_GEN_PASS_DUPLEX_PROMPT = 19, RAD_GEN_PASS_DUPLEX_STEP = 20 };
+
+enum {
+    RAD_DUPLEX_AUDIO_USER  = 1,       /* the client's live input frame */
+    RAD_DUPLEX_AUDIO_MODEL = 2        /* the model's own frame (reference or last output) */
+};
+
+typedef struct RadDuplexAudioIn {
+    int32_t source;       /* RAD_DUPLEX_AUDIO_* */
+    int64_t in_dim;       /* the latent width the codec produces, e.g. 64 */
+    int64_t hidden;       /* the projector's hidden width */
+    int64_t out_dim;      /* the embedding width it writes */
+    int32_t rms_norm;     /* 1: RMSNorm between the two projections */
+} RadDuplexAudioIn;
+
+typedef struct RadDuplexDecl {
+    const char* name;              /* the tenant name in /duplex/v1/info */
+
+    /* The preamble. `{card}` is the start message's card rendered as text; `{references}` is
+     * replaced by one row per reference frame, model audio only. No transcript. */
+    const char* tmpl;
+    int64_t     max_prompt;        /* card tokens + reference rows */
+    int64_t     max_ref_frames;
+    int64_t     ref_rate;          /* 24000 */
+    int64_t     ref_hop;           /* samples a reference frame; equal to samples_per_frame */
+
+    /* One conversation a lane. */
+    int64_t     max_lanes;
+
+    /* The frame contract (docs/DUPLEX-ENGINE.md). */
+    int64_t     sample_rate;       /* 24000 */
+    int64_t     channels;          /* 1 */
+    int64_t     samples_per_frame; /* 3200 */
+    int64_t     latent_dim;        /* 64 */
+    int64_t     frame_rate_num;    /* 15 */
+    int64_t     frame_rate_den;    /* 2 -> 7.5 frames a second */
+
+    /* The audio-input projectors. Each is a network the plugin declares itself; the core only
+     * needs to know which source feeds it and the geometry, so the driver and the graph dump can
+     * name it. The array is `audio_ins` because `audio_in` below is the wire-frame buffer. */
+    int32_t          n_audio_in;   /* 0..2 */
+    RadDuplexAudioIn audio_ins[2];
+
+    /* 1: the model may emit a text token beside its audio frame. */
+    int32_t     text;
+
+    /* Device buffers. audio_in is written by the driver from the wire; audio_out, text_out and
+     * status are read back after STEP. */
+    rad_buf     audio_in;          /* f32 [max_lanes, samples_per_frame] */
+    rad_buf     audio_out;         /* f32 [max_lanes, samples_per_frame] */
+    rad_buf     text_out;          /* i32 [max_lanes], -1 = no token; required with text */
+    /* i32 [max_lanes], one a lane. 0: replied with an audio frame. 1: replied with NO audio (a
+     * silent frame); audio_out is not read. < 0: fatal. This is a comment-only meaning, not a
+     * layout change. */
+    rad_buf     status;
+} RadDuplexDecl;
+
+int rad_declare_duplex_tenant(RadBuilder* b, const RadDuplexDecl* d);
+
 /* ================================================================== diagnostics */
 /* A plugin may annotate the graph dump. Free-form, printed under --debug-graph. */
 void rad_note(RadBuilder* b, const char* fmt, ...);
@@ -1723,6 +1800,11 @@ typedef struct RadArchProbe {
      * `gen_rows` (its largest pass: a step's two branches, or a query pass's points). It keeps no
      * KV. */
     int32_t gen_shape;
+
+    /* ---- appended in ABI 38 (the duplex tenant) */
+    /* Nonzero for a duplex tenant (rad_declare_duplex_tenant): `gen_rows` is its largest prompt
+     * or step pass and `gen_ctx` the bound a lane's context grows to. `gen_audio` stays 0. */
+    int32_t gen_duplex;
 } RadArchProbe;
 
 int rad_arch_probe(const RadModelMeta* meta, RadArchProbe* out);

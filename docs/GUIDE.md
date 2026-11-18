@@ -2189,6 +2189,9 @@ by 0.002-0.003 nats.
 | `--no-cors` | CORS on | send no CORS headers (§6.6) |
 | `--duplex-test-tenants` | off | serve the duplex contract's model-free `echo` and `echo1` tenants on `/duplex/v1/session`, for checking a client without a model (§5.19) |
 | `--duplex-max-lanes N` | 2 | conversations one duplex test tenant holds at once; past it a start is `session_limit` |
+| `--duplex-max-ctx N` | 13500 | rows a duplex lane may grow to, prompt included (30 min at 7.5 frames/s) |
+| `--duplex-open-timeout-ms N` | 120000 | how long a duplex prompt may take before its lane is closed |
+| `--duplex-step-timeout-ms N` | 5000 | how long one duplex step or flush may take before its lane is closed |
 | `--duplex-idle-s S` | 30 | seconds a duplex session may receive no message before it is closed with `timeout` |
 | `--duplex-max-reference-mib N` | 64 | the largest reference audio a duplex start may announce, in MiB (1 to 512) |
 
@@ -3718,7 +3721,10 @@ No model is needed for the two built-in test tenants, which are off unless
 `--duplex-test-tenants` is given. `echo` returns each frame unchanged in the same step; `echo1`
 returns it one step later, with the first reply empty, and `flush` returns the frame it still holds.
 `--duplex-max-lanes N` sets how many conversations one test tenant holds at once (default 2); a start
-beyond it is `session_limit`. A session that receives no message for `--duplex-idle-s` seconds
+beyond it is `session_limit`. A duplex lane reserves up to `--duplex-max-ctx` rows; its prompt
+may take `--duplex-open-timeout-ms` and each live step or flush `--duplex-step-timeout-ms` before
+the engine gives up and closes it with `timeout`. A session that receives no message for
+`--duplex-idle-s` seconds
 (default 30) is closed with the fatal `timeout` error, and a lane that runs past
 `start.max_minutes` (when positive) is closed the same way. `--duplex-max-reference-mib N`
 (default 64) bounds reference audio and is reported as `max_reference_bytes` in `/info`; a start that

@@ -43,6 +43,7 @@ struct Deps {
     IMultimodal*      mm      = nullptr;   /* absent -> image and audio parts are 501 */
     IImageGen*        images  = nullptr;   /* absent -> the images endpoints are 501 */
     IAudioGen*        audio   = nullptr;   /* absent -> /v1/audio/speech is 501 */
+    IDuplexGen*       duplex  = nullptr;   /* absent -> /duplex/v1 lists no plugin tenant */
     IVideoGen*        videos  = nullptr;   /* absent -> /v1/videos is 501 */
     IShapeGen*        shapes  = nullptr;   /* absent -> /generate is 501 */
     const SpeechFormat* speech = nullptr;  /* absent -> /v1/audio/transcriptions is 501 */
@@ -83,6 +84,9 @@ struct ServerOptions {
     /* An audio generator (rad_declare_audio_generator) generates no text either: the text
      * endpoints answer 501 naming /v1/audio/speech. */
     bool        audio_model = false;
+    /* A duplex tenant (rad_declare_duplex_tenant) serves /duplex/v1 only and generates no text
+     * or files. */
+    bool        duplex_model = false;
     /* A video generator (rad_declare_video_generator) generates no text either: the text
      * endpoints answer 501 naming /v1/videos. */
     bool        video_model = false;

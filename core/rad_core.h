@@ -461,10 +461,17 @@ public:
     RadShapeGenDecl shape_gen{};
     std::string     sgen_name;
     bool is_shape_generator() const { return shape_gen.max_lanes != 0; }
-    /* Driven by passes, not token steps: any generator. */
+    /* The declared duplex tenant (rad_declare_duplex_tenant); `max_lanes` 0 when none. Its strings
+     * point at `dup_str`, as the audio generator's do at `agen_str`. */
+    RadDuplexDecl duplex{};
+    struct DuplexStrings {
+        std::string name, tmpl;
+    } dup_str;
+    bool is_duplex_tenant() const { return duplex.max_lanes != 0; }
+    /* Driven by passes, not token steps: any generator or the duplex tenant. */
     bool is_pass_driven() const {
         return is_generator() || is_audio_generator() || is_video_generator() ||
-               is_shape_generator();
+               is_shape_generator() || is_duplex_tenant();
     }
 
     /* Two arenas, because a host-site activation cannot index device memory. The buffer plan
@@ -1131,6 +1138,15 @@ struct Config {
     /* --duplex-max-lanes: the conversations one duplex test tenant holds at once; past it a start
      * is session_limit. */
     int64_t duplex_max_lanes = 2;
+    /* --duplex-max-ctx: the context a duplex lane may grow to, prompt included, in rows. The
+     * default is 30 minutes at 7.5 frames a second; the KV plan reserves it a lane. */
+    int64_t duplex_max_ctx = 13500;
+    /* --duplex-open-timeout-ms: how long a lane's prompt may take before the engine gives up and
+     * closes it. */
+    int64_t duplex_open_timeout_ms = 120000;
+    /* --duplex-step-timeout-ms: how long one live step or flush may take. The client's frame
+     * deadline is about a second, so this defaults well below the prompt's bound. */
+    int64_t duplex_step_timeout_ms = 5000;
     /* --duplex-idle-s: how long a duplex session may receive no message at all before it is
      * closed with the "timeout" error. */
     int64_t duplex_idle_s = 30;

@@ -73,6 +73,10 @@ set(RAD_GOLDEN_FIXTURES ${CMAKE_CURRENT_SOURCE_DIR}/data/golden)
 # silently replace the weak fakes sched_test, ref_test and runtime_test rely on.
 set(RAD_TEST_CORE stdc++ rad_core)
 
+# A test-only architecture plugin (tests/duplex_plugin), built into $RADIANCE_HOME/archtest so a
+# normal radiance run never scans it. duplex_plugin_test copies it into a temporary home.
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/duplex_plugin ${CMAKE_CURRENT_BINARY_DIR}/duplex_plugin)
+
 # harness_test runs harness_fixture's cases through the harness's command line (rad_test.h).
 set(RAD_TESTS_HARNESS harness_test)
 add_executable(harness_fixture ${CMAKE_CURRENT_SOURCE_DIR}/harness_fixture.cpp)
@@ -376,6 +380,16 @@ if(TARGET clef_decision_test)
 endif()
 if(TARGET laya_decision_test)
   set_tests_properties(laya_decision_test PROPERTIES LABELS "e2e" TIMEOUT 300)
+endif()
+# The first real run of the duplex engine wiring: the binary, libref and the test-only plugin,
+# with a tiny checkpoint. Kept out of the fast tier like the other e2e runs.
+if(TARGET duplex_plugin_test AND TARGET radtest_duplex)
+  target_compile_definitions(duplex_plugin_test PRIVATE
+    RAD_E2E_SERVER="$<TARGET_FILE:radiance>"
+    RAD_E2E_HOME="${RAD_PLUGIN_OUT}"
+    RAD_DUPLEX_PLUGIN="$<TARGET_FILE:radtest_duplex>")
+  add_dependencies(duplex_plugin_test radiance libref radtest_duplex)
+  set_tests_properties(duplex_plugin_test PROPERTIES LABELS "e2e" TIMEOUT 300)
 endif()
 
 # abi_layout_test compares the ABI's struct layouts with a C translation unit's: abi_c_test.c

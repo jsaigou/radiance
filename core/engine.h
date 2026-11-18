@@ -50,7 +50,7 @@ namespace rad {
 
 class Kld;
 class StallWatch;
-namespace gen { class Driver; class AudioDriver; class VideoDriver; class ShapeDriver; struct IPassDriver; }
+namespace gen { class Driver; class AudioDriver; class DuplexDriver; class VideoDriver; class ShapeDriver; struct IPassDriver; }
 namespace server { class Sink; }
 struct TierPump;
 struct TierJob;
@@ -439,12 +439,13 @@ private:
     /* A generator (rad_declare_generator, rad_declare_audio_generator,
      * rad_declare_video_generator, rad_declare_shape_generator): the driver that turns requests
      * into passes and the loop that runs them, replacing the scheduler and step loop
-     * (engine_gen.cpp). Null for every other program. `img_gen_`, `aud_gen_`, `vid_gen_` and
-     * `shp_gen_` are the same driver by its kind, for the endpoints; one of them is set when
-     * `gen_` is. */
+     * (engine_gen.cpp). Null for every other program. `img_gen_`, `aud_gen_`, `dup_gen_`,
+     * `vid_gen_` and `shp_gen_` are the same driver by its kind, for the endpoints; one of them is
+     * set when `gen_` is. */
     std::unique_ptr<gen::IPassDriver> gen_;
     gen::Driver*                      img_gen_ = nullptr;
     gen::AudioDriver*                 aud_gen_ = nullptr;
+    gen::DuplexDriver*                dup_gen_ = nullptr;
     gen::VideoDriver*                 vid_gen_ = nullptr;
     gen::ShapeDriver*                 shp_gen_ = nullptr;
     int  gen_loop();

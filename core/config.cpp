@@ -306,6 +306,12 @@ static const Flag g_flags[] = {
     { "--duplex-test-tenants", nullptr, "serve the duplex contract's model-free echo and echo1 tenants on\n"
     "                                    /duplex/v1/session, for checking a client without a model" },
     { "--duplex-max-lanes",   "N",      "conversations one duplex test tenant holds at once (default 2)" },
+    { "--duplex-max-ctx",     "N",      "rows one duplex lane may grow to, prompt included (default 13500:\n"
+    "                                    30 minutes at 7.5 frames a second)" },
+    { "--duplex-open-timeout-ms", "N",  "milliseconds a duplex prompt may take before its lane is\n"
+    "                                    closed (default 120000)" },
+    { "--duplex-step-timeout-ms", "N",  "milliseconds one duplex step or flush may take before its\n"
+    "                                    lane is closed (default 5000)" },
     { "--duplex-idle-s",      "S",      "seconds a duplex session may receive no message before it is\n"
     "                                    closed with the timeout error (default 30)" },
     { "--duplex-max-reference-mib", "N", "the largest reference audio a duplex start may announce, in MiB\n"
@@ -1056,6 +1062,13 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--no-cors"))               c->cors = false;
         else if (S("--duplex-test-tenants"))   c->duplex_test_tenants = true;
         else if (S("--duplex-max-lanes"))      { if (!num(1, INT32_MAX, &c->duplex_max_lanes)) return RAD_E_INVAL; }
+        else if (S("--duplex-max-ctx"))        { if (!num(1, INT32_MAX, &c->duplex_max_ctx)) return RAD_E_INVAL; }
+        else if (S("--duplex-open-timeout-ms")) {
+            if (!num(100, 600000, &c->duplex_open_timeout_ms)) return RAD_E_INVAL;
+        }
+        else if (S("--duplex-step-timeout-ms")) {
+            if (!num(100, 600000, &c->duplex_step_timeout_ms)) return RAD_E_INVAL;
+        }
         else if (S("--duplex-idle-s"))         { if (!num(1, INT32_MAX, &c->duplex_idle_s)) return RAD_E_INVAL; }
         else if (S("--duplex-max-reference-mib")) {
             if (!num(1, 512, &c->duplex_max_reference_mib)) return RAD_E_INVAL;
@@ -1513,6 +1526,9 @@ const ShowRow kShow[] = {
           return std::string(c.cors ? "not given: CORS headers sent" : "no CORS headers"); } },
     { "--duplex-test-tenants", [](const Config& c) { return onoff(c.duplex_test_tenants); } },
     { "--duplex-max-lanes",   [](const Config& c) { return num(c.duplex_max_lanes); } },
+    { "--duplex-max-ctx",     [](const Config& c) { return num(c.duplex_max_ctx); } },
+    { "--duplex-open-timeout-ms", [](const Config& c) { return num(c.duplex_open_timeout_ms); } },
+    { "--duplex-step-timeout-ms", [](const Config& c) { return num(c.duplex_step_timeout_ms); } },
     { "--duplex-idle-s",      [](const Config& c) { return num(c.duplex_idle_s); } },
     { "--duplex-max-reference-mib", [](const Config& c) { return num(c.duplex_max_reference_mib); } },
     { "--image-min-pixels",   [](const Config& c) { return opt(c.image_min_pixels, "the container's"); } },
