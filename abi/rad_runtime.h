@@ -363,6 +363,11 @@ typedef struct RadBatch {
      * context state at the anchor (LiLiCorr) gathers it there; the query rows themselves sit past
      * that position. Null on every other pass. */
     const int32_t* anchor_rows;
+
+    /* ---- appended in ABI 38 (the duplex tenant) */
+    /* A duplex tenant's pass (rad_declare_duplex_tenant; `gen` is one of its
+     * RAD_GEN_PASS_DUPLEX_*): its payload. Null on every other step. */
+    const struct RadDuplexBatch* dup_b;
 } RadBatch;
 
 /* What a generator pass carries beside the step batch's own fields, which keep their meanings:
@@ -635,6 +640,54 @@ enum {
     RAD_AGEN_F_LAST  = 8,    /* the window's last step: after it the latent is final */
     RAD_AGEN_F_JOIN  = 16    /* the window has a predecessor whose end it overlaps */
 };
+
+/* A duplex tenant's STEP flags (rad_builder.h, RadDuplexDecl). */
+enum {
+    RAD_DUPLEX_F_FIRST = 1,  /* the lane's first live step */
+    RAD_DUPLEX_F_FLUSH = 2   /* a flush; no new input frame */
+};
+
+/* What a duplex tenant's pass carries beside the step batch's own fields (rad_builder.h,
+ * RadDuplexDecl, describes the passes):
+ *
+ *   PROMPT   card tokens and reference frames, an ordinary causal prefill: `token_ids`,
+ *            `positions`, `cu_seqlens` and the KV groups' slot mapping, block table and seqused.
+ *            `ref_frame[t]` names the reference frame row t embeds, or -1 for a card/text row.
+ *   STEP     one row a lane, at the lane's next position: `audio_in[lane]` holds the live frame
+ *            (the declaration's buffer, not a field here), and the plugin writes the reply's
+ *            samples, token and status to the declaration's buffers.
+ *
+ * Every pointer is device memory unless the name ends in _h. */
+typedef struct RadDuplexBatch {
+    /* PROMPT and STEP: the lanes of the pass, in entry order. */
+    int64_t         n_lane;
+    const int32_t*  lane;          /* [n_lane] */
+    const int32_t*  lane_h;
+
+    /* PROMPT: the number of prompt rows. */
+    int64_t         n_tok;
+    /* PROMPT: the last prompt row of each lane. */
+    const int32_t*  last_row;
+    const int32_t*  last_row_h;
+
+    /* PROMPT: the clips' samples end to end, their bounds in samples, and the frame each row
+     * names, as RadAudioGenBatch's reference fields: -1 is a card/text row; >= 0 is the index of
+     * the reference frame that row embeds. */
+    int64_t         n_ref;
+    int64_t         ref_samples;
+    const float*    ref_audio;
+    const int32_t*  ref_cu;
+    const int32_t*  ref_cu_h;
+    const int32_t*  ref_frame;
+    const int32_t*  ref_frame_h;
+
+    /* STEP: the live frame number, the lane's seed, and RAD_DUPLEX_F_*. */
+    const int32_t*  frame;
+    const int32_t*  frame_h;
+    const uint32_t* seed;
+    const int32_t*  flags;
+    const int32_t*  flags_h;
+} RadDuplexBatch;
 
 /* What a video generator's pass carries beside the step batch's own fields (rad_builder.h,
  * RadVideoGenDecl, describes the passes). Every pass is one request's, in lane `lane`:
