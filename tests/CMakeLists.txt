@@ -248,6 +248,13 @@ foreach(t ${RAD_TESTS})
     # tokenizers are too large).
     target_compile_definitions(${n} PRIVATE
       RAD_GBNF_TEST_DATA="${CMAKE_CURRENT_SOURCE_DIR}/data/gbnf")
+  elseif(n STREQUAL "duplex_sampler_test")
+    # The host text sampler's cases come from gen_sampler_vectors.py; the sampler itself is part
+    # of rad_core (core/gen), so this is the ordinary no-engine unit test with its data path.
+    add_executable(${n} ${t})
+    target_link_libraries(${n} PRIVATE ${RAD_TEST_CORE})
+    target_compile_definitions(${n} PRIVATE
+      RAD_GEN_SAMPLER_VECTORS="${CMAKE_CURRENT_SOURCE_DIR}/data/haru")
   else()
     add_executable(${n} ${t})
     target_link_libraries(${n} PRIVATE ${RAD_TEST_CORE})
