@@ -63,7 +63,9 @@ If it will not start: check `cat /sys/module/amdgpu/parameters/cwsr_enable` prin
 
 | File | Size | SHA-256 |
 |---|---:|---|
-| `flash-size.rad` | 90593767424 bytes | `6b0887a7b25a5c93999669c3ae8d3c7cceecd1754036343ec8f2913826620cb3` |
+| `flash-size.rad` | 90593767424 bytes | `27fadd11f5fd77b8cb19ed307f4f661f8ec439c2630c215cdfaaacb5513eabd8` |
+
+**Revision 2 (2026-11-18).** The Q2_0 down-projection experts on layers 8 and 10 (1024 tensors, about 0.45 GB of the file) were re-quantised from the bf16 weights with a least-squares scale instead of llama.cpp's reference rule (scale = the block's largest value), which had rounded 80% of their values to zero. Their relative error against bf16 fell from about 0.72 to 0.38 (Unsloth's own blocks measure 0.365). Same format, same file size, same kernels, so speed is unchanged; on four temperature-0 checks (arithmetic, a fact, code, a needle in a 54,000-character prompt) the answers were identical to revision 1. Revision 1 (SHA-256 `6b0887a7b25a5c93999669c3ae8d3c7cceecd1754036343ec8f2913826620cb3`, repository commit `678d52c`) has the old blocks on those two layers. Everything else in the file is byte-identical to revision 1.
 
 ## How it was made
 
@@ -96,7 +98,7 @@ The engine is the unofficial fork **https://github.com/jsaigou/radiance-strix** 
 
 ## Provenance
 
-- Container built 2026-11-16 with `rad-convert` and `tools/ud_map` (`--policy size`) from the fork. It mixes native and rotated expert layers, which needs the plugin fix in `strix-halo-r1` or later; it was verified to load and answer correctly on `strix-halo-r2` (2026-11-17).
+- Container built 2026-11-16 with `rad-convert` and `tools/ud_map` (`--policy size`) from the fork; revision 2 (2026-11-18) rewrote the 1024 Q2_0 expert tensors in place with the fork's least-squares Q2_0 encoder (commit `9580df8`). It mixes native and rotated expert layers, which needs the plugin fix in `strix-halo-r1` or later; it was verified to load and answer correctly on `strix-halo-r2` (2026-11-17).
 - Base model revision: `812d96e10a0dd82b69d749e68693698cf6c36daa`.
 - Format map and importance matrix: Unsloth, downloaded 2026-11-05.
 
