@@ -26,10 +26,11 @@ constexpr int64_t kTextRows = 1024;
 
 struct Model {
     rad_buf audio_in = 0, audio_out = 0, text_out = 0, status = 0;
-    rad_buf q = 0, attn = 0;
+    rad_buf q = 0, attn = 0, text_tmp = 0;
     rad_weight text0 = 0, text1 = 0, one = 0;
     rad_kvgroup kv = 0;
-    rad_op op_fill_q = 0, op_attn = 0, op_echo = 0, op_status = 0, op_text0 = 0, op_text1 = 0;
+    rad_op op_fill_q = 0, op_attn = 0, op_echo = 0, op_status = 0, op_text0 = 0, op_text1 = 0,
+           op_cast = 0;
 };
 
 static Model g_model[MAX_RANKS];
@@ -55,7 +56,9 @@ static int declare(RadBuilder* b, const RadModelMeta*, const RadBuildCtx* ctx) {
     m.status    = decl_b(b, "duplex.status",    RAD_I32, { kMaxLanes }, RAD_BUF_PERSIST);
     m.q         = decl_b(b, "duplex.q",         RAD_F32, { kMaxPrompt, 1 }, RAD_BUF_PERSIST);
     m.attn      = decl_b(b, "duplex.attn",      RAD_F32, { kMaxPrompt, 1 }, RAD_BUF_PERSIST);
-    if (!m.audio_in || !m.audio_out || !m.text_out || !m.status || !m.q || !m.attn)
+    m.text_tmp  = decl_b(b, "duplex.text_tmp",  RAD_F32, { 1, 1 }, RAD_BUF_PERSIST);
+    if (!m.audio_in || !m.audio_out || !m.text_out || !m.status || !m.q || !m.attn ||
+        !m.text_tmp)
         return RAD_E_INVAL;
 
     /* The one full-attention group the driver requires, and the user's prompt pass's consumer. */
@@ -92,9 +95,9 @@ static int declare(RadBuilder* b, const RadModelMeta*, const RadBuildCtx* ctx) {
 
     /* The twitch: the per-frame tables are in the checkpoint; `one` makes mul_weight an exact
      * copy (x * 1, including -0). */
-    m.text0 = decl_w(b, "duplex.text0", RAD_I32, { kTextRows, 1 }, RAD_ACCESS_PER_TOKEN,
+    m.text0 = decl_w(b, "duplex.text0", RAD_F32, { kTextRows, 1 }, RAD_ACCESS_PER_TOKEN,
                      RAD_SHARD_NONE, grp_model());
-    m.text1 = decl_w(b, "duplex.text1", RAD_I32, { kTextRows, 1 }, RAD_ACCESS_PER_TOKEN,
+    m.text1 = decl_w(b, "duplex.text1", RAD_F32, { kTextRows, 1 }, RAD_ACCESS_PER_TOKEN,
                      RAD_SHARD_NONE, grp_model());
     m.one   = decl_w(b, "duplex.one",   RAD_F32, { 1 }, RAD_ACCESS_PER_TOKEN,
                      RAD_SHARD_NONE, grp_model());
@@ -106,12 +109,20 @@ static int declare(RadBuilder* b, const RadModelMeta*, const RadBuildCtx* ctx) {
     };
     m.op_echo = rad_decl_op(b, "mul_weight", echo_p, (int)(sizeof(echo_p) / sizeof(echo_p[0])),
                             &m.one, 1);
-    const RadParam text_p[] = { RAD_INT("M", 1), RAD_INT("n", 1), RAD_STR("dtype", "i32") };
-    m.op_text0 = rad_decl_op(b, "gather_rows2", text_p,
+    const RadParam text_p[] = {
+        RAD_RANGE("M", 1, 1), RAD_INT("n_embd", 1), RAD_INT("n_vocab", (int)kTextRows),
+        RAD_STR("dtype", "f32"), RAD_INT("vocab_offset", 0), RAD_F64("mult", 1.0),
+    };
+    m.op_text0 = rad_decl_op(b, "embed_lookup", text_p,
                              (int)(sizeof(text_p) / sizeof(text_p[0])), &m.text0, 1);
-    m.op_text1 = rad_decl_op(b, "gather_rows2", text_p,
+    m.op_text1 = rad_decl_op(b, "embed_lookup", text_p,
                              (int)(sizeof(text_p) / sizeof(text_p[0])), &m.text1, 1);
-    if (!m.op_fill_q || !m.op_status || !m.op_echo || !m.op_text0 || !m.op_text1)
+    const RadParam cast_p[] = {
+        RAD_RANGE("M", 1, 1), RAD_INT("n", 1), RAD_STR("from", "f32"), RAD_STR("to", "i32"),
+    };
+    m.op_cast = rad_decl_op(b, "cast", cast_p, (int)(sizeof(cast_p) / sizeof(cast_p[0])),
+                            nullptr, 0);
+    if (!m.op_fill_q || !m.op_status || !m.op_echo || !m.op_text0 || !m.op_text1 || !m.op_cast)
         return RAD_E_NOKERNEL;
 
     RadDuplexDecl d{};
@@ -169,9 +180,9 @@ static void step(RadCtx* c, const RadBatch* batch) {
         const int32_t lane = d->lane_h[i];
         const rad_op op = lane == 1 ? m.op_text1 : m.op_text0;
         const rad_weight w = lane == 1 ? m.text1 : m.text0;
-        RAD_ISSUE_N(c, op, 1, RAD_W(w), RAD_W(w),
-                    RAD_P_T2(d->frame + i, RAD_I32, 1, 1),
-                    RAD_B_N(m.text_out, lane, 1));
+        RAD_ISSUE_N(c, op, 1, RAD_P_T2(d->frame + i, RAD_I32, 1, 1), RAD_W(w),
+                    RAD_B(m.text_tmp));
+        RAD_ISSUE_N(c, m.op_cast, 1, RAD_B(m.text_tmp), RAD_B_N(m.text_out, lane, 1));
     }
 }
 

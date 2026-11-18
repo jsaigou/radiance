@@ -30,13 +30,13 @@ using json = nlohmann::ordered_json;
 
 namespace {
 
-/* The two i32 text tables of the test plugin, and the scalar that makes its echo a multiply by
+/* The two f32 text tables of the test plugin, and the scalar that makes its echo a multiply by
  * one (exact, including -0). */
-tiny::Tensor i32_table(const char* name, int32_t base, int64_t rows) {
-    tiny::Tensor t{ name, "I32", { rows, 1 }, {} };
+tiny::Tensor f32_table(const char* name, int32_t base, int64_t rows) {
+    tiny::Tensor t{ name, "F32", { rows, 1 }, {} };
     t.bytes.resize((size_t)rows * 4);
     for (int64_t i = 0; i < rows; ++i) {
-        const int32_t v = base + (int32_t)i;
+        const float v = (float)(base + (int32_t)i);
         std::memcpy(t.bytes.data() + (size_t)i * 4, &v, 4);
     }
     return t;
@@ -62,8 +62,8 @@ bool write_checkpoint(const std::string& dir) {
     c["rms_norm_eps"] = 1e-5;
     c["tie_word_embeddings"] = false;
     std::vector<tiny::Tensor> ts;
-    ts.push_back(i32_table("duplex.text0", 0, 1024));
-    ts.push_back(i32_table("duplex.text1", 1000, 1024));
+    ts.push_back(f32_table("duplex.text0", 0, 1024));
+    ts.push_back(f32_table("duplex.text1", 1000, 1024));
     ts.push_back(one);
     return tiny::write_checkpoint(dir, c, ts);
 }
