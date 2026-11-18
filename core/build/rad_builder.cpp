@@ -2188,6 +2188,32 @@ int Builder::declare_duplex_tenant(const RadDuplexDecl* d) {
         !buf_ok(d->status, RAD_I32, d->max_lanes, "status") ||
         (d->text && !buf_ok(d->text_out, RAD_I32, d->max_lanes, "text_out")))
         return RAD_E_INVAL;
+    if (d->host_sampling != 0 && d->host_sampling != 1) {
+        err(RAD_E_INVAL, "declare_duplex_tenant '%s': host_sampling is %d, not 0 or 1", nm,
+            (int)d->host_sampling);
+        return RAD_E_INVAL;
+    }
+    if (d->host_sampling) {
+        if (!d->text || d->n_vocab <= 0 ||
+            !buf_ok(d->logits_out, RAD_F32, d->max_lanes * d->n_vocab, "logits_out") ||
+            !buf_ok(d->pad_eop_out, RAD_F32, d->max_lanes * 2, "pad_eop_out") ||
+            !buf_ok(d->text_in, RAD_I32, d->max_lanes, "text_in")) {
+            err(RAD_E_INVAL, "declare_duplex_tenant '%s': host_sampling needs text, n_vocab > 0 "
+                             "and the logits_out, pad_eop_out and text_in buffers", nm);
+            return RAD_E_INVAL;
+        }
+        auto id_ok = [&](int32_t id, const char* what) {
+            if (id < -1 || id >= d->n_vocab) {
+                err(RAD_E_INVAL, "declare_duplex_tenant '%s': %s %d is not -1 or in [0, %lld)",
+                    nm, what, (int)id, (long long)d->n_vocab);
+                return false;
+            }
+            return true;
+        };
+        if (!id_ok(d->pad_id, "pad_id") || !id_ok(d->eop_id, "eop_id") ||
+            !id_ok(d->eos_id, "eos_id"))
+            return RAD_E_INVAL;
+    }
     prog_.dup_str.name = nm;
     prog_.dup_str.tmpl = d->tmpl;
     prog_.duplex = *d;

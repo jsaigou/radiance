@@ -103,6 +103,38 @@ struct DuplexRequest {
     uint64_t             seed = 0;
 };
 
+/* One pass's view of the host seam below. Every pointer is host memory valid for the call. */
+struct DuplexHostPass {
+    int32_t        kind = 0;          /* RAD_GEN_PASS_DUPLEX_PROMPT or _STEP */
+    int64_t        n_lane = 0;
+    const int32_t* lane = nullptr;    /* [n_lane] */
+    const int32_t* frame = nullptr;   /* [n_lane]; null on PROMPT */
+    int64_t        n_tok = 0;         /* PROMPT rows */
+    int64_t        latent_dim = 0;
+    int64_t        n_vocab = 0;
+    int32_t        pad_id = -1, eop_id = -1, eos_id = -1;
+    const float*   logits = nullptr;  /* tokens(): [n_lane, n_vocab] */
+    const float*   pad_eop = nullptr; /* tokens(): [n_lane, 2] */
+};
+
+/* The narrow host seam for host-side text sampling and host noise (ABI 39). The driver calls
+ * noise() before a pass and tokens() after its readbacks land. Production supplies a sampler;
+ * a teacher-forced test supplies a recorded schedule. The driver owns the buffers it passes; a
+ * source must fill exactly the documented extents and must not retain the pointers. */
+class DuplexHostSource {
+public:
+    virtual ~DuplexHostSource() = default;
+
+    /* Before a pass. codec_noise is [n_tok, latent_dim] on PROMPT and [n_lane, latent_dim] on
+     * STEP; head_noise is [n_lane, latent_dim] on both. Both are host f32. */
+    virtual int noise(const DuplexHostPass& pass, float* codec_noise, float* head_noise,
+                      std::string* why) = 0;
+
+    /* After the pass's readbacks. One token per lane, in pass.lane order; a negative entry
+     * leaves the reply's token to the plugin's text_out and does not update text_in. */
+    virtual int tokens(const DuplexHostPass& pass, int32_t* out, std::string* why) = 0;
+};
+
 class DuplexDriver final : public IPassDriver {
 public:
     struct RankIO {
@@ -128,6 +160,10 @@ public:
     static int64_t device_bytes(const Program& prog, int64_t max_ctx);
     /* State slots a state_index row holds at most, as the audio driver: a lane never speculates. */
     static constexpr int64_t kMaxStateWidth = 8;
+
+    /* Host-side sampling/noise (ABI 39). Null keeps the pre-39 behaviour: no token feedback and
+     * zero noise. The source is not owned; set it before opening lanes. */
+    void set_host_source(DuplexHostSource* s) { host_source_ = s; }
 
     /* ---------------------------------------------------------- server threads */
     /* A lane's prompt, refused synchronously with `why` when it can never run: no lane free, no
@@ -198,7 +234,8 @@ private:
     };
     enum { R_TOK, R_POS, R_CU, R_SLOT, R_BT, R_USED, R_LANE, R_LROW, R_FRAME, R_SEED,
            R_FLAGS, R_CTX, R_ACC, R_SBT, R_SIDX, R_RAUD, R_RCU, R_RFRM,
-           R_AIN, R_AOUT, R_TOUT, R_STAT, R_N };
+           R_AIN, R_AOUT, R_TOUT, R_STAT,
+           R_TIN, R_CN, R_HN, R_LOG, R_PE, R_N };
 
     template <class T> T* hptr(int r) const { return reinterpret_cast<T*>(host_ + reg_[r].off); }
     template <class T> T* dptr(int rank, int r) const {
@@ -211,6 +248,7 @@ private:
     void stage_state(const std::vector<uint64_t>& seqs, const std::vector<int32_t>& ctx);
     int  build_prompt(Job& j, int step);
     int  build_step(const std::vector<Job*>& js, int step);
+    void make_host_pass(int kind, int64_t n_lane, int64_t n_tok, DuplexHostPass* out) const;
 
     Job* job_by_lane_locked(int32_t lane);
     Job* job_locked(uint64_t id);
@@ -230,6 +268,8 @@ private:
     std::vector<StateGroup> state_groups_;
     std::vector<RankIO>     ranks_;
     std::vector<void*>      audio_in_ptr_;
+    std::vector<void*>      text_in_ptr_;
+    DuplexHostSource*       host_source_ = nullptr;
     IKVManager*             kv_ = nullptr;
 
     char*               host_ = nullptr;

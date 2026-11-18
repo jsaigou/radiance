@@ -18,9 +18,10 @@ struct IPassDriver {
     /* A device buffer the staged pass leaves for the host: `bytes` from the start of `buf` on
      * rank 0, copied to `host` behind the pass. Every rank holds the same values. */
     struct Readback {
-        rad_buf buf   = RAD_NULL_HANDLE;
-        int64_t bytes = 0;
-        void*   host  = nullptr;
+        rad_buf buf    = RAD_NULL_HANDLE;
+        int64_t bytes  = 0;
+        void*   host   = nullptr;
+        int64_t offset = 0;   /* bytes into `buf` (a per-lane row, for example) */
     };
 
     virtual ~IPassDriver() = default;

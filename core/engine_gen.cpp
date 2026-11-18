@@ -85,7 +85,8 @@ int Engine::gen_loop() {
                         ranks_[0]->program.buffers[r.buf].name.c_str());
                 return stop(RAD_E_STATE);
             }
-            st = rad_memcpy_async(r.host, src, r.bytes, ranks_[0]->ctx.stream());
+            st = rad_memcpy_async(r.host, (const char*)src + r.offset, r.bytes,
+                                  ranks_[0]->ctx.stream());
         }
         for (auto& rk : ranks_)
             if (st >= 0) st = rad_stream_sync(rk->ctx.stream());

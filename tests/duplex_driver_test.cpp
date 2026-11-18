@@ -36,11 +36,14 @@ struct Fixture {
     RadDuplexDecl d{};
     std::vector<float>   audio_in, audio_out;
     std::vector<int32_t> text_out, status;
+    std::vector<float>   logits_out, pad_eop_out;
+    std::vector<int32_t> text_in;
     int64_t max_ctx = 0;
     int64_t max_lanes = 0;
     int step = 0;
 
-    explicit Fixture(int64_t ctx = 64, int64_t lanes = 2, int64_t max_prompt = 16)
+    explicit Fixture(int64_t ctx = 64, int64_t lanes = 2, int64_t max_prompt = 16,
+                     bool host_sampling = false)
         : max_ctx(ctx), max_lanes(lanes) {
         d.name = "test";
         d.tmpl = "<card>{card}</card>{references}";
@@ -64,7 +67,7 @@ struct Fixture {
         audio_out.assign((size_t)(lanes * kSamples), -1.0f);
         text_out.assign((size_t)lanes, -2);
         status.assign((size_t)lanes, -2);
-        prog.buffers.resize(5);
+        prog.buffers.resize(host_sampling ? 8 : 5);
         buffer(1, "audio_in", RAD_F32, lanes, kSamples, audio_in.data());
         buffer(2, "audio_out", RAD_F32, lanes, kSamples, audio_out.data());
         buffer(3, "text_out", RAD_I32, lanes, 1, text_out.data());
@@ -73,6 +76,22 @@ struct Fixture {
         d.audio_out = 2;
         d.text_out = 3;
         d.status = 4;
+        if (host_sampling) {
+            d.n_vocab = 8;
+            d.host_sampling = 1;
+            d.pad_id = 0;
+            d.eop_id = 1;
+            d.eos_id = 2;
+            logits_out.assign((size_t)(lanes * d.n_vocab), 0.0f);
+            pad_eop_out.assign((size_t)(lanes * 2), 0.0f);
+            text_in.assign((size_t)lanes, -1);
+            buffer(5, "logits_out", RAD_F32, lanes, d.n_vocab, logits_out.data());
+            buffer(6, "pad_eop_out", RAD_F32, lanes, 2, pad_eop_out.data());
+            buffer(7, "text_in", RAD_I32, lanes, 1, text_in.data());
+            d.logits_out = 5;
+            d.pad_eop_out = 6;
+            d.text_in = 7;
+        }
         prog.duplex = d;
         prog.dup_str.name = "test";
         prog.ctx.max_tok = 64;
@@ -134,6 +153,28 @@ struct Fixture {
         return drv.step(lane, samples.data(), (int64_t)samples.size(), seq, t, why);
     }
 
+    /* The fake plugin's logits: the driver's readbacks are the test's host landing area, so a
+     * seam test writes the row there just as a plugin writes the declared buffer on a device. */
+    void answer_logits(const RadBatch* b, float base) {
+        const RadDuplexBatch* D = b ? b->dup_b : nullptr;
+        if (!D) return;
+        std::vector<float*> logs, pads;
+        for (const gen::IPassDriver::Readback& rb : drv.readbacks()) {
+            if (rb.buf == d.logits_out) logs.push_back(static_cast<float*>(rb.host));
+            else if (rb.buf == d.pad_eop_out) pads.push_back(static_cast<float*>(rb.host));
+        }
+        for (int64_t i = 0; i < D->n_lane; ++i) {
+            const int32_t lane = D->lane_h[(size_t)i];
+            if ((size_t)i < logs.size())
+                for (int64_t v = 0; v < d.n_vocab; ++v)
+                    logs[(size_t)i][v] = base + (float)(lane * 100 + v);
+            if ((size_t)i < pads.size()) {
+                pads[(size_t)i][0] = base + (float)lane * 100 + 0.25f;
+                pads[(size_t)i][1] = base + (float)lane * 100 + 0.5f;
+            }
+        }
+    }
+
     /* The fake plugin's STEP: read what the driver uploaded into the declared audio_in buffer,
      * write the declared outputs. */
     void answer_step(const RadBatch* b, int32_t status = 0) {
@@ -166,7 +207,90 @@ struct Fixture {
     }
 };
 
+/* A recorded schedule, the shape a teacher-forced test supplies through the ABI 39 seam. */
+struct TeacherSource final : gen::DuplexHostSource {
+    std::vector<float>   codec;
+    std::vector<float>   head;
+    std::vector<int32_t> tokens;
+    int64_t noise_calls = 0;
+    size_t  token_at = 0;
+
+    int noise(const gen::DuplexHostPass& p, float* codec_noise, float* head_noise,
+              std::string*) override {
+        ++noise_calls;
+        const int64_t rows = p.kind == RAD_GEN_PASS_DUPLEX_PROMPT ? p.n_tok : p.n_lane;
+        for (int64_t r = 0; r < rows * p.latent_dim; ++r)
+            codec_noise[r] = r < (int64_t)codec.size() ? codec[(size_t)r] : 0.0f;
+        for (int64_t r = 0; r < p.n_lane * p.latent_dim; ++r)
+            head_noise[r] = r < (int64_t)head.size() ? head[(size_t)r] : 0.0f;
+        return RAD_OK;
+    }
+    int tokens(const gen::DuplexHostPass& p, int32_t* out, std::string*) override {
+        for (int64_t i = 0; i < p.n_lane; ++i)
+            out[i] = token_at < tokens.size() ? tokens[token_at++] : -1;
+        return RAD_OK;
+    }
+};
+
 }  /* namespace */
+
+/* ABI 39: the driver stages host noise, reads the row's logits back to the source, and feeds the
+ * sampled token into the declaration's text_in for the next STEP. */
+TEST(host_sampling_seam_stages_noise_and_feeds_the_token_back) {
+    Fixture f(64, 1, 16, /*host_sampling=*/true);
+    REQUIRE_EQ(f.init(), RAD_OK);
+    TeacherSource src;
+    src.codec.assign(64 * 2, 0.5f);
+    src.head.assign(64 * 2, 0.25f);
+    src.tokens = { 5, 6, 7 };
+    f.drv.set_host_source(&src);
+
+    std::shared_ptr<gen::DuplexTicket> open;
+    std::string why;
+    REQUIRE_EQ(f.open({ 1, 2 }, &open, &why), RAD_OK);
+    const RadBatch* b = f.drv.next(f.step++);
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->gen, (int32_t)RAD_GEN_PASS_DUPLEX_PROMPT);
+    REQUIRE(b->dup_b != nullptr);
+    REQUIRE(b->dup_b->codec_noise != nullptr);
+    CHECK_EQ(b->dup_b->codec_noise[0], 0.5f);
+    f.answer_logits(b, 1.0f);
+    CHECK_OK(f.drv.done());
+    bool to = false;
+    REQUIRE(open->wait(0, &to));
+    CHECK_EQ(open->status(), (int)RAD_OK);
+    CHECK_EQ(src.noise_calls, (int64_t)1);
+    CHECK_EQ(src.token_at, (size_t)1);
+
+    const int32_t lane = open->lane();
+    std::shared_ptr<gen::DuplexTicket> t;
+    REQUIRE_EQ(f.queue_step(lane, 10, 1.0f, &t, &why), RAD_OK);
+    b = f.drv.next(f.step++);
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->gen, (int32_t)RAD_GEN_PASS_DUPLEX_STEP);
+    CHECK_EQ(f.text_in[(size_t)lane], 5);          /* token 0, uploaded for this STEP */
+    REQUIRE(b->dup_b != nullptr);
+    CHECK_EQ(b->dup_b->head_noise[0], 0.25f);
+    f.answer_logits(b, 2.0f);
+    f.answer_step(b);
+    CHECK_OK(f.drv.done());
+    gen::DuplexReply r;
+    REQUIRE(t->next(&r, 0, &to));
+    CHECK_EQ(r.token, 6);                          /* token 1 from the host source */
+    CHECK_EQ(src.noise_calls, (int64_t)2);
+
+    /* The next STEP sees token 1 in the declaration's text_in after upload. */
+    std::shared_ptr<gen::DuplexTicket> t2;
+    REQUIRE_EQ(f.queue_step(lane, 11, 2.0f, &t2, &why), RAD_OK);
+    b = f.drv.next(f.step++);
+    REQUIRE(b != nullptr);
+    CHECK_EQ(f.text_in[(size_t)lane], 6);
+    f.answer_logits(b, 3.0f);
+    f.answer_step(b);
+    CHECK_OK(f.drv.done());
+    REQUIRE(t2->next(&r, 0, &to));
+    CHECK_EQ(r.token, 7);
+}
 
 /* A card-only prompt: the card rows, their positions, the lane's last row, no references. */
 TEST(open_stages_a_card_only_prompt) {

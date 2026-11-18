@@ -89,6 +89,7 @@ struct Sizes {
     int64_t T = 0, S = 0, L = 0, NB = 0, SPF = 1;
     int64_t NG = 0;
     int64_t RS = 0, RN = 0;
+    int64_t NV = 0, LD = 0;   /* ABI 39: logits width and latent width */
 };
 
 /* The one paged full-attention group, and how many stateful groups sit beside it. */
@@ -115,12 +116,15 @@ Sizes sizes_of(const Program& prog, int64_t block_size, int64_t max_ctx) {
     full_group(prog, &z.NG);
     z.RS = d.max_ref_frames > 0 ? d.max_ref_frames * d.ref_hop : 0;
     z.RN = d.max_ref_frames;
+    z.NV = d.host_sampling ? std::max<int64_t>(d.n_vocab, 0) : 0;
+    z.LD = d.host_sampling ? std::max<int64_t>(d.latent_dim, 0) : 0;
     return z;
 }
 
 int64_t carve(const Sizes& z, int64_t (*bytes)[2], int n) {
     const int64_t I = 4;
     const int64_t S = z.S, T = z.T, L = z.L;
+    const int64_t NR = std::max<int64_t>(T, L);
     const int64_t want[] = {
         T * I,                                      /* R_TOK */
         T * I,                                      /* R_POS */
@@ -144,6 +148,11 @@ int64_t carve(const Sizes& z, int64_t (*bytes)[2], int n) {
         L * z.SPF * 4,                              /* R_AOUT */
         L * I,                                      /* R_TOUT */
         L * I,                                      /* R_STAT */
+        L * I,                                      /* R_TIN */
+        NR * z.LD * 4,                              /* R_CN */
+        L * z.LD * 4,                               /* R_HN */
+        L * z.NV * 4,                               /* R_LOG */
+        L * 2 * 4,                                  /* R_PE */
     };
     int64_t off = 0;
     for (int r = 0; r < n; ++r) {
@@ -264,8 +273,24 @@ int DuplexDriver::init(const Program& prog, IKVManager* kv, const std::vector<Ra
         !buf_ok(decl_.status, RAD_I32, max_lanes_, "status") ||
         (decl_.text && !buf_ok(decl_.text_out, RAD_I32, max_lanes_, "text_out")))
         return RAD_E_INVAL;
+    if (decl_.host_sampling != 0 && decl_.host_sampling != 1) {
+        RAD_ERR("duplex tenant '%s': host_sampling is %d, not 0 or 1", name_.c_str(),
+                (int)decl_.host_sampling);
+        return RAD_E_INVAL;
+    }
+    if (decl_.host_sampling) {
+        if (decl_.n_vocab <= 0 || decl_.latent_dim <= 0 ||
+            !buf_ok(decl_.logits_out, RAD_F32, max_lanes_ * decl_.n_vocab, "logits_out") ||
+            !buf_ok(decl_.pad_eop_out, RAD_F32, max_lanes_ * 2, "pad_eop_out") ||
+            !buf_ok(decl_.text_in, RAD_I32, max_lanes_, "text_in")) {
+            RAD_ERR("duplex tenant '%s': host_sampling needs n_vocab > 0, latent_dim > 0 and the "
+                    "logits_out, pad_eop_out and text_in buffers", name_.c_str());
+            return RAD_E_INVAL;
+        }
+    }
 
     audio_in_ptr_.clear();
+    text_in_ptr_.clear();
     for (size_t r = 0; r < ranks_.size(); ++r) {
         const Program* P = ranks_[r].program ? ranks_[r].program : &prog;
         if (!P || (size_t)decl_.audio_in >= P->buffers.size() ||
@@ -275,6 +300,14 @@ int DuplexDriver::init(const Program& prog, IKVManager* kv, const std::vector<Ra
             return RAD_E_STATE;
         }
         audio_in_ptr_.push_back(P->buffers[decl_.audio_in].ptr);
+        if (decl_.host_sampling) {
+            if ((size_t)decl_.text_in >= P->buffers.size() || !P->buffers[decl_.text_in].ptr) {
+                RAD_ERR("duplex tenant '%s': rank %zu's text_in buffer is not bound; pass its "
+                        "Program in RankIO", name_.c_str(), r);
+                return RAD_E_STATE;
+            }
+            text_in_ptr_.push_back(P->buffers[decl_.text_in].ptr);
+        }
     }
 
     const Sizes z = sizes_of(prog, block_size_, max_ctx_);
@@ -322,6 +355,7 @@ void DuplexDriver::fini() {
     if (host_) rad_dev_free(host_, RAD_MEM_HOST_PINNED);
     host_ = nullptr;
     audio_in_ptr_.clear();
+    text_in_ptr_.clear();
     rb_.clear();
 }
 
@@ -417,20 +451,24 @@ int DuplexDriver::open(std::unique_ptr<DuplexRequest> r, std::shared_ptr<DuplexT
     const int64_t n_ref = r->ref_cu.empty() ? 0 : (int64_t)r->ref_cu.size() - 1;
     if (has_refs) {
         const int64_t hop = decl_.ref_hop;
-        bool ok = decl_.max_ref_frames > 0 && n_ref >= 1 && n_ref <= decl_.max_ref_frames &&
+        bool ok = decl_.max_ref_frames > 0 && n_ref >= 1 &&
                   r->ref_cu[0] == 0 && r->ref_cu.back() == (int64_t)r->ref_audio.size() &&
                   (int64_t)r->ref_audio.size() <= decl_.max_ref_frames * hop &&
                   (int64_t)r->ref_frame.size() == T;
         for (int64_t i = 0; ok && i < n_ref; ++i)
             ok = r->ref_cu[(size_t)i + 1] > r->ref_cu[(size_t)i] &&
-                 r->ref_cu[(size_t)i + 1] % hop == 0;
-        const int64_t frames = ok ? r->ref_cu.back() / hop : 0;
+                 r->ref_cu[(size_t)i + 1] <= (int64_t)r->ref_audio.size();
+        /* The final frame may be partial: a 44,000-sample reference is 14 frames of which the
+         * last is 2,400 samples, not 14 whole frames with 800 zero-padded samples. */
+        const int64_t frames =
+            ok ? ((int64_t)r->ref_audio.size() + hop - 1) / hop : 0;
+        if (ok && (frames < 1 || frames > decl_.max_ref_frames)) ok = false;
         for (int64_t i = 0; ok && i < T; ++i)
             ok = r->ref_frame[(size_t)i] >= -1 && r->ref_frame[(size_t)i] < frames;
         if (!ok)
             return no(RAD_E_INVAL, decl_.max_ref_frames > 0
                        ? "the references do not fit this tenant: at most " +
-                             std::to_string(decl_.max_ref_frames) + " clips of whole frames"
+                             std::to_string(decl_.max_ref_frames) + " frames"
                        : std::string("this tenant takes no reference audio"));
     }
     if (!kv_->can_ever_fit(max_ctx_))
@@ -641,7 +679,9 @@ int64_t DuplexDriver::running() const {
 int DuplexDriver::upload() {
     for (size_t r = 0; r < ranks_.size(); ++r) {
         for (int g = 0; g < R_N; ++g) {
-            if (g == R_AIN || g == R_AOUT || g == R_TOUT || g == R_STAT) continue;
+            if (g == R_AIN || g == R_AOUT || g == R_TOUT || g == R_STAT || g == R_TIN ||
+                g == R_LOG || g == R_PE)
+                continue;
             if (reg_[g].used <= 0) continue;
             RAD_TRY(rad_memcpy_async((char*)dev_[r] + reg_[g].off, host_ + reg_[g].off,
                                      reg_[g].used, ranks_[r].stream));
@@ -649,6 +689,9 @@ int DuplexDriver::upload() {
         if (reg_[R_AIN].used > 0)
             RAD_TRY(rad_memcpy_async(audio_in_ptr_[r], host_ + reg_[R_AIN].off,
                                      reg_[R_AIN].used, ranks_[r].stream));
+        if (decl_.host_sampling && reg_[R_TIN].used > 0 && r < text_in_ptr_.size())
+            RAD_TRY(rad_memcpy_async(text_in_ptr_[r], host_ + reg_[R_TIN].off,
+                                     reg_[R_TIN].used, ranks_[r].stream));
     }
     return RAD_OK;
 }
@@ -705,6 +748,24 @@ void DuplexDriver::base_batches(int64_t n_tok, int64_t n_seq, int32_t max_q, int
     }
 }
 
+void DuplexDriver::make_host_pass(int kind, int64_t n_lane, int64_t n_tok,
+                                  DuplexHostPass* out) const {
+    if (!out) return;
+    *out = DuplexHostPass{};
+    out->kind = kind;
+    out->n_lane = n_lane;
+    out->lane = h_lane_.data();
+    out->frame = kind == RAD_GEN_PASS_DUPLEX_STEP ? h_frame_.data() : nullptr;
+    out->n_tok = n_tok;
+    out->latent_dim = decl_.latent_dim;
+    out->n_vocab = decl_.n_vocab;
+    out->pad_id = decl_.pad_id;
+    out->eop_id = decl_.eop_id;
+    out->eos_id = decl_.eos_id;
+    out->logits = hptr<float>(R_LOG);
+    out->pad_eop = hptr<float>(R_PE);
+}
+
 void DuplexDriver::stage_state(const std::vector<uint64_t>& seqs,
                                const std::vector<int32_t>& ctx) {
     const int64_t n = (int64_t)seqs.size();
@@ -756,6 +817,7 @@ int DuplexDriver::build_prompt(Job& j, int step) {
     for (int64_t k = 0; k < pitch; ++k) btab[k] = k < (int64_t)bt.size() ? bt[(size_t)k] : -1;
     used[0] = (int32_t)T;
     h_lane_.assign(1, j.lane);
+    h_frame_.assign(1, 0);
     h_lrow_.assign(1, T - 1);
     hptr<int32_t>(R_LANE)[0] = j.lane;
     hptr<int32_t>(R_LROW)[0] = (int32_t)(T - 1);
@@ -779,6 +841,25 @@ int DuplexDriver::build_prompt(Job& j, int step) {
         h_ref_frame_ = q.ref_frame;
     }
 
+    if (decl_.host_sampling) {
+        const int64_t cn = T * std::max<int64_t>(decl_.latent_dim, 0);
+        const int64_t hn = std::max<int64_t>(decl_.latent_dim, 0);
+        std::memset(hptr<float>(R_CN), 0, (size_t)(cn * 4));
+        std::memset(hptr<float>(R_HN), 0, (size_t)(hn * 4));
+        reg_[R_CN].used = cn * 4;
+        reg_[R_HN].used = hn * 4;
+        if (host_source_) {
+            DuplexHostPass hp;
+            make_host_pass(RAD_GEN_PASS_DUPLEX_PROMPT, 1, T, &hp);
+            std::string why;
+            if (host_source_->noise(hp, hptr<float>(R_CN), hptr<float>(R_HN), &why) < 0) {
+                RAD_ERR("duplex tenant '%s': the host noise source failed: %s", name_.c_str(),
+                        why.c_str());
+                return RAD_E_STATE;
+            }
+        }
+    }
+
     std::vector<uint64_t> seqs{ j.seq };
     std::vector<int32_t> ctx{ 0 };
     stage_state(seqs, ctx);
@@ -791,6 +872,12 @@ int DuplexDriver::build_prompt(Job& j, int step) {
         D.n_tok = T;
         D.lane_h = h_lane_.data();
         D.last_row_h = h_lrow_.data();
+        if (decl_.host_sampling) {
+            D.codec_noise = dptr<float>((int)r, R_CN);
+            D.codec_noise_h = hptr<float>(R_CN);
+            D.head_noise = dptr<float>((int)r, R_HN);
+            D.head_noise_h = hptr<float>(R_HN);
+        }
         if (n_ref > 0) {
             const int ri = (int)r;
             D.n_ref = n_ref;
@@ -801,6 +888,14 @@ int DuplexDriver::build_prompt(Job& j, int step) {
             D.ref_frame = dptr<int32_t>(ri, R_RFRM);
             D.ref_frame_h = h_ref_frame_.data();
         }
+    }
+    if (decl_.host_sampling && j.lane >= 0) {
+        rb_.push_back(Readback{ decl_.logits_out, decl_.n_vocab * 4,
+                                hptr<float>(R_LOG) + (size_t)j.lane * decl_.n_vocab,
+                                (int64_t)j.lane * decl_.n_vocab * 4 });
+        rb_.push_back(Readback{ decl_.pad_eop_out, 2 * 4,
+                                hptr<float>(R_PE) + (size_t)j.lane * 2,
+                                (int64_t)j.lane * 2 * 4 });
     }
     pass_.pitch = pitch;
     return RAD_OK;
@@ -868,6 +963,25 @@ int DuplexDriver::build_step(const std::vector<Job*>& js, int step) {
     reg_[R_LANE].used = reg_[R_FRAME].used = reg_[R_FLAGS].used = L * 4;
     reg_[R_SEED].used = 2 * L * 4;
     reg_[R_AIN].used = max_lanes_ * decl_.samples_per_frame * 4;
+    if (decl_.host_sampling) {
+        const int64_t cn = L * std::max<int64_t>(decl_.latent_dim, 0);
+        const int64_t hn = L * std::max<int64_t>(decl_.latent_dim, 0);
+        std::memset(hptr<float>(R_CN), 0, (size_t)(cn * 4));
+        std::memset(hptr<float>(R_HN), 0, (size_t)(hn * 4));
+        reg_[R_CN].used = cn * 4;
+        reg_[R_HN].used = hn * 4;
+        reg_[R_TIN].used = max_lanes_ * 4;
+        if (host_source_) {
+            DuplexHostPass hp;
+            make_host_pass(RAD_GEN_PASS_DUPLEX_STEP, L, 0, &hp);
+            std::string why;
+            if (host_source_->noise(hp, hptr<float>(R_CN), hptr<float>(R_HN), &why) < 0) {
+                RAD_ERR("duplex tenant '%s': the host noise source failed: %s", name_.c_str(),
+                        why.c_str());
+                return RAD_E_STATE;
+            }
+        }
+    }
     stage_state(seqs, ctx);
     base_batches(L, L, 1, max_ctx, step, true, pitch);
     for (size_t r = 0; r < ranks_.size(); ++r) {
@@ -883,6 +997,12 @@ int DuplexDriver::build_step(const std::vector<Job*>& js, int step) {
         D.lane_h = h_lane_.data();
         D.frame_h = h_frame_.data();
         D.flags_h = h_flags_.data();
+        if (decl_.host_sampling) {
+            D.codec_noise = dptr<float>((int)r, R_CN);
+            D.codec_noise_h = hptr<float>(R_CN);
+            D.head_noise = dptr<float>((int)r, R_HN);
+            D.head_noise_h = hptr<float>(R_HN);
+        }
     }
     rb_.clear();
     rb_.push_back(Readback{ decl_.audio_out, max_lanes_ * decl_.samples_per_frame * 4,
@@ -890,6 +1010,18 @@ int DuplexDriver::build_step(const std::vector<Job*>& js, int step) {
     if (decl_.text)
         rb_.push_back(Readback{ decl_.text_out, max_lanes_ * 4, hptr<void>(R_TOUT) });
     rb_.push_back(Readback{ decl_.status, max_lanes_ * 4, hptr<void>(R_STAT) });
+    if (decl_.host_sampling) {
+        for (int64_t i = 0; i < L; ++i) {
+            const int32_t lane = h_lane_[(size_t)i];
+            if (lane < 0) continue;
+            rb_.push_back(Readback{ decl_.logits_out, decl_.n_vocab * 4,
+                                    hptr<float>(R_LOG) + (size_t)lane * decl_.n_vocab,
+                                    (int64_t)lane * decl_.n_vocab * 4 });
+            rb_.push_back(Readback{ decl_.pad_eop_out, 2 * 4,
+                                    hptr<float>(R_PE) + (size_t)lane * 2,
+                                    (int64_t)lane * 2 * 4 });
+        }
+    }
     pass_.pitch = pitch;
     return RAD_OK;
 }
@@ -964,11 +1096,36 @@ int DuplexDriver::done() {
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (pass_.kind == 0) return RAD_OK;
+        std::vector<int32_t> host_tokens;
+        bool host_tokens_ok = true;
+        if (host_source_ && decl_.host_sampling && !pass_.jobs.empty()) {
+            DuplexHostPass hp;
+            const int64_t n_lane = (int64_t)pass_.jobs.size();
+            make_host_pass(pass_.kind, n_lane, pass_.rows, &hp);
+            host_tokens.assign((size_t)n_lane, -1);
+            std::string why;
+            if (host_source_->tokens(hp, host_tokens.data(), &why) < 0) {
+                host_tokens_ok = false;
+                for (uint64_t id : pass_.jobs) {
+                    Job* j = job_locked(id);
+                    if (!j || j->failed || j->closed) continue;
+                    fail_locked(*j, RAD_E_STATE, why.empty() ? "the host token source failed" : why,
+                                &fin);
+                }
+            } else {
+                for (int64_t i = 0; i < n_lane; ++i) {
+                    const int32_t lane = hp.lane ? hp.lane[i] : -1;
+                    if (lane >= 0 && host_tokens[(size_t)i] >= 0)
+                        hptr<int32_t>(R_TIN)[lane] = host_tokens[(size_t)i];
+                }
+            }
+        }
         if (pass_.kind == RAD_GEN_PASS_DUPLEX_PROMPT) {
-            for (uint64_t id : pass_.jobs) {
-                Job* j = job_locked(id);
+            for (size_t i = 0; i < pass_.jobs.size(); ++i) {
+                Job* j = job_locked(pass_.jobs[i]);
                 if (!j) continue;
                 if (j->failed || j->closed) continue;
+                if (!host_tokens_ok) continue;
                 j->pos = j->T;
                 j->ready = true;
                 if (j->open_ticket) {
@@ -980,9 +1137,10 @@ int DuplexDriver::done() {
             const int32_t* stat = hptr<int32_t>(R_STAT);
             const int32_t* text = hptr<int32_t>(R_TOUT);
             const float* audio = hptr<float>(R_AOUT);
-            for (uint64_t id : pass_.jobs) {
-                Job* j = job_locked(id);
+            for (size_t i = 0; i < pass_.jobs.size(); ++i) {
+                Job* j = job_locked(pass_.jobs[i]);
                 if (!j || j->failed || j->closed) continue;
+                if (!host_tokens_ok) continue;
                 const int32_t st = stat[j->lane];
                 if (st < 0) {
                     fail_locked(*j, st, "the duplex lane failed", &fin);
@@ -998,7 +1156,9 @@ int DuplexDriver::done() {
                     s.r.seq = j->pending_seq;
                     s.r.status = st;
                     s.r.has_audio = st == 0;
-                    s.r.token = decl_.text ? text[j->lane] : -1;
+                    const int32_t host_tok =
+                        i < host_tokens.size() ? host_tokens[i] : -1;
+                    s.r.token = host_tok >= 0 ? host_tok : (decl_.text ? text[j->lane] : -1);
                     if (st == 0) {
                         const size_t off = (size_t)j->lane * (size_t)decl_.samples_per_frame;
                         s.r.audio.assign(audio + off,
