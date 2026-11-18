@@ -320,6 +320,11 @@ TEST(codec_two_lanes_do_not_mix) {
                          wb.c_str());
             REQUIRE(false);
         }
+        /* step() returns the whole 3200-float reply; only the first 64 floats (the latent) are the
+         * block's output, the rest is engine scratch that a lone lane and a shared pass fill
+         * differently (the reference runs held denormals there). Compare what run_step returned. */
+        oa.resize(ref_a[t].size());
+        ob.resize(ref_b[t].size());
         REQUIRE(close_enough("lane A frame " + std::to_string(t + 1), oa, ref_a[t],
                              haru_test::Tol{ 0.0, 0.0 }));
         REQUIRE(close_enough("lane B frame " + std::to_string(t + 1), ob, ref_b[t],

@@ -121,7 +121,7 @@ int declare_conv(RadBuilder* b, const CodecGeometry& g, ConvLayer* L, const char
     L->combined = decl_b(b, nm.f("%s.combined", prefix), dt_of(g), { L->cu_rows, cin });
     L->out = decl_b(b, nm.f("%s.out", prefix), dt_of(g), { out_rows, cout });
     L->state = decl_b(b, nm.f("%s.state", prefix), dt_of(g),
-                      { g.max_lanes, state_rows, cin }, RAD_BUF_PERSIST);
+                      { g.max_lanes * state_rows, cin }, RAD_BUF_PERSIST);
     L->cu = decl_b(b, nm.f("%s.cu", prefix), RAD_I32, { 2 }, RAD_BUF_PERSIST);
     if (!good(L->combined) || !good(L->out) || !good(L->state) || !good(L->cu))
         return RAD_E_INVAL;
@@ -187,7 +187,7 @@ int declare_block(RadBuilder* b, const CodecGeometry& g, BlockLayer* B, const ch
 
     B->combined = decl_b(b, nm.f("%s.combined", prefix), dt_of(g), { B->cu_rows, dim });
     B->dw_out = decl_b(b, nm.f("%s.dw_out", prefix), dt_of(g), { B->cu_rows, dim });
-    B->state = decl_b(b, nm.f("%s.state", prefix), dt_of(g), { g.max_lanes, B->context, dim },
+    B->state = decl_b(b, nm.f("%s.state", prefix), dt_of(g), { g.max_lanes * B->context, dim },
                       RAD_BUF_PERSIST);
     B->cu = decl_b(b, nm.f("%s.cu", prefix), RAD_I32, { 2 }, RAD_BUF_PERSIST);
     B->n1 = decl_b(b, nm.f("%s.n1", prefix), dt_of(g), { max_rows, dim });
