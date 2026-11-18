@@ -305,6 +305,30 @@ TEST(the_card_and_template_reach_the_engine_as_rows) {
     }
 }
 
+/* No card, a null card and an empty object all render as nothing; a literal "{}" must not reach
+ * the model. */
+TEST(an_absent_or_empty_card_renders_nothing) {
+    FakeDuplex gen;
+    Fixture f(Fixture::Tweak{ [&](ServerOptions&, Deps& d) { d.duplex = &gen; } });
+    for (int variant = 0; variant < 3; ++variant) {
+        Session s(f);
+        json j = start_json("plugin");
+        if (variant == 0) j.erase("card");
+        else if (variant == 1) j["card"] = nullptr;
+        else j["card"] = json::object();
+        s.conn.client(j);
+        REQUIRE(!s.conn.wait_for("ready").is_null());
+        std::vector<int32_t> want, want_frame;
+        append_chars("<c></c>", &want, &want_frame);
+        const DuplexGenRequest r = gen.last_open();
+        CHECK(r.tokens == want);
+        CHECK(r.ref_frame == want_frame);
+        s.conn.client({ { "type", "close" } });
+        REQUIRE(s.conn.wait_closed());
+        s.join();
+    }
+}
+
 /* Reference audio is decoded at the declaration's rate, padded to whole frames and laid into the
  * prompt as one placeholder row a frame. */
 TEST(reference_bytes_become_frames_and_rows) {

@@ -146,8 +146,10 @@ struct EchoTenant : DuplexTenant {
 /* The start's card as text: a string as it is, an object's string "text", anything else as its
  * compact JSON. */
 std::string card_text(const DuplexJson& card) {
+    if (card.is_null()) return std::string();
     if (card.is_string()) return card.get<std::string>();
     if (card.is_object()) {
+        if (card.empty()) return std::string();
         const auto it = card.find("text");
         if (it != card.end() && it->is_string()) return it->get<std::string>();
     }
