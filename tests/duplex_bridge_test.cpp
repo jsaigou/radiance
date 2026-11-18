@@ -329,8 +329,9 @@ TEST(an_absent_or_empty_card_renders_nothing) {
     }
 }
 
-/* Reference audio is decoded at the declaration's rate, padded to whole frames and laid into the
- * prompt as one placeholder row a frame. */
+/* Reference audio is decoded at the declaration's rate and keeps its true sample count: a final
+ * partial frame is not zero-padded, because the codec's per-conv partial-hop rule is not an audio
+ * pad. A 5-sample clip at hop 4 is two frames, the last 1 sample, and two placeholder rows. */
 TEST(reference_bytes_become_frames_and_rows) {
     if (!mm::decoder_available()) return;
     FakeDuplex gen;
@@ -345,7 +346,7 @@ TEST(reference_bytes_become_frames_and_rows) {
     s.conn.binary(wav);
     REQUIRE(!s.conn.wait_for("ready").is_null());
     const DuplexGenRequest r = gen.last_open();
-    /* Five samples at a 4-sample hop pad to 8, so two frames and two rows. */
+    /* Five samples at a 4-sample hop are two frames, the last 1 sample. */
     std::vector<int32_t> want, want_frame;
     append_chars("<c>hi</c>", &want, &want_frame);
     for (int32_t k = 0; k < 2; ++k) {
@@ -356,8 +357,8 @@ TEST(reference_bytes_become_frames_and_rows) {
     CHECK(r.ref_frame == want_frame);
     REQUIRE_EQ(r.ref_cu.size(), (size_t)2);
     CHECK_EQ(r.ref_cu[0], 0);
-    CHECK_EQ(r.ref_cu[1], 8);
-    CHECK_EQ(r.ref_audio.size(), (size_t)8);
+    CHECK_EQ(r.ref_cu[1], 5);
+    CHECK_EQ(r.ref_audio.size(), (size_t)5);
 }
 
 /* A step's audio and text token cross the bridge unchanged. */

@@ -351,6 +351,24 @@ TEST(open_stages_reference_rows) {
     CHECK_EQ(D->last_row_h[0], 4);
 }
 
+/* A final reference frame may be partial: 6 samples at hop 4 is two frames, the last 2 samples. */
+TEST(open_accepts_a_partial_final_reference_frame) {
+    Fixture f;
+    REQUIRE_EQ(f.init(), RAD_OK);
+    std::shared_ptr<gen::DuplexTicket> t;
+    std::string why;
+    const std::vector<float> clip = { 1, 2, 3, 4, 5, 6 };
+    REQUIRE_EQ(f.open({ 10, 0, 0 }, &t, &why, clip, { 0, 6 }, { -1, 0, 1 }), RAD_OK);
+    const RadBatch* b = f.run_prompt(t);
+    REQUIRE(b != nullptr);
+    const RadDuplexBatch* D = b->dup_b;
+    REQUIRE(D != nullptr);
+    CHECK_EQ(D->ref_samples, (int64_t)6);
+    CHECK_EQ(D->ref_cu_h[1], 6);
+    CHECK_EQ(D->ref_frame_h[1], 0);
+    CHECK_EQ(D->ref_frame_h[2], 1);
+}
+
 /* One lane's steps: one row each at its next position, one reply per input in order, with the
  * model's frame and token. */
 TEST(a_step_returns_the_lanes_model_frame) {

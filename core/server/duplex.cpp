@@ -245,15 +245,16 @@ struct EngineDuplexTenant final : DuplexTenant {
                 if (why) *why = "the reference audio holds no samples";
                 return RAD_E_INVAL;
             }
-            const int64_t padded = ((int64_t)decoded.size() + hop - 1) / hop * hop;
-            if (padded > max_samples) {
+            if ((int64_t)decoded.size() > max_samples) {
                 if (why) *why = "the reference audio is longer than this tenant takes";
                 return RAD_E_INVAL;
             }
-            decoded.resize((size_t)padded, 0.0f);
+            /* Keep the true sample count: the last frame may be partial (a 44,000-sample
+             * reference is 14 frames, the last 2,400 samples). Zero-padding the audio to a whole
+             * hop is not the reference's per-conv partial-hop rule and changes the last latent. */
             ref_audio = std::move(decoded);
-            ref_cu = { 0, (int32_t)padded };
-            ref_frames = padded / hop;
+            ref_cu = { 0, (int32_t)ref_audio.size() };
+            ref_frames = ((int64_t)ref_audio.size() + hop - 1) / hop;
         }
         if (!tok) {
             if (why) *why = "the server has no tokenizer for this tenant";
