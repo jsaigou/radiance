@@ -92,7 +92,9 @@ bool check_close(const char* what, const std::vector<float>& got,
 /* The engine on the test's temporary checkpoint copy. The copy names the tenant the plugin should
  * declare, so the lane's tenant and the block under test always agree. */
 std::unique_ptr<haru_test::Engine> start_tenant(const std::string& model, std::string* why) {
-    return haru_test::Engine::start({ "--model", model }, why);
+    /* The engine's duplex context default is 13500 rows a lane; these blocks never read the KV,
+     * so the smaller bound only keeps the reservation honest. */
+    return haru_test::Engine::start({ "--model", model, "--duplex-max-ctx", "512" }, why);
 }
 
 }  /* namespace */
