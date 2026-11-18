@@ -408,6 +408,18 @@ foreach(block codec head lm)
   endif()
 endforeach()
 
+# The shared harness' own test: the goldens, compare(), and a real engine and lane against the
+# existing model-free radtest-duplex plugin (a zero-delay echo) with a tiny checkpoint.
+if(TARGET haru_harness_test AND TARGET radtest_duplex)
+  target_compile_definitions(haru_harness_test PRIVATE
+    RAD_E2E_SERVER="$<TARGET_FILE:radiance>"
+    RAD_E2E_HOME="${RAD_PLUGIN_OUT}"
+    RAD_HARU_PLUGIN="$<TARGET_FILE:radtest_duplex>"
+    RAD_HARU_DATA="${CMAKE_SOURCE_DIR}/tests/data/haru")
+  add_dependencies(haru_harness_test radiance libref radtest_duplex)
+  set_tests_properties(haru_harness_test PROPERTIES LABELS "e2e" TIMEOUT 300)
+endif()
+
 # abi_layout_test compares the ABI's struct layouts with a C translation unit's: abi_c_test.c
 # includes every abi/ header as strict C11, so a header only C++ accepts fails the build.
 if(TARGET abi_layout_test)

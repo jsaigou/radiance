@@ -426,6 +426,23 @@ TEST(lane_limits_surface_as_session_limit) {
     }
 }
 
+/* A card or reference the engine refuses (not audio, too long, unreadable) is the CLIENT's mistake: the contract's
+ * bad_request, not internal, which means a server fault and would page someone for a user's bad clip. */
+TEST(a_refused_card_or_reference_is_a_bad_request_not_an_internal_error) {
+    FakeDuplex gen;
+    gen.open_rc = RAD_E_INVAL;
+    Fixture f(Fixture::Tweak{ [&](ServerOptions&, Deps& d) { d.duplex = &gen; } });
+    Session s(f);
+    s.conn.client(start_json("plugin"));
+    const json e = s.conn.wait_for("error");
+    REQUIRE(!e.is_null());
+    CHECK_EQ(e.value("code", std::string()), std::string("bad_request"));
+    CHECK(e.value("fatal", false));
+    /* The reason is fixed text: nothing the client sent is echoed back. */
+    CHECK(e.value("message", std::string()).find("reference") != std::string::npos);
+    CHECK(s.conn.wait_closed());
+}
+
 /* A close message and a dropped socket both release the lane. */
 TEST(close_and_socket_drop_release_the_lane) {
     FakeDuplex gen;

@@ -210,12 +210,13 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
 
     flatten_json(j, "", out);
 
-    /* Alias text_config.X (or llm_config.X) to a bare X where no bare X exists, so plugins read
-     * the same free-form keys (e.g. `partial_rotary_factor`) with or without a vision tower. A
-     * bare key wins where both exist. */
+    /* Alias text_config.X (or llm_config.X, or Haru's lm.X) to a bare X where no bare X exists, so
+     * plugins read the same free-form keys (e.g. `partial_rotary_factor`) with or without a vision
+     * tower. A bare key wins where both exist, so a wrapper's own top-level model_type is never
+     * replaced by the nested language model's. */
     {
         const size_t n = out->keys.size();
-        for (const char* pre : { "text_config.", "llm_config." }) {
+        for (const char* pre : { "text_config.", "llm_config.", "lm." }) {
             const size_t len = std::strlen(pre);
             for (size_t i = 0; i < n; ++i) {
                 const std::string& k = out->keys[i];
@@ -230,10 +231,11 @@ int meta_from_config_json(const std::string& dir, MetaOwn* out) {
     }
 
     auto gs = [&](const char* k) -> const char* { return out->get(k); };
-    /* text_config first, then llm_config, then the top level. */
+    /* text_config first, then llm_config, then lm (Haru's language model), then the top level. */
     auto nested = [&](const char* k) -> const char* {
         const char* v = gs((std::string("text_config.") + k).c_str());
         if (!v) v = gs((std::string("llm_config.") + k).c_str());
+        if (!v) v = gs((std::string("lm.") + k).c_str());
         return v ? v : gs(k);
     };
     auto gi = [&](const char* k, int64_t dflt) -> int64_t {

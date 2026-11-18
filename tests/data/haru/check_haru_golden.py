@@ -380,6 +380,45 @@ def check_replay(golden: dict[str, torch.Tensor], model) -> None:
     )
 
 
+# --------------------------------------------------------------------------- E
+
+def check_sensitivity_measurement() -> None:
+    """Rerun measure_sensitivity.py and compare with the README JSON block."""
+    import measure_sensitivity
+
+    measured = measure_sensitivity.measure(threads=1)
+    text = (HERE / "README.md").read_text(encoding="utf-8")
+    match = re.search(
+        r"<!-- BEGIN H0B SENSITIVITY JSON -->\s*```json\s*(.*?)\s*```\s*"
+        r"<!-- END H0B SENSITIVITY JSON -->",
+        text,
+        re.S,
+    )
+    if match is None:
+        report("E sensitivity measurement reproduces README", False, "JSON block not found")
+        return
+    recorded = json.loads(match.group(1))
+    if measured == recorded:
+        report(
+            "E sensitivity measurement reproduces README",
+            True,
+            f"{len(measured['families'])} families, rel_floor={measured['rel_floor']:.0e}",
+        )
+        return
+    differences = []
+    for family, row in measured["families"].items():
+        if recorded.get("families", {}).get(family) != row:
+            differences.append(family)
+    for key in ("rel_floor", "norm_pairs"):
+        if measured.get(key) != recorded.get(key):
+            differences.append(key)
+    report(
+        "E sensitivity measurement reproduces README",
+        False,
+        f"differs: {', '.join(differences[:8])}",
+    )
+
+
 # ------------------------------------------------------------------------ main
 
 def main() -> int:
@@ -399,6 +438,7 @@ def main() -> int:
     check_faithful_loop(model, model.tokenizer, golden)
     check_checkpoint_names(committed_ckpt)
     check_replay(golden, model)
+    check_sensitivity_measurement()
 
     print()
     if FAILURES:
