@@ -1134,6 +1134,8 @@ struct Config {
     /* --duplex-idle-s: how long a duplex session may receive no message at all before it is
      * closed with the "timeout" error. */
     int64_t duplex_idle_s = 30;
+    /* --duplex-max-reference-mib: the largest reference audio a duplex start may announce. */
+    int64_t duplex_max_reference_mib = 64;
     /* --max-stop-strings / --max-stop-bytes: count and length limits on a request's stop strings.
      * Every stop string is searched in all generated text, so these bound that scan's cost. */
     int64_t max_stop_strings = 64;

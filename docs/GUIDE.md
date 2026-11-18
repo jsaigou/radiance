@@ -2190,6 +2190,7 @@ by 0.002-0.003 nats.
 | `--duplex-test-tenants` | off | serve the duplex contract's model-free `echo` and `echo1` tenants on `/duplex/v1/session`, for checking a client without a model (§5.19) |
 | `--duplex-max-lanes N` | 2 | conversations one duplex test tenant holds at once; past it a start is `session_limit` |
 | `--duplex-idle-s S` | 30 | seconds a duplex session may receive no message before it is closed with `timeout` |
+| `--duplex-max-reference-mib N` | 64 | the largest reference audio a duplex start may announce, in MiB (1 to 512) |
 
 **Request defaults and bounds** (§4.9). A request that names the field wins.
 
@@ -3719,9 +3720,11 @@ returns it one step later, with the first reply empty, and `flush` returns the f
 `--duplex-max-lanes N` sets how many conversations one test tenant holds at once (default 2); a start
 beyond it is `session_limit`. A session that receives no message for `--duplex-idle-s` seconds
 (default 30) is closed with the fatal `timeout` error, and a lane that runs past
-`start.max_minutes` (when positive) is closed the same way. With the flag off,
-`/duplex/v1/info` lists no tenants and any start is `tenant_unavailable`. When `--api-key` is set,
-both the discovery request and the upgrade carry the key as they do for the other routes.
+`start.max_minutes` (when positive) is closed the same way. `--duplex-max-reference-mib N`
+(default 64) bounds reference audio and is reported as `max_reference_bytes` in `/info`; a start that
+announces more is `bad_request`. With the flag off, `/duplex/v1/info` lists no tenants and any start
+is `tenant_unavailable`. When `--api-key` is set, both the discovery request and the upgrade carry
+the key as they do for the other routes.
 
 ## 6. Operation
 

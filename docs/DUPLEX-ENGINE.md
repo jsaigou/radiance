@@ -34,12 +34,14 @@ One lane is one conversation: one WebSocket, one model state.
   "engine_version": "...",
   "tenants": [{"name": "echo", "text": false, "max_lanes": 2}],
   "frame": {"sample_rate": 24000, "samples": 3200, "format": "f32le"},
+  "max_reference_bytes": 67108864,
   "ready": true
 }
 ```
 
-`ready: false` means the model is still loading. The client treats that as retryable. Unknown fields
-are ignored by both sides.
+`max_reference_bytes` is optional and states the largest reference audio the engine accepts. `ready:
+false` means the model is still loading. The client treats that as retryable. Unknown fields are
+ignored by both sides.
 
 ## 4. Session messages
 
@@ -52,7 +54,8 @@ are ignored by both sides.
 
 `card` is opaque to the engine except for what the tenant understands; unknown keys are ignored. If
 `reference.bytes > 0`, exactly that many bytes follow as **one binary message** before the engine
-replies. The engine replies with exactly one of:
+replies. A start announcing more than the engine's `max_reference_bytes` is `bad_request`. The engine
+replies with exactly one of:
 
 - `{"type":"ready","text":false,"input_rates":[24000]}`
 - `{"type":"error", ...}` (section 5), after which it closes the socket.

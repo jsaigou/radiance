@@ -559,6 +559,7 @@ const std::map<std::string, std::vector<std::string>>& legal_values() {
         { "--default-max-tokens", { "256" } }, { "--max-tokens-cap", { "1024" } },
         { "--max-n", { "4" } }, { "--max-queued-requests", { "4096" } },
         { "--duplex-max-lanes", { "2" } }, { "--duplex-idle-s", { "30" } },
+        { "--duplex-max-reference-mib", { "64" } },
         { "--max-stop-strings", { "8" } }, { "--max-stop-bytes", { "256" } },
         { "--chat-template-kwargs", { "{\"enable_thinking\": false}" } },
         { "--reasoning-format", { "none" } }, { "--http-threads", { "4" } },

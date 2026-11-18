@@ -397,6 +397,26 @@ TEST(reference_bytes_reach_the_tenant) {
     }
 }
 
+TEST(the_reference_limit_is_advertised_and_enforced) {
+    auto rec = std::make_shared<RecordingTenant>();
+    Fixture f(Fixture::Tweak{ [rec](ServerOptions& o, Deps&) {
+        o.duplex_test_tenants = true;
+        o.duplex_max_reference_mib = 1;
+        o.duplex_tenants.push_back(rec);
+    } });
+    const json info = json::parse(f.get("/duplex/v1/info").body);
+    CHECK_EQ(info.value("max_reference_bytes", 0), 1 << 20);
+
+    Session s(f);
+    json j = start_json("record");
+    j["reference"] = { { "id", "" }, { "bytes", (1 << 20) + 1 }, { "transcript", "" } };
+    s.conn.client(j);
+    const json e = s.conn.wait_for("error");
+    REQUIRE(!e.is_null());
+    CHECK_EQ(e.value("code", std::string()), std::string("bad_request"));
+    CHECK(s.conn.wait_closed());
+}
+
 TEST(an_unknown_tenant_is_unavailable) {
     Fixture f(Fixture::Tweak{ [](ServerOptions& o, Deps&) { o.duplex_test_tenants = true; } });
     Session s(f);

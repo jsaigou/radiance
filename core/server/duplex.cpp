@@ -50,6 +50,10 @@ constexpr size_t   kMaxStartBytes = 1u << 20;
 /* The client messages a session may have queued and not yet taken in. */
 constexpr size_t   kMaxQueuedBytes = 16u << 20;
 
+size_t reference_limit_bytes(int64_t mib) {
+    return (size_t)std::max<int64_t>(1, mib) << 20;
+}
+
 uint32_t read_le32(const char* p) {
     return (uint32_t)(uint8_t)p[0] | ((uint32_t)(uint8_t)p[1] << 8) |
            ((uint32_t)(uint8_t)p[2] << 16) | ((uint32_t)(uint8_t)p[3] << 24);
@@ -185,6 +189,7 @@ HttpResponse Server::handle_duplex_info(const HttpRequest& req) {
     frame["samples"] = kSamples;
     frame["format"] = "f32le";
     o["frame"] = std::move(frame);
+    o["max_reference_bytes"] = reference_limit_bytes(opt_.duplex_max_reference_mib);
     o["ready"] = true;
     return HttpResponse::json_body(200, json_dump(o));
 }
@@ -202,6 +207,9 @@ struct Server::DuplexSession {
     size_t inbox_bytes = 0;
     bool   peer_gone = false;
     bool   overflow = false;
+    bool   first_processed = false;
+    bool   reference_allowed = false;
+    size_t reference_limit = 0;
 
     /* Everything below is the session thread's alone. */
     enum class Phase { Start, Reference, Running };
@@ -249,6 +257,7 @@ void Server::handle_duplex(const HttpRequest& req, WsConn& ws) {
     DuplexSession s;
     s.id = random_id("duplex_");
     s.peer = req.peer;
+    s.reference_limit = reference_limit_bytes(opt_.duplex_max_reference_mib);
     std::thread worker([this, &s, &ws] { duplex_run(s, ws); });
     struct Join {
         DuplexSession& s;
@@ -265,16 +274,29 @@ void Server::handle_duplex(const HttpRequest& req, WsConn& ws) {
 
     std::string msg;
     bool binary = false;
+    bool first = true;
     while (ws.read(&msg, &binary)) {
-        std::lock_guard<std::mutex> lk(s.m);
-        if (s.inbox_bytes + msg.size() > kMaxQueuedBytes) {
+        std::unique_lock<std::mutex> lk(s.m);
+        /* One binary message may be the reference: it is the only one held to the reference
+         * limit. Steps and control messages keep the ordinary queue cap. */
+        const bool large = binary && s.reference_allowed;
+        const size_t per_message = large ? s.reference_limit : kMaxQueuedBytes;
+        if (msg.size() > per_message ||
+            s.inbox_bytes + msg.size() > kMaxQueuedBytes + s.reference_limit) {
             s.overflow = true;
-            s.cv.notify_one();
+            s.cv.notify_all();
             break;
         }
+        if (large) s.reference_allowed = false;
         s.inbox_bytes += msg.size();
         s.inbox.emplace_back(std::move(msg), binary);
-        s.cv.notify_one();
+        s.cv.notify_all();
+        /* The session decides whether the next message may be a large reference. Do not read
+         * past the start until it has. */
+        if (first) {
+            first = false;
+            s.cv.wait(lk, [&] { return s.first_processed; });
+        }
     }
 }
 
@@ -291,6 +313,11 @@ void Server::duplex_run(DuplexSession& s, WsConn& ws) {
                                                  "log")));
         ws.close(1011, "internal error");
     }
+    {
+        std::lock_guard<std::mutex> lk(s.m);
+        s.first_processed = true;
+    }
+    s.cv.notify_all();
     s.release();
     RAD_INFO("duplex %s closed from %s: %llu steps", s.id.c_str(), s.peer.c_str(),
              (unsigned long long)s.steps);
@@ -375,9 +402,9 @@ bool Server::duplex_loop(DuplexSession& s, WsConn& ws) {
                     return fail("bad_request", "reference.bytes is an integer", 1008);
                 }
             }
-            if (reference_bytes > kMaxQueuedBytes)
+            if (reference_bytes > s.reference_limit)
                 return fail("bad_request", fmt("the reference audio is larger than %zu bytes",
-                                               kMaxQueuedBytes), 1008);
+                                               s.reference_limit), 1008);
             if (r.contains("id") && r["id"].is_string())
                 reference_id = r["id"].get<std::string>();
             if (r.contains("transcript") && r["transcript"].is_string())
@@ -409,6 +436,10 @@ bool Server::duplex_loop(DuplexSession& s, WsConn& ws) {
         s.pending->transcript = std::move(transcript);
         if (reference_bytes > 0) {
             s.want_reference = (size_t)reference_bytes;
+            {
+                std::lock_guard<std::mutex> lk(s.m);
+                s.reference_allowed = true;
+            }
             s.phase = DuplexSession::Phase::Reference;
             return false;
         }
@@ -523,8 +554,15 @@ bool Server::duplex_loop(DuplexSession& s, WsConn& ws) {
         if (overflow)
             return fail("bad_request", fmt("the session fell more than %zu MiB of messages behind",
                                            kMaxQueuedBytes >> 20), 1008);
+        bool ended = false;
         for (const auto& m : got)
-            if (handle(m.first, m.second)) return true;
+            if (handle(m.first, m.second)) { ended = true; break; }
+        {
+            std::lock_guard<std::mutex> lk(s.m);
+            s.first_processed = true;
+        }
+        s.cv.notify_all();
+        if (ended) return true;
         if (gone) return false;
         if (stopping_.load())
             return fail("internal", "the server is shutting down", 1001);
