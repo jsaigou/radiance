@@ -20,14 +20,14 @@ torch 2.15.0 in float32.
 ```
 gen_haru_tiny.py         builds the checkpoint, tokenizer and golden exchange
 check_haru_golden.py     four PASS/FAIL checks; exits non-zero on failure
-golden.safetensors       461 float32/int64 tensors (1,059,764 bytes)
+golden.safetensors       486 float32/int64 tensors (1,110,964 bytes)
 golden_meta.json         sampling config, seeds, reference commit, hashes
 haru_tiny/config.json    HF-style Haru config (same schema as the real one)
 haru_tiny/model.safetensors  model.state_dict(), float32, real key names
 haru_tiny/tokenizer.json small byte-level BPE tokenizer, 512 ids
 ```
 
-Total size of this directory is below 4 MB (3.89 MB at the time of writing).
+Total size of this directory is below 4 MB (3.94 MB at the time of writing).
 
 To regenerate everything (the committed files are byte-identical to a fresh
 run with `--threads 1`).  Bit-identical regeneration required one fix: the
@@ -185,6 +185,7 @@ pinned reference.
 | `frame{t}.lm_layer0..3` | `[64]` each | float32 | per-layer outputs at this position, only `t = 1,2,3` |
 | `frame{t}.logits` | `[512]` | float32 | raw `model.logits(hidden)` before DRY, `haru.py:113-115`, `session.py:148` |
 | `frame{t}.logits_fp32_pad_eop` | `[2]` | float32 | float32 logits for `[pad, eop]`, `haru.py:117-123`, `session.py:151` |
+| `frame{t}.logits_final` | `[512]` | float32 | raw logits after DRY and the PAD/EOP replacement, exactly what sampling sees, `session.py:148-157` |
 | `frame{t}.token_out` | `[1]` | int64 | sampled token, `sampling.py:80-100`, `session.py:157` |
 | `frame{t}.head_noise` | `[64]` | float32 | `torch.randn` draw for the head, `session.py:159-160` |
 | `frame{t}.head_latent_normalized` | `[64]` | float32 | `head.sample(hidden, noise, 1.5)`, `meanflow_head.py:117-134`, `session.py:162` |
@@ -232,10 +233,12 @@ compare stage by stage; the first differing stage localises the bug.
   run one MeanFlow step with `h = 1`, guidance 1.5 (the guidance scalar is part
   of the network input, `meanflow_head.py:106-113,130-134`).  Compare
   `head_latent_normalized`, then unscale to `latent_out`.
-* **Sampling.**  Start from `frame{t}.logits`, apply the DRY penalties from the
-  recorded token history (`sampling.py:33-77`), replace the PAD/EOP logits with
-  `logits_fp32_pad_eop`, divide by temperature and top-k the result.  Compare
-  the recorded `token_out`; the engine should replay tokens, not the multinomial
+* **Sampling.**  `frame{t}.logits` is the raw `model.logits` output;
+  `frame{t}.logits_final` is that vector after the DRY penalties from the
+  recorded token history (`sampling.py:33-77`) and after replacing the PAD/EOP
+  entries with `logits_fp32_pad_eop`.  A sampler should consume
+  `logits_final`, divide by temperature and top-k the result.  Compare the
+  recorded `token_out`; the engine should replay tokens, not the multinomial
   RNG.
 * **Prompt assembly.**  Compare `prompt.tokens`, `prompt.model_latents`,
   `prompt.user_latents`, `prompt.model_mask` and `prompt.user_mask` directly.
@@ -287,7 +290,7 @@ PASS B real DuplexSession audio matches: max |diff| 0.000e+00
 PASS C checkpoint name patterns equal real header: 103 patterns; missing=[] extra=[]
 PASS C checkpoint shapes scale down from real
 PASS C config geometry
-PASS D recorded noise/tokens replay through components: 256 tensors reproduced
+PASS D recorded noise/tokens replay through components: 281 tensors reproduced
 PASS D recorded noise reconstructs latents
 RESULT PASS (all checks)
 ```

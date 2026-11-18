@@ -218,6 +218,8 @@ def _family(name: str) -> str:
 
 def replay(golden: dict[str, torch.Tensor], model, threads: int) -> dict[str, torch.Tensor]:
     """Recompute every derived golden tensor from recorded inputs and noise."""
+    from haru.sampling import DryConfig, DryState
+
     torch.set_num_threads(threads)
     model.eval().requires_grad_(False)
     out: dict[str, torch.Tensor] = {}
@@ -265,6 +267,8 @@ def replay(golden: dict[str, torch.Tensor], model, threads: int) -> dict[str, to
         # Streaming codec + LM, feeding recorded latents and tokens.
         stream = gen.open_stream(model.codec, backend="torch")
         stream.reset()
+        stream_ids = torch.tensor([gen.PAD_ID, gen.EOP_ID], device=model.device)
+        dry = DryState(DryConfig(), {gen.PAD_ID, gen.EOP_ID, gen.EOS_ID})
 
         for t in range(0, gen.USER_FRAMES + 1):
             if t > 0:
@@ -286,8 +290,12 @@ def replay(golden: dict[str, torch.Tensor], model, threads: int) -> dict[str, to
 
             logits = model.logits(hidden)
             put(f"frame{t}.logits", logits[0])
-            stream_ids = torch.tensor([gen.PAD_ID, gen.EOP_ID], device=model.device)
-            put(f"frame{t}.logits_fp32_pad_eop", model.logits_fp32(hidden, stream_ids)[0])
+            fp32_pad_eop = model.logits_fp32(hidden, stream_ids)
+            put(f"frame{t}.logits_fp32_pad_eop", fp32_pad_eop[0])
+            dry.apply(logits[0])
+            logits[:, stream_ids] = fp32_pad_eop
+            put(f"frame{t}.logits_final", logits[0])
+            dry.update(int(golden[f"frame{t}.token_out"].reshape(-1)[0]))
 
             noise = golden[f"frame{t}.head_noise"][None]
             latent_normalized = model.head.sample(hidden, noise, gen.GUIDANCE_SCALE)

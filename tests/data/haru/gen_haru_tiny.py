@@ -563,6 +563,7 @@ def run_generation(
             _put(out, f"frame{frame_index}.hidden", hidden[0])
             _put(out, f"frame{frame_index}.logits", logits_raw)
             _put(out, f"frame{frame_index}.logits_fp32_pad_eop", fp32_pad_eop[0])
+            _put(out, f"frame{frame_index}.logits_final", logits[0])
             _put(out, f"frame{frame_index}.token_out", token.reshape(-1).to(torch.int64))
             _put(out, f"frame{frame_index}.head_noise", noise[0])
             _put(out, f"frame{frame_index}.head_latent_normalized", latent_normalized[0])

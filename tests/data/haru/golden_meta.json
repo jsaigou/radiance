@@ -28,8 +28,8 @@
   ],
   "hashes": {
     "config.json": "879f2c5bcfe282fbc44530de57e3aef77d85e6cb1ce6a6c0945e092272fbe2ee",
-    "golden.safetensors": "d61b1195310cc8038347d3f44abaa5ed81f6ed8903b96c2f094e5827ad65e36e",
-    "golden_tensor_sha256": "1b949ef411be16a0467ce5ae6fa87c76d2cfbb920be70078bc4c6f7f2d627331",
+    "golden.safetensors": "c1059dbefef4343b38bcedc944496dd925f95708c973aabf01a20b1b499a8898",
+    "golden_tensor_sha256": "db35d9aa817f21fb5a85a613e5a4bf9c6669d17adfe95a109c006458a8768937",
     "model.safetensors": "4a35786dfa594ca47bc88cdfc232b066d53a112d9faee6253dde0f4c28bc9d62",
     "state_dict_sha256": "957d249567a7872bcb7aee700e2ded91ba8eb73df801bc4379f1cb3b89bb4a98",
     "tokenizer.json": "bfdf9706841b01315f09279fa1ef861a72b3b615d4ae044eb50de7011301b5b7"
@@ -71,7 +71,7 @@
   },
   "seed": 1234,
   "system_prompt": "You are Haru.",
-  "tensor_count": 461,
+  "tensor_count": 486,
   "threads": 1,
   "torch_version": "2.15.0",
   "user_audio_seed": 515151,
