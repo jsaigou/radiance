@@ -258,9 +258,10 @@ void HaruHead::issue(RadCtx* c, RadOperand hidden, RadOperand noise, RadOperand 
         const HaruHeadLayerOp& o = lop[(size_t)l];
         RAD_ISSUE_N(c, o.ada, 1, RAD_B(b_emb), RAD_W(w.ada), RAD_B(b_ada));
         RAD_ISSUE_N(c, o.norm, 1, RAD_B(cur), RAD_W(w.norm), RAD_B(b_hn));
-        RAD_ISSUE_N(c, op_add_h, 1, RAD_B(b_oneh), RAD_B_N(b_ada, 0, H), RAD_B(b_t1));
+        /* chunk order is (shift, scale, gate): h * (1 + scale) + shift */
+        RAD_ISSUE_N(c, op_add_h, 1, RAD_B(b_oneh), RAD_B_N(b_ada, H, H), RAD_B(b_t1));
         RAD_ISSUE_N(c, op_mul_h, 1, RAD_B(b_hn), RAD_B(b_t1), RAD_B(b_t2));
-        RAD_ISSUE_N(c, op_add_h, 1, RAD_B(b_t2), RAD_B_N(b_ada, H, H), RAD_B(b_t1));
+        RAD_ISSUE_N(c, op_add_h, 1, RAD_B(b_t2), RAD_B_N(b_ada, 0, H), RAD_B(b_t1));
         RAD_ISSUE_N(c, o.gate, 1, RAD_B(b_t1), RAD_W(w.gate), RAD_B(b_g));
         RAD_ISSUE_N(c, o.up, 1, RAD_B(b_t1), RAD_W(w.up), RAD_B(b_up));
         RAD_ISSUE_N(c, op_silu_f, 1, RAD_B(b_g), RAD_B(b_sg));
@@ -273,9 +274,10 @@ void HaruHead::issue(RadCtx* c, RadOperand hidden, RadOperand noise, RadOperand 
 
     RAD_ISSUE_N(c, op_final_ada, 1, RAD_B(b_emb), RAD_W(final_ada), RAD_B(b_fada));
     RAD_ISSUE_N(c, op_rmsnorm_p, 1, RAD_B(cur), RAD_B(b_hn));
-    RAD_ISSUE_N(c, op_add_h, 1, RAD_B(b_oneh), RAD_B_N(b_fada, 0, H), RAD_B(b_t1));
+    /* chunk order is (shift, scale) */
+    RAD_ISSUE_N(c, op_add_h, 1, RAD_B(b_oneh), RAD_B_N(b_fada, H, H), RAD_B(b_t1));
     RAD_ISSUE_N(c, op_mul_h, 1, RAD_B(b_hn), RAD_B(b_t1), RAD_B(b_t2));
-    RAD_ISSUE_N(c, op_add_h, 1, RAD_B(b_t2), RAD_B_N(b_fada, H, H), RAD_B(b_t1));
+    RAD_ISSUE_N(c, op_add_h, 1, RAD_B(b_t2), RAD_B_N(b_fada, 0, H), RAD_B(b_t1));
     RAD_ISSUE_N(c, op_final_proj, 1, RAD_B(b_t1), RAD_W(final_proj), RAD_B(b_vel));
 
     /* One MeanFlow step from t = 0 at h = 1: z = noise + velocity. */
