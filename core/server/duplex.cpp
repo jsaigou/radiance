@@ -503,6 +503,12 @@ bool Server::duplex_loop(DuplexSession& s, WsConn& ws) {
             if (st == RAD_E_FULL)
                 return fail("session_limit",
                             "the tenant has no lane or KV left; try again later", 1013);
+            /* The card or the reference was refused (not audio, too long, unreadable): the client's
+             * mistake, so the contract's bad_request, with fixed text that echoes nothing it sent. */
+            if (st == RAD_E_INVAL)
+                return fail("bad_request",
+                            "the card or the reference audio was refused (unreadable, not audio, or "
+                            "too long for this tenant)", 1008);
             return fail("internal", "the tenant could not open the session", 1011);
         }
         s.lane = std::move(lane);
