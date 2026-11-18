@@ -1,0 +1,14 @@
+# haru-bf16.recipe -- Haru (the duplex speech model) served at bf16, the precision its release
+# ships and its reference runs.
+#
+#   rad-convert <Haru checkpoint directory> \
+#       --recipe data/recipes/haru-bf16.recipe -o haru-bf16.rad
+#
+# The real checkpoint is bf16 in every one of its 1022 tensors (checked against header.json), so
+# this rule is exact there. It makes the serving precision explicit and gives a repacked f32
+# checkpoint the same bf16 container. The LM's norms and PAD/EOP rows, the two audio projectors,
+# the latent scale/bias and the MeanFlow head are declared f32 by their blocks; the loader widens
+# those bf16 values to f32 exactly (core/build/rad_builder.cpp:207-227), so they stay f32 in the
+# container. The codec is declared at the config's dtype, bfloat16.
+
+*                                    cast dtype=bf16

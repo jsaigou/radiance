@@ -864,6 +864,12 @@ if(RAD_PYTHON3)
   add_test(NAME dspark_qos_regression_test
            COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/dspark_qos_regression_test.py)
   set_tests_properties(dspark_qos_regression_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
+  add_test(NAME haru_names_check
+           COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/data/haru/check_haru_names.py)
+  set_tests_properties(haru_names_check PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
+  add_test(NAME haru_names_check_selftest
+           COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/data/haru/check_haru_names.py --self-test)
+  set_tests_properties(haru_names_check_selftest PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
 endif()
 
 # ================================================================== the shipped plugins, out of tree

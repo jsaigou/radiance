@@ -20,15 +20,25 @@ torch 2.15.0 in float32.
 ```
 gen_haru_tiny.py         builds the checkpoint, tokenizer and golden exchange
 check_haru_golden.py     five PASS/FAIL checks; exits non-zero on failure
+check_haru_names.py      block-declaration coverage against tiny and real headers
 measure_sensitivity.py   float64 and bfloat16 sensitivity over the same goldens
 golden.safetensors       486 float32/int64 tensors (1,110,964 bytes of payload)
 golden_meta.json         sampling config, seeds, reference commit, hashes
 haru_tiny/config.json    HF-style Haru config (same schema as the real one)
 haru_tiny/model.safetensors  model.state_dict(), float32, real key names
 haru_tiny/tokenizer.json small byte-level BPE tokenizer, 512 ids
+real/config.json         the real checkpoint's config
+real/header.json         the real checkpoint's 1022-tensor safetensors header
 ```
 
-Total size of this directory is below 4 MB (3.97 MB at the time of writing).
+`check_haru_names.py` parses the weight declarations in `arch/haru_common/`, expands the layer and
+stage loops with each config, and checks names, shapes and dtypes against both the tiny header and
+`real/header.json`.  Run it with `python3 tests/data/haru/check_haru_names.py`; `--self-test` mutates
+one name, shape and dtype in memory and confirms each is reported.  `real/` holds only the header
+and config (about 112 KB), not the real weights.
+
+Total size of this directory is below 5 MB (about 4.0 MB at the time of writing, including the
+real header/config copy).
 
 To regenerate everything (the committed files are byte-identical to a fresh
 run with `--threads 1`).  Bit-identical regeneration required one fix: the
