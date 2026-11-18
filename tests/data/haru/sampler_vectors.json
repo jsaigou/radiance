@@ -1,0 +1,906 @@
+{
+  "source": "tests/data/haru/gen_sampler_vectors.py",
+  "penalty_cases": [
+    {
+      "name": "empty",
+      "dry": {
+        "multiplier": 0.8,
+        "base": 1.75,
+        "allowed_length": 1,
+        "lookback": 1024,
+        "max_match_length": 32,
+        "max_penalty": 32.0
+      },
+      "pad_id": 900,
+      "eop_id": 901,
+      "eos_id": -1,
+      "observe": [],
+      "expected_history": [],
+      "expected_penalties": {}
+    },
+    {
+      "name": "below_allowed_length",
+      "dry": {
+        "multiplier": 0.8,
+        "base": 1.75,
+        "allowed_length": 3,
+        "lookback": 1024,
+        "max_match_length": 32,
+        "max_penalty": 32.0
+      },
+      "pad_id": 900,
+      "eop_id": 901,
+      "eos_id": -1,
+      "observe": [
+        1,
+        2
+      ],
+      "expected_history": [
+        1,
+        2
+      ],
+      "expected_penalties": {}
+    },
+    {
+      "name": "match_length_1",
+      "dry": {
+        "multiplier": 0.8,
+        "base": 1.75,
+        "allowed_length": 1,
+        "lookback": 1024,
+        "max_match_length": 32,
+        "max_penalty": 32.0
+      },
+      "pad_id": 900,
+      "eop_id": 901,
+      "eos_id": -1,
+      "observe": [
+        7,
+        7
+      ],
+      "expected_history": [
+        7,
+        7
+      ],
+      "expected_penalties": {
+        "7": 0.8
+      }
+    },
+    {
+      "name": "match_length_2",
+      "dry": {
+        "multiplier": 0.8,
+        "base": 1.75,
+        "allowed_length": 1,
+        "lookback": 1024,
+        "max_match_length": 32,
+        "max_penalty": 32.0
+      },
+      "pad_id": 900,
+      "eop_id": 901,
+      "eos_id": -1,
+      "observe": [
+        10,
+        20,
+        10,
+        20
+      ],
+      "expected_history": [
+        10,
+        20,
+        10,
+        20
+      ],
+      "expected_penalties": {
+        "10": 1.4000000000000001
+      }
+    },
+    {
+      "name": "match_length_3",
+      "dry": {
+        "multiplier": 0.8,
+        "base": 1.75,
+        "allowed_length": 1,
+        "lookback": 1024,
+        "max_match_length": 32,
+        "max_penalty": 32.0
+      },
+      "pad_id": 900,
+      "eop_id": 901,
+      "eos_id": -1,
+      "observe": [
+        10,
+        20,
+        10,
+        20,
+        10
+      ],
+      "expected_history": [
+        10,
+        20,
+        10,
+        20,
+        10
+      ],
+      "expected_penalties": {
+        "20": 2.45
+      }
+    },
+    {
+      "name": "several_candidates",
+      "dry": {
+        "multiplier": 0.8,
+        "base": 1.75,
+        "allowed_length": 1,
+        "lookback": 1024,
+        "max_match_length": 32,
+        "max_penalty": 32.0
+      },
+      "pad_id": 900,
+      "eop_id": 901,
+      "eos_id": -1,
+      "observe": [
+        7,
+        8,
+        9,
+        7,
+        9,
+        7
+      ],
+      "expected_history": [
+        7,
+        8,
+        9,
+        7,
+        9,
+        7
+      ],
+      "expected_penalties": {
+        "8": 0.8,
+        "9": 1.4000000000000001
+      }
+    },
+    {
+      "name": "max_penalty_clamp",
+      "dry": {
+        "multiplier": 0.8,
+        "base": 1.75,
+        "allowed_length": 1,
+        "lookback": 1024,
+        "max_match_length": 32,
+        "max_penalty": 32.0
+      },
+      "pad_id": 900,
+      "eop_id": 901,
+      "eos_id": -1,
+      "observe": [
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42
+      ],
+      "expected_history": [
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42,
+        42
+      ],
+      "expected_penalties": {
+        "42": 32.0
+      }
+    },
+    {
+      "name": "exempt_tokens",
+      "dry": {
+        "multiplier": 0.8,
+        "base": 1.75,
+        "allowed_length": 1,
+        "lookback": 1024,
+        "max_match_length": 32,
+        "max_penalty": 32.0
+      },
+      "pad_id": 2,
+      "eop_id": 3,
+      "eos_id": 4,
+      "observe": [
+        1,
+        2,
+        1,
+        3,
+        1,
+        4,
+        1
+      ],
+      "expected_history": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "expected_penalties": {
+        "1": 2.45
+      }
+    },
+    {
+      "name": "history_size_trim",
+      "dry": {
+        "multiplier": 0.8,
+        "base": 1.75,
+        "allowed_length": 1,
+        "lookback": 4,
+        "max_match_length": 2,
+        "max_penalty": 32.0
+      },
+      "pad_id": 900,
+      "eop_id": 901,
+      "eos_id": -1,
+      "observe": [
+        100,
+        1,
+        2,
+        1,
+        3,
+        1,
+        2,
+        1,
+        3
+      ],
+      "expected_history": [
+        2,
+        1,
+        3,
+        1,
+        2,
+        1,
+        3
+      ],
+      "expected_penalties": {
+        "1": 1.4000000000000001
+      }
+    }
+  ],
+  "sample_cases": [
+    {
+      "name": "greedy_ties_and_replacement",
+      "logits": [
+        1.0,
+        3.0,
+        3.0,
+        10.0,
+        10.0
+      ],
+      "pad_eop": [
+        2.0,
+        0.5
+      ],
+      "pad_id": 3,
+      "eop_id": 4,
+      "eos_id": -1,
+      "temperature": 0.0,
+      "top_k": 0,
+      "top_p": 1.0,
+      "eop_bias": 0.0,
+      "dry": {
+        "multiplier": 0.8,
+        "base": 1.75,
+        "allowed_length": 1,
+        "lookback": 1024,
+        "max_match_length": 32,
+        "max_penalty": 32.0
+      },
+      "observe": [],
+      "force_text_frames": 0,
+      "seed": 1234,
+      "uniform": 0.0,
+      "expected_logits": [
+        1.0,
+        3.0,
+        3.0,
+        2.0,
+        0.5
+      ],
+      "expected_token": 1,
+      "expected_penalties_before": {},
+      "expected_penalties_after": {},
+      "expected_history_after": [
+        1
+      ],
+      "expected_force_text_after": 0,
+      "expected_rng_state": 1234
+    },
+    {
+      "name": "top_k_1",
+      "logits": [
+        0.5,
+        2.0,
+        1.0,
+        -1.0,
+        5.0,
+        5.0
+      ],
+      "pad_eop": [
+        -2.0,
+        -3.0
+      ],
+      "pad_id": 4,
+      "eop_id": 5,
+      "eos_id": -1,
+      "temperature": 1.0,
+      "top_k": 1,
+      "top_p": 1.0,
+      "eop_bias": 0.0,
+      "dry": {
+        "multiplier": 0.8,
+        "base": 1.75,
+        "allowed_length": 1,
+        "lookback": 1024,
+        "max_match_length": 32,
+        "max_penalty": 32.0
+      },
+      "observe": [],
+      "force_text_frames": 0,
+      "seed": 1234,
+      "uniform": 0.99,
+      "expected_logits": [
+        0.5,
+        2.0,
+        1.0,
+        -1.0,
+        -2.0,
+        -3.0
+      ],
+      "expected_token": 1,
+      "expected_penalties_before": {},
+      "expected_penalties_after": {},
+      "expected_history_after": [
+        1
+      ],
+      "expected_force_text_after": 0,
+      "expected_rng_state": 1234
+    },
+    {
+      "name": "top_k_above_vocab",
+      "logits": [
+        0.0,
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        5.0,
+        6.0,
+        7.0,
+        50.0,
+        50.0
+      ],
+      "pad_eop": [
+        -5.0,
+        -6.0
+      ],
+      "pad_id": 8,
+      "eop_id": 9,
+      "eos_id": -1,
+      "temperature": 1.0,
+      "top_k": 25,
+      "top_p": 1.0,
+      "eop_bias": 0.0,
+      "dry": {
+        "multiplier": 0.8,
+        "base": 1.75,
+        "allowed_length": 1,
+        "lookback": 1024,
+        "max_match_length": 32,
+        "max_penalty": 32.0
+      },
+      "observe": [],
+      "force_text_frames": 0,
+      "seed": 1234,
+      "uniform": 0.3,
+      "expected_logits": [
+        0.0,
+        1.0,
+        2.0,
+        3.0,
+        4.0,
+        5.0,
+        6.0,
+        7.0,
+        -5.0,
+        -6.0
+      ],
+      "expected_token": 7,
+      "expected_penalties_before": {},
+      "expected_penalties_after": {},
+      "expected_history_after": [
+        7
+      ],
+      "expected_force_text_after": 0,
+      "expected_rng_state": 1234
+    },
+    {
+      "name": "top_p_below_one",
+      "logits": [
+        2.0,
+        1.0,
+        0.0,
+        -1.0,
+        -2.0,
+        9.0,
+        9.0
+      ],
+      "pad_eop": [
+        -9.0,
+        -9.0
+      ],
+      "pad_id": 5,
+      "eop_id": 6,
+      "eos_id": -1,
+      "temperature": 1.0,
+      "top_k": 0,
+      "top_p": 0.8,
+      "eop_bias": 0.0,
+      "dry": {
+        "multiplier": 0.8,
+        "base": 1.75,
+        "allowed_length": 1,
+        "lookback": 1024,
+        "max_match_length": 32,
+        "max_penalty": 32.0
+      },
+      "observe": [],
+      "force_text_frames": 0,
+      "seed": 1234,
+      "uniform": 0.85,
+      "expected_logits": [
+        2.0,
+        1.0,
+        0.0,
+        -1.0,
+        -2.0,
+        -9.0,
+        -9.0
+      ],
+      "expected_token": 1,
+      "expected_penalties_before": {},
+      "expected_penalties_after": {},
+      "expected_history_after": [
+        1
+      ],
+      "expected_force_text_after": 0,
+      "expected_rng_state": 1234
+    },
+    {
+      "name": "top_p_strict_and_ties",
+      "logits": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "pad_eop": [
+        1.0,
+        1.0
+      ],
+      "pad_id": 4,
+      "eop_id": 5,
+      "eos_id": -1,
+      "temperature": 1.0,
+      "top_k": 0,
+      "top_p": 0.5,
+      "eop_bias": 0.0,
+      "dry": {
+        "multiplier": 0.8,
+        "base": 1.75,
+        "allowed_length": 1,
+        "lookback": 1024,
+        "max_match_length": 32,
+        "max_penalty": 32.0
+      },
+      "observe": [],
+      "force_text_frames": 0,
+      "seed": 1234,
+      "uniform": 0.6,
+      "expected_logits": [
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "expected_token": 1,
+      "expected_penalties_before": {},
+      "expected_penalties_after": {},
+      "expected_history_after": [
+        1
+      ],
+      "expected_force_text_after": 0,
+      "expected_rng_state": 1234
+    },
+    {
+      "name": "top_k_tie_cut",
+      "logits": [
+        5.0,
+        5.0,
+        5.0,
+        5.0
+      ],
+      "pad_eop": [
+        5.0,
+        5.0
+      ],
+      "pad_id": 2,
+      "eop_id": 3,
+      "eos_id": -1,
+      "temperature": 1.0,
+      "top_k": 3,
+      "top_p": 1.0,
+      "eop_bias": 0.0,
+      "dry": {
+        "multiplier": 0.8,
+        "base": 1.75,
+        "allowed_length": 1,
+        "lookback": 1024,
+        "max_match_length": 32,
+        "max_penalty": 32.0
+      },
+      "observe": [],
+      "force_text_frames": 0,
+      "seed": 1234,
+      "uniform": 0.95,
+      "expected_logits": [
+        5.0,
+        5.0,
+        5.0,
+        5.0
+      ],
+      "expected_token": 2,
+      "expected_penalties_before": {},
+      "expected_penalties_after": {},
+      "expected_history_after": [],
+      "expected_force_text_after": 0,
+      "expected_rng_state": 1234
+    },
+    {
+      "name": "force_text_bans_eos",
+      "logits": [
+        100.0,
+        100.0,
+        100.0,
+        2.0,
+        1.0,
+        0.0
+      ],
+      "pad_eop": [
+        100.0,
+        100.0
+      ],
+      "pad_id": 0,
+      "eop_id": 1,
+      "eos_id": 2,
+      "temperature": 1.0,
+      "top_k": 0,
+      "top_p": 1.0,
+      "eop_bias": 0.0,
+      "dry": {
+        "multiplier": 0.8,
+        "base": 1.75,
+        "allowed_length": 1,
+        "lookback": 1024,
+        "max_match_length": 32,
+        "max_penalty": 32.0
+      },
+      "observe": [],
+      "force_text_frames": 1,
+      "seed": 1234,
+      "uniform": 0.0,
+      "expected_logits": [
+        "-inf",
+        "-inf",
+        "-inf",
+        2.0,
+        1.0,
+        0.0
+      ],
+      "expected_token": 3,
+      "expected_penalties_before": {},
+      "expected_penalties_after": {},
+      "expected_history_after": [
+        3
+      ],
+      "expected_force_text_after": 0,
+      "expected_rng_state": 1234
+    },
+    {
+      "name": "force_text_without_eos",
+      "logits": [
+        100.0,
+        100.0,
+        100.0,
+        2.0,
+        1.0,
+        0.0
+      ],
+      "pad_eop": [
+        100.0,
+        100.0
+      ],
+      "pad_id": 0,
+      "eop_id": 1,
+      "eos_id": -1,
+      "temperature": 1.0,
+      "top_k": 0,
+      "top_p": 1.0,
+      "eop_bias": 0.0,
+      "dry": {
+        "multiplier": 0.8,
+        "base": 1.75,
+        "allowed_length": 1,
+        "lookback": 1024,
+        "max_match_length": 32,
+        "max_penalty": 32.0
+      },
+      "observe": [],
+      "force_text_frames": 1,
+      "seed": 1234,
+      "uniform": 0.0,
+      "expected_logits": [
+        "-inf",
+        "-inf",
+        100.0,
+        2.0,
+        1.0,
+        0.0
+      ],
+      "expected_token": 2,
+      "expected_penalties_before": {},
+      "expected_penalties_after": {},
+      "expected_history_after": [
+        2
+      ],
+      "expected_force_text_after": 0,
+      "expected_rng_state": 1234
+    },
+    {
+      "name": "pad_eop_bias_after_replacement",
+      "logits": [
+        10.0,
+        0.0,
+        1.0,
+        2.0,
+        3.0
+      ],
+      "pad_eop": [
+        0.0,
+        2.0
+      ],
+      "pad_id": 0,
+      "eop_id": 1,
+      "eos_id": -1,
+      "temperature": 0.0,
+      "top_k": 0,
+      "top_p": 1.0,
+      "eop_bias": 5.0,
+      "dry": {
+        "multiplier": 0.8,
+        "base": 1.75,
+        "allowed_length": 1,
+        "lookback": 1024,
+        "max_match_length": 32,
+        "max_penalty": 32.0
+      },
+      "observe": [],
+      "force_text_frames": 0,
+      "seed": 1234,
+      "uniform": 0.0,
+      "expected_logits": [
+        0.0,
+        7.0,
+        1.0,
+        2.0,
+        3.0
+      ],
+      "expected_token": 1,
+      "expected_penalties_before": {},
+      "expected_penalties_after": {},
+      "expected_history_after": [],
+      "expected_force_text_after": 0,
+      "expected_rng_state": 1234
+    },
+    {
+      "name": "dry_changes_token",
+      "logits": [
+        0.0,
+        2.5,
+        2.0,
+        0.0,
+        0.0
+      ],
+      "pad_eop": [
+        -5.0,
+        -5.0
+      ],
+      "pad_id": 3,
+      "eop_id": 4,
+      "eos_id": -1,
+      "temperature": 0.0,
+      "top_k": 0,
+      "top_p": 1.0,
+      "eop_bias": 0.0,
+      "dry": {
+        "multiplier": 0.8,
+        "base": 1.75,
+        "allowed_length": 1,
+        "lookback": 1024,
+        "max_match_length": 32,
+        "max_penalty": 32.0
+      },
+      "observe": [
+        2,
+        1,
+        2
+      ],
+      "force_text_frames": 0,
+      "seed": 1234,
+      "uniform": 0.0,
+      "expected_logits": [
+        0.0,
+        1.7,
+        2.0,
+        -5.0,
+        -5.0
+      ],
+      "expected_token": 2,
+      "expected_penalties_before": {
+        "1": 0.8
+      },
+      "expected_penalties_after": {
+        "1": 0.8,
+        "2": 0.8
+      },
+      "expected_history_after": [
+        2,
+        1,
+        2,
+        2
+      ],
+      "expected_force_text_after": 0,
+      "expected_rng_state": 1234
+    },
+    {
+      "name": "dry_match_length_2",
+      "logits": [
+        0.0,
+        2.0,
+        1.8,
+        0.0,
+        0.0
+      ],
+      "pad_eop": [
+        -5.0,
+        -5.0
+      ],
+      "pad_id": 3,
+      "eop_id": 4,
+      "eos_id": -1,
+      "temperature": 0.0,
+      "top_k": 0,
+      "top_p": 1.0,
+      "eop_bias": 0.0,
+      "dry": {
+        "multiplier": 0.8,
+        "base": 1.75,
+        "allowed_length": 1,
+        "lookback": 1024,
+        "max_match_length": 32,
+        "max_penalty": 32.0
+      },
+      "observe": [
+        1,
+        2,
+        1,
+        2
+      ],
+      "force_text_frames": 0,
+      "seed": 1234,
+      "uniform": 0.0,
+      "expected_logits": [
+        0.0,
+        0.5999999999999999,
+        1.8,
+        -5.0,
+        -5.0
+      ],
+      "expected_token": 2,
+      "expected_penalties_before": {
+        "1": 1.4000000000000001
+      },
+      "expected_penalties_after": {
+        "1": 0.8,
+        "2": 0.8
+      },
+      "expected_history_after": [
+        1,
+        2,
+        1,
+        2,
+        2
+      ],
+      "expected_force_text_after": 0,
+      "expected_rng_state": 1234
+    }
+  ]
+}

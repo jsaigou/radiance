@@ -248,6 +248,13 @@ foreach(t ${RAD_TESTS})
     # tokenizers are too large).
     target_compile_definitions(${n} PRIVATE
       RAD_GBNF_TEST_DATA="${CMAKE_CURRENT_SOURCE_DIR}/data/gbnf")
+  elseif(n STREQUAL "duplex_sampler_test")
+    # The host text sampler's cases come from gen_sampler_vectors.py; the sampler itself is part
+    # of rad_core (core/gen), so this is the ordinary no-engine unit test with its data path.
+    add_executable(${n} ${t})
+    target_link_libraries(${n} PRIVATE ${RAD_TEST_CORE})
+    target_compile_definitions(${n} PRIVATE
+      RAD_GEN_SAMPLER_VECTORS="${CMAKE_CURRENT_SOURCE_DIR}/data/haru")
   else()
     add_executable(${n} ${t})
     target_link_libraries(${n} PRIVATE ${RAD_TEST_CORE})
@@ -876,6 +883,12 @@ if(RAD_PYTHON3)
   add_test(NAME dspark_qos_regression_test
            COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/dspark_qos_regression_test.py)
   set_tests_properties(dspark_qos_regression_test PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
+  add_test(NAME haru_names_check
+           COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/data/haru/check_haru_names.py)
+  set_tests_properties(haru_names_check PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
+  add_test(NAME haru_names_check_selftest
+           COMMAND ${RAD_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/data/haru/check_haru_names.py --self-test)
+  set_tests_properties(haru_names_check_selftest PROPERTIES LABELS "unit;fast" TIMEOUT ${RAD_TEST_TIMEOUT})
 endif()
 
 # ================================================================== the shipped plugins, out of tree
