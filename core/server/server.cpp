@@ -1472,6 +1472,8 @@ std::optional<HttpResponse> Server::refuse_text(const std::string& peer, ApiShap
                                      "and /v1/images/edits and generates no text"
         : opt_.audio_model         ? "this is an audio model: it serves /v1/audio/speech and "
                                      "generates no text"
+        : opt_.duplex_model        ? "this is a duplex model: it serves /duplex/v1 and generates "
+                                     "no text"
         : opt_.video_model         ? "this is a video model: it serves /v1/videos and generates "
                                      "no text"
         : opt_.shape_model         ? "this is a 3-D shape model: it serves /generate and generates "
@@ -1761,6 +1763,8 @@ HttpResponse Server::serve_pooled(const HttpRequest& req, bool rerank) {
         return error_response(err_not_implemented(
             opt_.image_model ? "/v1/embeddings requires an embedding model; this one makes images"
             : opt_.audio_model ? "/v1/embeddings requires an embedding model; this one makes audio"
+            : opt_.duplex_model ? "/v1/embeddings requires an embedding model; this one serves "
+                                  "duplex conversations"
             : opt_.video_model ? "/v1/embeddings requires an embedding model; this one makes video"
             : opt_.shape_model ? "/v1/embeddings requires an embedding model; this one makes shapes"
                                : "/v1/embeddings requires an embedding model; this one generates "

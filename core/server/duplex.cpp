@@ -16,6 +16,7 @@
 #include "server.h"
 #include "server_priv.h"
 #include "oai.h"
+#include "mm/media.h"
 
 #include <nlohmann/json.hpp>
 
@@ -26,9 +27,11 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -133,6 +136,170 @@ struct EchoTenant : DuplexTenant {
     int delay_ = 0;
 };
 
+/* ------------------------------------------------------------------ the engine's tenant */
+
+/* The start's card as text: a string as it is, an object's string "text", anything else as its
+ * compact JSON. */
+std::string card_text(const DuplexJson& card) {
+    if (card.is_string()) return card.get<std::string>();
+    if (card.is_object()) {
+        const auto it = card.find("text");
+        if (it != card.end() && it->is_string()) return it->get<std::string>();
+    }
+    return card.dump();
+}
+
+/* One lane on the engine's IDuplexGen. Engine replies are synchronous here: the driver's ticket
+ * is waited on by the bridge, and the server's session thread owns this lane. */
+struct EngineDuplexLane final : DuplexLane {
+    IDuplexGen* gen = nullptr;
+    ITokenizer* tok = nullptr;
+    int32_t     lane = -1;
+    uint64_t    last_seq = 0;
+
+    DuplexReply map(const DuplexGenReply& r) const {
+        if (r.status < 0) throw std::runtime_error("the duplex engine failed the lane");
+        DuplexReply out;
+        if (r.status == 0) {
+            out.audio = r.audio;
+        } else if (r.status == 1) {
+            /* A silent frame: the wire carries flags = 0. */
+        } else {
+            throw std::runtime_error("the duplex engine returned an invalid status");
+        }
+        if (r.token >= 0) {
+            std::string text;
+            if (!gen->decode_token(r.token, &text) && tok)
+                text = tok->decode(std::vector<int32_t>{ r.token });
+            out.text = std::move(text);
+        }
+        return out;
+    }
+
+    DuplexReply step(uint32_t seq, const std::vector<float>& samples) override {
+        DuplexGenReply r;
+        std::string why;
+        if (gen->step(lane, samples, seq, &r, &why) < 0)
+            throw std::runtime_error("the duplex engine failed the step");
+        last_seq = seq;
+        return map(r);
+    }
+    DuplexReply flush() override {
+        DuplexGenReply r;
+        std::string why;
+        if (gen->flush(lane, last_seq, &r, &why) < 0)
+            throw std::runtime_error("the duplex engine failed the flush");
+        return map(r);
+    }
+    void close() override { gen->close(lane); }
+};
+
+struct EngineDuplexTenant final : DuplexTenant {
+    IDuplexGen* gen = nullptr;
+    ITokenizer* tok = nullptr;
+    DuplexGenInfo inf;
+
+    DuplexTenantInfo info() const override {
+        DuplexTenantInfo i;
+        i.name = inf.name.empty() ? "duplex" : inf.name;
+        i.text = inf.text;
+        i.max_lanes = (int)std::max<int64_t>(1, std::min<int64_t>(inf.max_lanes, INT32_MAX));
+        return i;
+    }
+
+    int open(const DuplexStart& start, std::unique_ptr<DuplexLane>* out,
+             std::string* why) override {
+        auto r = std::make_unique<DuplexGenRequest>();
+        const std::string card = card_text(start.card);
+        std::vector<float> ref_audio;
+        std::vector<int32_t> ref_cu;
+        int64_t ref_frames = 0;
+        if (!start.reference.empty()) {
+            if (inf.max_ref_frames <= 0 || inf.ref_rate <= 0 || inf.ref_hop <= 0) {
+                if (why) *why = "this tenant takes no reference audio";
+                return RAD_E_INVAL;
+            }
+            if (inf.tmpl.find("{references}") == std::string::npos) {
+                if (why) *why = "this tenant's prompt has no reference slot";
+                return RAD_E_INVAL;
+            }
+            const int64_t hop = inf.ref_hop;
+            const int64_t max_samples = inf.max_ref_frames * hop;
+            std::vector<float> decoded;
+            std::string dwhy;
+            if (mm::decode_audio(start.reference.data(), start.reference.size(),
+                                 (int32_t)inf.ref_rate, max_samples + 1, &decoded, &dwhy) < 0) {
+                if (why) *why = "the reference audio could not be decoded";
+                return RAD_E_INVAL;
+            }
+            if (decoded.empty()) {
+                if (why) *why = "the reference audio holds no samples";
+                return RAD_E_INVAL;
+            }
+            const int64_t padded = ((int64_t)decoded.size() + hop - 1) / hop * hop;
+            if (padded > max_samples) {
+                if (why) *why = "the reference audio is longer than this tenant takes";
+                return RAD_E_INVAL;
+            }
+            decoded.resize((size_t)padded, 0.0f);
+            ref_audio = std::move(decoded);
+            ref_cu = { 0, (int32_t)padded };
+            ref_frames = padded / hop;
+        }
+        if (!tok) {
+            if (why) *why = "the server has no tokenizer for this tenant";
+            return RAD_E_STATE;
+        }
+        auto encode = [&](const std::string& t, bool parse_special) {
+            const auto ids = tok->encode(t, false, parse_special);
+            r->tokens.insert(r->tokens.end(), ids.begin(), ids.end());
+            r->ref_frame.insert(r->ref_frame.end(), ids.size(), -1);
+        };
+        static const std::string kCard = "{card}", kRefs = "{references}";
+        for (size_t at = 0; at <= inf.tmpl.size();) {
+            const size_t a = inf.tmpl.find(kCard, at), b = inf.tmpl.find(kRefs, at);
+            const size_t p = std::min(a, b);
+            encode(inf.tmpl.substr(at, p == std::string::npos ? std::string::npos : p - at), true);
+            if (p == std::string::npos) break;
+            if (p == b) {
+                for (int64_t f = 0; f < ref_frames; ++f) {
+                    r->tokens.push_back(0);
+                    r->ref_frame.push_back((int32_t)f);
+                }
+                at = p + kRefs.size();
+            } else {
+                encode(card, false);
+                at = p + kCard.size();
+            }
+        }
+        if ((int64_t)r->tokens.size() > inf.max_prompt) {
+            if (why) *why = "the prompt is longer than this tenant takes";
+            return RAD_E_INVAL;
+        }
+        r->ref_audio = std::move(ref_audio);
+        r->ref_cu = std::move(ref_cu);
+        r->seed = std::hash<std::string>{}(start.session_id);
+        int32_t lane = -1;
+        const int st = gen->open(std::move(r), &lane, why);
+        if (st < 0 || lane < 0) return st < 0 ? st : RAD_E_STATE;
+        auto l = std::make_unique<EngineDuplexLane>();
+        l->gen = gen;
+        l->tok = tok;
+        l->lane = lane;
+        out->reset(l.release());
+        return RAD_OK;
+    }
+};
+
+std::shared_ptr<DuplexTenant> make_engine_duplex_tenant(IDuplexGen* gen, ITokenizer* tok) {
+    if (!gen) return nullptr;
+    auto t = std::make_shared<EngineDuplexTenant>();
+    t->gen = gen;
+    t->tok = tok;
+    t->inf = gen->info();
+    return t;
+}
+
 }  /* namespace */
 
 std::shared_ptr<DuplexTenant> make_echo_tenant(int max_lanes) {
@@ -153,6 +320,7 @@ void Server::init_duplex_tenants() {
             if (s->tenant->info().name == name) return;
         duplex_tenants_.emplace_back(new DuplexTenantSlot(std::move(t)));
     };
+    add(make_engine_duplex_tenant(deps_.duplex, deps_.tok));
     for (const auto& t : opt_.duplex_tenants) add(t);
     if (opt_.duplex_test_tenants) {
         const int lanes = (int)std::max<int64_t>(1, opt_.duplex_max_lanes);
@@ -323,6 +491,9 @@ bool Server::duplex_loop(DuplexSession& s, WsConn& ws) {
             RAD_WARN("duplex %s: the tenant could not open the lane: %s", s.id.c_str(),
                      log_sanitize(why).c_str());
             s.release();
+            if (st == RAD_E_FULL)
+                return fail("session_limit",
+                            "the tenant has no lane or KV left; try again later", 1013);
             return fail("internal", "the tenant could not open the session", 1011);
         }
         s.lane = std::move(lane);

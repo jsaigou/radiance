@@ -411,6 +411,7 @@ json Server::capabilities() const {
     caps["image_generation"] = deps_.images != nullptr;
     caps["image_edit"]       = deps_.images != nullptr && deps_.images->info().max_refs > 0;
     caps["audio_generation"] = deps_.audio != nullptr;
+    caps["duplex"]           = deps_.duplex != nullptr;
     caps["video_generation"] = deps_.videos != nullptr;
     caps["shape_generation"] = deps_.shapes != nullptr;
     /* The decision protocol /v1/systemone serves (ServerOptions::decision_type), so a proxy can
