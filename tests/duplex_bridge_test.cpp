@@ -7,8 +7,10 @@
 #include "server_fakes.h"
 #include "mm/media.h"
 
+#include <cmath>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <mutex>
 #include <thread>
 
@@ -67,6 +69,13 @@ struct Reply {
     std::string text;
     std::string audio;
 };
+
+float audio_at(const std::string& bytes, size_t i) {
+    float f = 0.0f;
+    if (i * sizeof(float) + sizeof(float) <= bytes.size())
+        std::memcpy(&f, bytes.data() + i * sizeof(float), sizeof f);
+    return f;
+}
 
 bool decode_reply(const std::string& m, Reply* r) {
     if (m.size() < 9) return false;
@@ -176,6 +185,9 @@ struct FakeDuplex : IDuplexGen {
     int open_rc = RAD_OK;
     bool no_audio = false;
     int32_t token = -1;
+    bool host_text = false;
+    std::string text;
+    std::vector<float> reply_audio;
 
     FakeDuplex() {
         inf.name = "plugin";
@@ -208,8 +220,10 @@ struct FakeDuplex : IDuplexGen {
              std::string*) override {
         DuplexGenReply r;
         r.status = no_audio ? 1 : 0;
-        if (!no_audio) r.audio = in;
+        if (!no_audio) r.audio = reply_audio.empty() ? in : reply_audio;
         r.token = token;
+        r.text = text;
+        r.host_text = host_text;
         *out = std::move(r);
         return RAD_OK;
     }
@@ -378,6 +392,87 @@ TEST(a_step_maps_audio_and_a_text_token_to_text) {
     CHECK_EQ(r.flags, 3);
     CHECK_EQ(r.text, std::string("A"));
     CHECK(r.audio == sent.substr(4));
+}
+
+/* A host-sampled reply carries the source's detokenized delta; an empty delta clears bit 1. */
+TEST(a_host_text_reply_uses_the_stream_delta) {
+    FakeDuplex gen;
+    gen.token = 65;                 /* 'A' in FakeTokenizer, deliberately not the host text */
+    gen.host_text = true;
+    gen.text = "Z";
+    Fixture f(Fixture::Tweak{ [&](ServerOptions&, Deps& d) { d.duplex = &gen; } });
+    Session s(f);
+    s.conn.client(start_json("plugin"));
+    REQUIRE(!s.conn.wait_for("ready").is_null());
+    s.conn.binary(frame(0, samples(3)));
+    Reply r;
+    REQUIRE(decode_reply(s.conn.wait_binary(0), &r));
+    CHECK_EQ(r.flags, 3);
+    CHECK_EQ(r.text, std::string("Z"));
+}
+
+TEST(an_empty_host_text_clears_the_text_flag) {
+    FakeDuplex gen;
+    gen.token = 65;
+    gen.host_text = true;
+    gen.text = "";
+    Fixture f(Fixture::Tweak{ [&](ServerOptions&, Deps& d) { d.duplex = &gen; } });
+    Session s(f);
+    s.conn.client(start_json("plugin"));
+    REQUIRE(!s.conn.wait_for("ready").is_null());
+    s.conn.binary(frame(0, samples(3)));
+    Reply r;
+    REQUIRE(decode_reply(s.conn.wait_binary(0), &r));
+    CHECK_EQ(r.flags, 1);
+    CHECK(r.text.empty());
+}
+
+/* A client that asked for no text gets none, but the audio still flows. */
+TEST(start_text_false_suppresses_host_text) {
+    FakeDuplex gen;
+    gen.host_text = true;
+    gen.text = "Z";
+    Fixture f(Fixture::Tweak{ [&](ServerOptions&, Deps& d) { d.duplex = &gen; } });
+    Session s(f);
+    json j = start_json("plugin");
+    j["text"] = false;
+    s.conn.client(j);
+    REQUIRE(!s.conn.wait_for("ready").is_null());
+    s.conn.binary(frame(0, samples(3)));
+    Reply r;
+    REQUIRE(decode_reply(s.conn.wait_binary(0), &r));
+    CHECK_EQ(r.flags, 1);
+    CHECK(r.text.empty());
+}
+
+/* The one engine-to-wire conversion clamps to [-1, 1] and maps non-finite values: NaN -> 0,
+ * +inf -> 1, -inf -> -1. */
+TEST(engine_audio_is_clamped_and_non_finite_values_are_mapped) {
+    FakeDuplex gen;
+    gen.token = -1;
+    gen.reply_audio.assign(3200, 0.5f);
+    gen.reply_audio[0] = 2.0f;
+    gen.reply_audio[1] = -3.0f;
+    gen.reply_audio[2] = std::numeric_limits<float>::quiet_NaN();
+    gen.reply_audio[3] = std::numeric_limits<float>::infinity();
+    gen.reply_audio[4] = -std::numeric_limits<float>::infinity();
+    gen.reply_audio[5] = 0.25f;
+    Fixture f(Fixture::Tweak{ [&](ServerOptions&, Deps& d) { d.duplex = &gen; } });
+    Session s(f);
+    s.conn.client(start_json("plugin"));
+    REQUIRE(!s.conn.wait_for("ready").is_null());
+    s.conn.binary(frame(0, samples(0)));
+    Reply r;
+    REQUIRE(decode_reply(s.conn.wait_binary(0), &r));
+    CHECK_EQ(r.flags, 1);
+    REQUIRE_EQ(r.audio.size(), (size_t)3200 * sizeof(float));
+    CHECK_EQ(audio_at(r.audio, 0), 1.0f);
+    CHECK_EQ(audio_at(r.audio, 1), -1.0f);
+    CHECK_EQ(audio_at(r.audio, 2), 0.0f);
+    CHECK_EQ(audio_at(r.audio, 3), 1.0f);
+    CHECK_EQ(audio_at(r.audio, 4), -1.0f);
+    CHECK_EQ(audio_at(r.audio, 5), 0.25f);
+    CHECK_EQ(audio_at(r.audio, 100), 0.5f);
 }
 
 /* Status 1 is a silent frame: the wire reply has flags = 0. */

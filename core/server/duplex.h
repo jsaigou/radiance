@@ -58,6 +58,11 @@ public:
                      std::string* why) = 0;
 };
 
+/* The lane's deterministic seed from its session id: FNV-1a 64-bit (offset basis
+ * 14695981039346656037, prime 1099511628211), pinned so a replay does not depend on
+ * std::hash's implementation. The host sampler and noise source both start from it. */
+uint64_t duplex_seed(const std::string& session_id);
+
 /* The two test tenants of the contract's section 8, off unless --duplex-test-tenants enables
  * them. Both take no model. */
 std::shared_ptr<DuplexTenant> make_echo_tenant(int max_lanes);

@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -38,6 +39,20 @@
 
 namespace rad {
 namespace server {
+
+/* FNV-1a 64-bit, pinned so replay is independent of the standard library's std::hash. The
+ * constants are FNV's published offset basis and prime; tests/duplex_seed_test.cpp pins the
+ * "a" and "foobar" vectors. */
+uint64_t duplex_seed(const std::string& session_id) {
+    constexpr uint64_t kOffset = 14695981039346656037ULL;
+    constexpr uint64_t kPrime = 1099511628211ULL;
+    uint64_t h = kOffset;
+    for (unsigned char c : session_id) {
+        h ^= (uint64_t)c;
+        h *= kPrime;
+    }
+    return h;
+}
 
 namespace {
 
@@ -163,18 +178,32 @@ struct EngineDuplexLane final : DuplexLane {
     ITokenizer* tok = nullptr;
     int32_t     lane = -1;
     uint64_t    last_seq = 0;
+    bool        want_text = false;   /* start.text and the tenant's text capability */
 
     DuplexReply map(const DuplexGenReply& r) const {
         if (r.status < 0) throw std::runtime_error("the duplex engine failed the lane");
         DuplexReply out;
         if (r.status == 0) {
             out.audio = r.audio;
+            for (float& x : out.audio) {
+                /* The plugin cannot clamp (no constant-bound op); the reference clamps every
+                 * decoded frame to [-1, 1] (.haru-ref/session.py:163). One documented rule for
+                 * non-finite values as well, so the wire never carries NaN or infinity. */
+                if (std::isnan(x)) x = 0.0f;
+                else if (std::isinf(x)) x = std::copysign(1.0f, x);
+                else x = std::clamp(x, -1.0f, 1.0f);
+            }
         } else if (r.status == 1) {
             /* A silent frame: the wire carries flags = 0. */
         } else {
             throw std::runtime_error("the duplex engine returned an invalid status");
         }
-        if (r.token >= 0) {
+        if (r.host_text) {
+            /* Already detokenized by the host source; an empty delta is a valid reply with the
+             * text bit clear. */
+            if (want_text) out.text = r.text;
+        } else if (r.token >= 0) {
+            /* Plugin-sampling tenants keep the server's per-token decode. */
             std::string text;
             if (!gen->decode_token(r.token, &text) && tok)
                 text = tok->decode(std::vector<int32_t>{ r.token });
@@ -288,7 +317,7 @@ struct EngineDuplexTenant final : DuplexTenant {
         }
         r->ref_audio = std::move(ref_audio);
         r->ref_cu = std::move(ref_cu);
-        r->seed = std::hash<std::string>{}(start.session_id);
+        r->seed = duplex_seed(start.session_id);
         int32_t lane = -1;
         const int st = gen->open(std::move(r), &lane, why);
         if (st < 0 || lane < 0) return st < 0 ? st : RAD_E_STATE;
@@ -296,6 +325,7 @@ struct EngineDuplexTenant final : DuplexTenant {
         l->gen = gen;
         l->tok = tok;
         l->lane = lane;
+        l->want_text = start.text && inf.text;
         out->reset(l.release());
         return RAD_OK;
     }

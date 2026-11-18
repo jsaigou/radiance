@@ -55,6 +55,8 @@ int EngineDuplexBridge::step(int32_t lane, const std::vector<float>& samples, ui
     out->audio = std::move(r.audio);
     out->token = r.token;
     out->status = r.status;
+    out->text = std::move(r.text);
+    out->host_text = r.host_text;
     return RAD_OK;
 }
 
@@ -78,6 +80,8 @@ int EngineDuplexBridge::flush(int32_t lane, uint64_t seq, DuplexGenReply* out,
     out->audio = std::move(r.audio);
     out->token = r.token;
     out->status = r.status;
+    out->text = std::move(r.text);
+    out->host_text = r.host_text;
     return RAD_OK;
 }
 

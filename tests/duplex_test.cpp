@@ -293,6 +293,26 @@ TEST(echo_returns_each_frame_bit_exact) {
     }
 }
 
+/* The echo tenant is bit-exact by contract: the engine-path clamp must not touch it, even for a
+ * sample outside the client's stated [-1, 1] range. */
+TEST(echo_is_not_clamped) {
+    Fixture f(Fixture::Tweak{ [](ServerOptions& o, Deps&) { o.duplex_test_tenants = true; } });
+    Session s(f);
+    s.conn.client(start_json("echo"));
+    REQUIRE(!s.conn.wait_for("ready").is_null());
+    std::vector<float> loud = samples(7);
+    loud[0] = 2.0f;
+    loud[1] = -3.0f;
+    const std::string sent = frame(0, loud);
+    s.conn.binary(sent);
+    const std::string got = s.conn.wait_binary(0);
+    REQUIRE(!got.empty());
+    Reply r;
+    REQUIRE(decode_reply(got, &r));
+    CHECK_EQ(r.flags, 1);
+    CHECK(r.audio == sent.substr(4));
+}
+
 TEST(echo1_holds_one_frame_and_flush_returns_it) {
     Fixture f(Fixture::Tweak{ [](ServerOptions& o, Deps&) { o.duplex_test_tenants = true; } });
     Session s(f);

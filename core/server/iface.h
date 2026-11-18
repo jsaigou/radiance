@@ -790,11 +790,14 @@ struct DuplexGenRequest {
 };
 
 /* One lane operation's answer: status 0 has an audio frame, 1 has none (audio is empty), < 0 is a
- * failed lane. `token` is the optional text token, -1 for none. */
+ * failed lane. `token` is the optional text token, -1 for none. `text` is the host stream's
+ * detokenized delta when `host_text` is true; otherwise the server decodes `token` itself. */
 struct DuplexGenReply {
     std::vector<float> audio;
     int32_t            token = -1;
     int32_t            status = 0;
+    std::string        text;
+    bool               host_text = false;
 };
 
 /* IDuplexGen::step or flush returns this when the engine did not finish inside its bound. The
