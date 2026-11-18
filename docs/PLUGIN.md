@@ -420,6 +420,15 @@ says so with `RAD_ARCH_SERVES_IMPORTS(0)` (`qwen35_w8a8` does), and imports keep
   language is forced and named, and where the transcript starts in the reply. That is all
   `/v1/audio/transcriptions` knows about a model, so a new speech model is a plugin, not a server
   change. Like `rad_arch_chat_format`, the struct grows only at its end, behind its `struct_size`.
+- **A duplex tenant declares its conversation.** `rad_declare_duplex_tenant(b, &RadDuplexDecl)`
+  states the card/reference prompt template, the frame geometry (`sample_rate`,
+  `samples_per_frame`, `frame_rate_num/den`, `latent_dim`), the `max_lanes` conversations it
+  serves, the optional audio-input projectors and the `audio_in`, `audio_out`, `text_out` and
+  `status` device buffers. The core drives `RAD_GEN_PASS_DUPLEX_PROMPT` and
+  `RAD_GEN_PASS_DUPLEX_STEP`; `RadDuplexBatch` carries the lanes, prompt rows, reference frames and
+  step flags. A program declares exactly one of this, the other generators, logits or pooled
+  vectors. The declaration is accepted now; the pass driver and the `/duplex/v1` bridge are
+  follow-ups.
 
 ---
 

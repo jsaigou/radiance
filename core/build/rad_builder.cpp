@@ -1222,6 +1222,11 @@ int Builder::declare_logits(rad_buf b) {
             prog_.sgen_name.c_str());
         return RAD_E_STATE;
     }
+    if (prog_.is_duplex_tenant()) {
+        err(RAD_E_STATE, "declare_logits: this program already declared the duplex tenant '%s'",
+            prog_.dup_str.name.c_str());
+        return RAD_E_STATE;
+    }
     prog_.logits_buf = b;
     return RAD_OK;
 }
@@ -1265,6 +1270,11 @@ int Builder::declare_pooled(rad_buf b) {
     if (prog_.is_shape_generator()) {
         err(RAD_E_STATE, "declare_pooled: this program already declared the shape generator '%s'",
             prog_.sgen_name.c_str());
+        return RAD_E_STATE;
+    }
+    if (prog_.is_duplex_tenant()) {
+        err(RAD_E_STATE, "declare_pooled: this program already declared the duplex tenant '%s'",
+            prog_.dup_str.name.c_str());
         return RAD_E_STATE;
     }
     const RadBufDecl& d = prog_.buffers[b].decl;
@@ -1379,13 +1389,16 @@ int Builder::declare_generator(const RadGeneratorDecl* d) {
         return RAD_E_STATE;
     }
     if (prog_.logits_buf != RAD_NULL_HANDLE || prog_.pooled_buf != RAD_NULL_HANDLE ||
-        prog_.is_audio_generator() || prog_.is_video_generator() || prog_.is_shape_generator()) {
+        prog_.is_audio_generator() || prog_.is_video_generator() || prog_.is_shape_generator() ||
+        prog_.is_duplex_tenant()) {
         err(RAD_E_STATE, "declare_generator '%s': this program already declared %s; a program "
-                         "generates text, embeds, makes images, audio, video or shapes -- one of "
-                         "the six", nm, prog_.logits_buf != RAD_NULL_HANDLE ? "logits"
+                         "generates text, embeds, makes images, audio, video, shapes or serves a "
+                         "duplex tenant -- one of the seven", nm,
+            prog_.logits_buf != RAD_NULL_HANDLE ? "logits"
                 : prog_.pooled_buf != RAD_NULL_HANDLE ? "a pooled output"
                 : prog_.is_audio_generator() ? "an audio generator"
-                : prog_.is_video_generator() ? "a video generator" : "a shape generator");
+                : prog_.is_video_generator() ? "a video generator"
+                : prog_.is_shape_generator() ? "a shape generator" : "a duplex tenant");
         return RAD_E_STATE;
     }
     if (d->layout != RAD_GEN_LAYOUT_JOINT_GRID && d->layout != RAD_GEN_LAYOUT_JOINT_STEP) {
@@ -1537,14 +1550,16 @@ int Builder::declare_audio_generator(const RadAudioGenDecl* d) {
         return RAD_E_STATE;
     }
     if (prog_.logits_buf != RAD_NULL_HANDLE || prog_.pooled_buf != RAD_NULL_HANDLE ||
-        prog_.generator.layout != 0 || prog_.is_video_generator() || prog_.is_shape_generator()) {
+        prog_.generator.layout != 0 || prog_.is_video_generator() || prog_.is_shape_generator() ||
+        prog_.is_duplex_tenant()) {
         err(RAD_E_STATE, "declare_audio_generator '%s': this program already declared %s; a "
-                         "program generates text, embeds, makes images, audio, video or shapes -- "
-                         "one of the six", nm,
+                         "program generates text, embeds, makes images, audio, video, shapes or "
+                         "serves a duplex tenant -- one of the seven", nm,
             prog_.logits_buf != RAD_NULL_HANDLE ? "logits"
                 : prog_.pooled_buf != RAD_NULL_HANDLE ? "a pooled output"
                 : prog_.generator.layout != 0 ? "an image generator"
-                : prog_.is_video_generator() ? "a video generator" : "a shape generator");
+                : prog_.is_video_generator() ? "a video generator"
+                : prog_.is_shape_generator() ? "a shape generator" : "a duplex tenant");
         return RAD_E_STATE;
     }
     if (!d->tmpl && !d->tmpl_plain) {
@@ -1715,14 +1730,16 @@ int Builder::declare_video_generator(const RadVideoGenDecl* d) {
         return RAD_E_STATE;
     }
     if (prog_.logits_buf != RAD_NULL_HANDLE || prog_.pooled_buf != RAD_NULL_HANDLE ||
-        prog_.generator.layout != 0 || prog_.is_audio_generator() || prog_.is_shape_generator()) {
+        prog_.generator.layout != 0 || prog_.is_audio_generator() || prog_.is_shape_generator() ||
+        prog_.is_duplex_tenant()) {
         err(RAD_E_STATE, "declare_video_generator '%s': this program already declared %s; a "
-                         "program generates text, embeds, makes images, audio, video or shapes -- "
-                         "one of the six", nm,
+                         "program generates text, embeds, makes images, audio, video, shapes or "
+                         "serves a duplex tenant -- one of the seven", nm,
             prog_.logits_buf != RAD_NULL_HANDLE ? "logits"
                 : prog_.pooled_buf != RAD_NULL_HANDLE ? "a pooled output"
                 : prog_.generator.layout != 0 ? "an image generator"
-                : prog_.is_audio_generator() ? "an audio generator" : "a shape generator");
+                : prog_.is_audio_generator() ? "an audio generator"
+                : prog_.is_shape_generator() ? "a shape generator" : "a duplex tenant");
         return RAD_E_STATE;
     }
     if (!d->tmpl || !std::strstr(d->tmpl, "{prompt}") || d->max_text <= 0) {
@@ -1953,14 +1970,16 @@ int Builder::declare_shape_generator(const RadShapeGenDecl* d) {
         return RAD_E_STATE;
     }
     if (prog_.logits_buf != RAD_NULL_HANDLE || prog_.pooled_buf != RAD_NULL_HANDLE ||
-        prog_.generator.layout != 0 || prog_.is_audio_generator() || prog_.is_video_generator()) {
+        prog_.generator.layout != 0 || prog_.is_audio_generator() ||
+        prog_.is_video_generator() || prog_.is_duplex_tenant()) {
         err(RAD_E_STATE, "declare_shape_generator '%s': this program already declared %s; a "
-                         "program generates text, embeds, makes images, audio, video or shapes -- "
-                         "one of the six", nm,
+                         "program generates text, embeds, makes images, audio, video, shapes or "
+                         "serves a duplex tenant -- one of the seven", nm,
             prog_.logits_buf != RAD_NULL_HANDLE ? "logits"
                 : prog_.pooled_buf != RAD_NULL_HANDLE ? "a pooled output"
                 : prog_.generator.layout != 0 ? "an image generator"
-                : prog_.is_audio_generator() ? "an audio generator" : "a video generator");
+                : prog_.is_audio_generator() ? "an audio generator"
+                : prog_.is_video_generator() ? "a video generator" : "a duplex tenant");
         return RAD_E_STATE;
     }
     if (d->canvas < 1 || d->canvas > 4096 || !(d->border_ratio >= 0.0 && d->border_ratio < 1.0) ||
@@ -2036,6 +2055,145 @@ int Builder::declare_shape_generator(const RadShapeGenDecl* d) {
     /* As for the other generators: the Program is moved after declare; the name lives in
      * sgen_name. */
     prog_.shape_gen.name = nullptr;
+    return RAD_OK;
+}
+
+/* Validated at declare for the reasons the audio generator is: a buffer too small for a lane's
+ * frame, a frame rate that does not follow from the sample rate, or a template the prompt builder
+ * cannot render would otherwise show at the first lane. The driver and server bridge are
+ * follow-ups; accepting the declaration now only records what a plugin has stated. */
+int Builder::declare_duplex_tenant(const RadDuplexDecl* d) {
+    if (finished_) {
+        err(RAD_E_STATE, "declare_duplex_tenant after declare finished");
+        return RAD_E_STATE;
+    }
+    if (!d) { err(RAD_E_INVAL, "declare_duplex_tenant: null declaration"); return RAD_E_INVAL; }
+    const char* nm = d->name && *d->name ? d->name : "(unnamed)";
+    if (prog_.is_duplex_tenant()) {
+        err(RAD_E_STATE, "declare_duplex_tenant: '%s' was already declared; '%s' is a second one",
+            prog_.dup_str.name.c_str(), nm);
+        return RAD_E_STATE;
+    }
+    if (prog_.logits_buf != RAD_NULL_HANDLE || prog_.pooled_buf != RAD_NULL_HANDLE ||
+        prog_.generator.layout != 0 || prog_.is_audio_generator() ||
+        prog_.is_video_generator() || prog_.is_shape_generator()) {
+        err(RAD_E_STATE, "declare_duplex_tenant '%s': this program already declared %s; a "
+                         "program generates text, embeds, makes images, audio, video, shapes or "
+                         "serves a duplex tenant -- one of the seven", nm,
+            prog_.logits_buf != RAD_NULL_HANDLE ? "logits"
+                : prog_.pooled_buf != RAD_NULL_HANDLE ? "a pooled output"
+                : prog_.generator.layout != 0 ? "an image generator"
+                : prog_.is_audio_generator() ? "an audio generator"
+                : prog_.is_video_generator() ? "a video generator" : "a shape generator");
+        return RAD_E_STATE;
+    }
+    if (!d->tmpl) {
+        err(RAD_E_INVAL, "declare_duplex_tenant '%s': no prompt template (tmpl)", nm);
+        return RAD_E_INVAL;
+    }
+    auto count = [](const char* t, const char* k) {
+        int n = 0;
+        for (const char* p = t; (p = std::strstr(p, k)) != nullptr; p += std::strlen(k)) ++n;
+        return n;
+    };
+    if (count(d->tmpl, "{card}") != 1 || count(d->tmpl, "{references}") > 1) {
+        err(RAD_E_INVAL, "declare_duplex_tenant '%s': tmpl needs {card} once and at most one "
+                         "{references}", nm);
+        return RAD_E_INVAL;
+    }
+    if (d->max_lanes <= 0 || d->max_prompt <= 0 || d->max_ref_frames < 0 ||
+        d->sample_rate <= 0 || d->channels <= 0 || d->samples_per_frame <= 0 ||
+        d->latent_dim <= 0 || d->frame_rate_num <= 0 || d->frame_rate_den <= 0) {
+        err(RAD_E_INVAL, "declare_duplex_tenant '%s': max_lanes %lld, max_prompt %lld, "
+                         "max_ref_frames %lld, sample_rate %lld, channels %lld, "
+                         "samples_per_frame %lld, latent_dim %lld, frame_rate_num %lld and "
+                         "frame_rate_den %lld must all be in range", nm,
+            (long long)d->max_lanes, (long long)d->max_prompt, (long long)d->max_ref_frames,
+            (long long)d->sample_rate, (long long)d->channels, (long long)d->samples_per_frame,
+            (long long)d->latent_dim, (long long)d->frame_rate_num,
+            (long long)d->frame_rate_den);
+        return RAD_E_INVAL;
+    }
+    if (d->samples_per_frame * d->frame_rate_num != d->sample_rate * d->frame_rate_den) {
+        err(RAD_E_INVAL, "declare_duplex_tenant '%s': samples_per_frame * frame_rate_num (%lld * "
+                         "%lld) is not sample_rate * frame_rate_den (%lld * %lld)", nm,
+            (long long)d->samples_per_frame, (long long)d->frame_rate_num,
+            (long long)d->sample_rate, (long long)d->frame_rate_den);
+        return RAD_E_INVAL;
+    }
+    if (d->max_lanes > prog_.ctx.max_seqs) {
+        err(RAD_E_INVAL, "declare_duplex_tenant '%s': max_lanes %lld does not fit this build's "
+                         "max_seqs %lld", nm, (long long)d->max_lanes,
+            (long long)prog_.ctx.max_seqs);
+        return RAD_E_INVAL;
+    }
+    if (d->max_prompt > prog_.ctx.max_tok) {
+        err(RAD_E_INVAL, "declare_duplex_tenant '%s': max_prompt %lld rows does not fit this "
+                         "build's max_tok %lld", nm, (long long)d->max_prompt,
+            (long long)prog_.ctx.max_tok);
+        return RAD_E_INVAL;
+    }
+    if (d->max_ref_frames > 0 &&
+        (d->ref_rate <= 0 || d->ref_hop <= 0 || d->ref_hop != d->samples_per_frame)) {
+        err(RAD_E_INVAL, "declare_duplex_tenant '%s': max_ref_frames %lld needs a reference rate "
+                         "(%lld Hz) and ref_hop %lld equal to samples_per_frame %lld", nm,
+            (long long)d->max_ref_frames, (long long)d->ref_rate, (long long)d->ref_hop,
+            (long long)d->samples_per_frame);
+        return RAD_E_INVAL;
+    }
+    if (d->n_audio_in < 0 || d->n_audio_in > 2) {
+        err(RAD_E_INVAL, "declare_duplex_tenant '%s': n_audio_in %d; a tenant declares 0 to 2 "
+                         "audio-input projectors", nm, (int)d->n_audio_in);
+        return RAD_E_INVAL;
+    }
+    for (int i = 0; i < d->n_audio_in; ++i) {
+        const RadDuplexAudioIn& ai = d->audio_ins[i];
+        if (ai.source != RAD_DUPLEX_AUDIO_USER && ai.source != RAD_DUPLEX_AUDIO_MODEL) {
+            err(RAD_E_INVAL, "declare_duplex_tenant '%s': audio_ins[%d].source %d is not "
+                             "RAD_DUPLEX_AUDIO_USER or RAD_DUPLEX_AUDIO_MODEL", nm, i,
+                (int)ai.source);
+            return RAD_E_INVAL;
+        }
+        if (ai.in_dim <= 0 || ai.hidden <= 0 || ai.out_dim <= 0) {
+            err(RAD_E_INVAL, "declare_duplex_tenant '%s': audio_ins[%d] has in_dim %lld, hidden "
+                             "%lld and out_dim %lld; all must be positive", nm, i,
+                (long long)ai.in_dim, (long long)ai.hidden, (long long)ai.out_dim);
+            return RAD_E_INVAL;
+        }
+        if (ai.rms_norm != 0 && ai.rms_norm != 1) {
+            err(RAD_E_INVAL, "declare_duplex_tenant '%s': audio_ins[%d].rms_norm %d is not 0 or 1",
+                nm, i, (int)ai.rms_norm);
+            return RAD_E_INVAL;
+        }
+    }
+    auto buf_ok = [&](rad_buf h, uint32_t dtype, int64_t numel, const char* what) {
+        if (h == RAD_NULL_HANDLE || (size_t)h >= prog_.buffers.size()) {
+            err(RAD_E_INVAL, "declare_duplex_tenant '%s': %s %u is not a declared buffer", nm,
+                what, (unsigned)h);
+            return false;
+        }
+        const RadBufDecl& ob = prog_.buffers[h].decl;
+        if (ob.dtype != dtype || ob.domain != RAD_DOMAIN_DEVICE ||
+            decl_numel(ob.rank, ob.shape) < numel) {
+            err(RAD_E_INVAL, "declare_duplex_tenant '%s': %s '%s' must be a device %s buffer of "
+                             "at least %lld elements", nm, what, prog_.buffers[h].name.c_str(),
+                dtype == RAD_I32 ? "i32" : "f32", (long long)numel);
+            return false;
+        }
+        return true;
+    };
+    const int64_t frame_samples = d->max_lanes * d->samples_per_frame;
+    if (!buf_ok(d->audio_in, RAD_F32, frame_samples, "audio_in") ||
+        !buf_ok(d->audio_out, RAD_F32, frame_samples, "audio_out") ||
+        !buf_ok(d->status, RAD_I32, d->max_lanes, "status") ||
+        (d->text && !buf_ok(d->text_out, RAD_I32, d->max_lanes, "text_out")))
+        return RAD_E_INVAL;
+    prog_.dup_str.name = nm;
+    prog_.dup_str.tmpl = d->tmpl;
+    prog_.duplex = *d;
+    /* The Program is moved after declare; the strings live in dup_str. */
+    prog_.duplex.name = nullptr;
+    prog_.duplex.tmpl = nullptr;
     return RAD_OK;
 }
 
@@ -2884,6 +3042,11 @@ int rad_declare_video_generator(RadBuilder* b, const RadVideoGenDecl* d) {
 int rad_declare_shape_generator(RadBuilder* b, const RadShapeGenDecl* d) {
     if (!b) return RAD_E_INVAL;
     return B(b)->declare_shape_generator(d);
+}
+
+int rad_declare_duplex_tenant(RadBuilder* b, const RadDuplexDecl* d) {
+    if (!b) return RAD_E_INVAL;
+    return B(b)->declare_duplex_tenant(d);
 }
 
 void rad_note(RadBuilder* b, const char* f, ...) {

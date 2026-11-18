@@ -461,10 +461,17 @@ public:
     RadShapeGenDecl shape_gen{};
     std::string     sgen_name;
     bool is_shape_generator() const { return shape_gen.max_lanes != 0; }
-    /* Driven by passes, not token steps: any generator. */
+    /* The declared duplex tenant (rad_declare_duplex_tenant); `max_lanes` 0 when none. Its strings
+     * point at `dup_str`, as the audio generator's do at `agen_str`. */
+    RadDuplexDecl duplex{};
+    struct DuplexStrings {
+        std::string name, tmpl;
+    } dup_str;
+    bool is_duplex_tenant() const { return duplex.max_lanes != 0; }
+    /* Driven by passes, not token steps: any generator or the duplex tenant. */
     bool is_pass_driven() const {
         return is_generator() || is_audio_generator() || is_video_generator() ||
-               is_shape_generator();
+               is_shape_generator() || is_duplex_tenant();
     }
 
     /* Two arenas, because a host-site activation cannot index device memory. The buffer plan

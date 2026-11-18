@@ -2049,6 +2049,14 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     const bool video_gen = ranks_[0]->program.is_video_generator();
     const bool shape_gen = ranks_[0]->program.is_shape_generator();
     const bool generator = ranks_[0]->program.is_pass_driven();
+    /* The duplex tenant's declaration and probe exist, but its pass driver and server bridge are
+     * follow-ups. Refuse it by name before any generator driver is constructed; accepting the
+     * declaration must not turn into an image-generator driver running a duplex graph. */
+    if (ranks_[0]->program.is_duplex_tenant()) {
+        RAD_ERR("the '%s' plugin declares a duplex tenant (rad_declare_duplex_tenant), which this "
+                "engine has no driver for yet", plugins_.arch_plugin.c_str());
+        return RAD_E_UNSUPPORTED;
+    }
     if (ranks_[0]->program.logits_buf == RAD_NULL_HANDLE && !embedding_ && !generator) {
         RAD_ERR("the '%s' plugin declared no logits buffer (rad_declare_logits), no pooled output "
                 "(rad_declare_pooled) and no generator (rad_declare_generator, "

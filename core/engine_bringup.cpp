@@ -1142,6 +1142,27 @@ int Engine::declare() {
             if (cfg_.mm_max_patches < 0) cfg_.mm_max_patches = 0;
             if (cfg_.n_spec < 0) cfg_.n_spec = 0;
             cfg_.prefix_cache = false;
+        } else if (pb.gen_rows > 0 && pb.gen_duplex) {
+            if (!cfg_.given.count("--max-num-batched-tokens")) {
+                cfg_.max_tok = pb.gen_rows;
+                decide("--max-num-batched-tokens", std::to_string(cfg_.max_tok),
+                       "a duplex tenant: its largest prompt or step pass");
+            }
+            /* The lanes are the declaration's max_lanes, which is checked against max_seqs at
+             * declare; this only keeps the default from sizing a whole piece's pool for a
+             * conversation. */
+            if (!cfg_.given.count("--max-num-seqs")) {
+                cfg_.max_seqs = 8;
+                decide("--max-num-seqs", "8", "a duplex tenant: its conversations at once");
+            }
+            if (!cfg_.given.count("--max-model-len") && cfg_.max_ctx == 0) {
+                cfg_.max_ctx = pb.gen_ctx > 0 ? pb.gen_ctx : pb.gen_rows;
+                decide("--max-model-len", std::to_string(cfg_.max_ctx),
+                       "a duplex tenant: the prompt and a lane's live context");
+            }
+            if (cfg_.mm_max_patches < 0) cfg_.mm_max_patches = 0;
+            if (cfg_.n_spec < 0) cfg_.n_spec = 0;
+            cfg_.prefix_cache = false;
         } else if (pb.gen_rows > 0 && pb.gen_shape) {
             if (!cfg_.given.count("--max-num-batched-tokens")) {
                 cfg_.max_tok = pb.gen_rows;
