@@ -681,12 +681,27 @@ typedef struct RadDuplexBatch {
     const int32_t*  ref_frame;
     const int32_t*  ref_frame_h;
 
-    /* STEP: the live frame number, the lane's seed, and RAD_DUPLEX_F_*. */
+    /* STEP: the live frame number, the lane's seed, and RAD_DUPLEX_F_*. `seed` is staged as two
+     * 32-bit words a lane: seed[2*i] is the low half and seed[2*i+1] the high half of lane i's
+     * 64-bit seed, so it does not alias the next lane's value. */
     const int32_t*  frame;
     const int32_t*  frame_h;
     const uint32_t* seed;
     const int32_t*  flags;
     const int32_t*  flags_h;
+
+    /* ---- ABI 39: host-provided noise, when the declaration sets host_sampling. ------------
+     * PROMPT: codec_noise is [n_tok, latent_dim]; row t is read only when ref_frame[t] >= 0.
+     *         head_noise is [n_lane, latent_dim]; row i is frame 0's head noise.
+     * STEP:   codec_noise is [n_lane, latent_dim]; head_noise is [n_lane, latent_dim]; row i
+     *         belongs to lane lane_h[i].
+     * codec_noise is the combined term the codec's sample adds; head_noise is the raw vector
+     * the MeanFlow head starts from. Both are device pointers; the _h forms are host staging
+     * valid only inside next()/the pass. */
+    const float*    codec_noise;
+    const float*    codec_noise_h;
+    const float*    head_noise;
+    const float*    head_noise_h;
 } RadDuplexBatch;
 
 /* What a video generator's pass carries beside the step batch's own fields (rad_builder.h,

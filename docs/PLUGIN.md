@@ -427,8 +427,10 @@ says so with `RAD_ARCH_SERVES_IMPORTS(0)` (`qwen35_w8a8` does), and imports keep
   `status` device buffers. The core drives `RAD_GEN_PASS_DUPLEX_PROMPT` and
   `RAD_GEN_PASS_DUPLEX_STEP`; `RadDuplexBatch` carries the lanes, prompt rows, reference frames and
   step flags. A program declares exactly one of this, the other generators, logits or pooled
-  vectors. The declaration is accepted now; the pass driver and the `/duplex/v1` bridge are
-  follow-ups.
+  vectors. ABI 39 adds host-side text sampling: `host_sampling`, `n_vocab`, the PAD/EOP/EOS ids,
+  `logits_out`, `pad_eop_out` and `text_in` in the declaration, and host-provided `codec_noise` and
+  `head_noise` in the batch. The plugin writes the row's logits; the host samples and feeds the
+  token back.
 
 ### Running the test-only duplex plugin
 

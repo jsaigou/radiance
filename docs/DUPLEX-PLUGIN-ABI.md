@@ -777,3 +777,43 @@ Sizes are rough engineer-effort estimates, not calendar promises.
 
 Stages 0-2 can proceed without a model and are the right first merge: they make the seam and the
 ABI reviewable while the model work is still exploratory.
+
+---
+
+## 8. ABI 39 addendum: host-side text sampling and host noise
+
+The v0 note above is the ABI-38 design. The assembled Haru tenant needs the host, not the plugin,
+to sample text, because DRY, the PAD/EOP replacement, `eop_bias` and the temperature/top-k/top-p
+sampler belong to the session policy. ABI 39 appends (never moves) the following fields:
+
+`RadDuplexDecl`, after `status`:
+
+```c
+int64_t n_vocab;        /* > 0 with host_sampling */
+int32_t host_sampling;  /* 1: the host samples logits_out and writes text_in */
+int32_t pad_id, eop_id, eos_id;   /* -1 when unused */
+rad_buf logits_out;     /* f32 [max_lanes, n_vocab] device */
+rad_buf pad_eop_out;    /* f32 [max_lanes, 2] device */
+rad_buf text_in;        /* i32 [max_lanes] device */
+```
+
+`RadDuplexBatch`, after `flags_h`:
+
+```c
+const float* codec_noise;
+const float* codec_noise_h;
+const float* head_noise;
+const float* head_noise_h;
+```
+
+The plugin writes the current model row's raw f32 logits and the f32 PAD/EOP pair. The host applies
+DRY, replaces the PAD/EOP entries, adds `eop_bias`, samples, and writes the chosen token to
+`text_in[lane]`; the next STEP's embedding reads it. `text_out` is unused when
+`host_sampling = 1`. `codec_noise` is the combined term added to the codec's latent means
+(`scale * (latent_std / 0.8) * raw`), one row per reference row on PROMPT and one row a lane on
+STEP; `head_noise` is the raw vector the MeanFlow head starts from. Both are host inputs in
+production (seed-derived) and in teacher-forced tests (recorded values); no RNG lives in a block.
+
+`RadDuplexBatch::seed` is now documented as two 32-bit words a lane: `seed[2*i]` low,
+`seed[2*i+1]` high. ABI 39 regenerates the layout table and moves `RAD_ABI_VERSION` to 39; see
+`abi/rad_abi_layout_rows.h` and `tests/abi_layout_table.h`.

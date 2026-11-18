@@ -1,4 +1,4 @@
-/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 38 and
+/* abi_layout_table.h -- every abi/ struct's size and field offsets at RAD_ABI_VERSION 39 and
  * RAD_FORMAT_VER 2, as { type, field, offset, size } rows ("" is the struct itself). A snapshot
  * of the headers on x86-64 Linux, which abi_layout_test.cpp holds the layout to; regenerate it
  * from the test's printout only together with a version bump. */
@@ -313,7 +313,7 @@
 { "RadDuplexAudioIn", "hidden", 16, 8 },
 { "RadDuplexAudioIn", "out_dim", 24, 8 },
 { "RadDuplexAudioIn", "rms_norm", 32, 4 },
-{ "RadDuplexBatch", "", 0, 144 },
+{ "RadDuplexBatch", "", 0, 176 },
 { "RadDuplexBatch", "n_lane", 0, 8 },
 { "RadDuplexBatch", "lane", 8, 8 },
 { "RadDuplexBatch", "lane_h", 16, 8 },
@@ -332,7 +332,11 @@
 { "RadDuplexBatch", "seed", 120, 8 },
 { "RadDuplexBatch", "flags", 128, 8 },
 { "RadDuplexBatch", "flags_h", 136, 8 },
-{ "RadDuplexDecl", "", 0, 216 },
+{ "RadDuplexBatch", "codec_noise", 144, 8 },
+{ "RadDuplexBatch", "codec_noise_h", 152, 8 },
+{ "RadDuplexBatch", "head_noise", 160, 8 },
+{ "RadDuplexBatch", "head_noise_h", 168, 8 },
+{ "RadDuplexDecl", "", 0, 256 },
 { "RadDuplexDecl", "name", 0, 8 },
 { "RadDuplexDecl", "tmpl", 8, 8 },
 { "RadDuplexDecl", "max_prompt", 16, 8 },
@@ -353,6 +357,14 @@
 { "RadDuplexDecl", "audio_out", 200, 4 },
 { "RadDuplexDecl", "text_out", 204, 4 },
 { "RadDuplexDecl", "status", 208, 4 },
+{ "RadDuplexDecl", "n_vocab", 216, 8 },
+{ "RadDuplexDecl", "host_sampling", 224, 4 },
+{ "RadDuplexDecl", "pad_id", 228, 4 },
+{ "RadDuplexDecl", "eop_id", 232, 4 },
+{ "RadDuplexDecl", "eos_id", 236, 4 },
+{ "RadDuplexDecl", "logits_out", 240, 4 },
+{ "RadDuplexDecl", "pad_eop_out", 244, 4 },
+{ "RadDuplexDecl", "text_in", 248, 4 },
 { "RadEncPlane", "", 0, 64 },
 { "RadEncPlane", "role", 0, 24 },
 { "RadEncPlane", "dtype", 24, 4 },

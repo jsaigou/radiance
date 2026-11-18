@@ -1656,6 +1656,23 @@ typedef struct RadDuplexDecl {
      * silent frame); audio_out is not read. < 0: fatal. This is a comment-only meaning, not a
      * layout change. */
     rad_buf     status;
+
+    /* ---- ABI 39: host-side text sampling. ------------------------------------------------
+     * A tenant that sets host_sampling leaves the text decision to the host: the plugin writes
+     * the current model row's raw f32 logits to logits_out[lane] and the f32 PAD/EOP pair to
+     * pad_eop_out[lane], and the host applies DRY, the PAD/EOP replacement, eop_bias and the
+     * temperature/top-k/top-p sampler, then writes the chosen token to text_in[lane] for the
+     * next STEP. text_out is then unused. All four handles are device buffers the plugin
+     * declares; `n_vocab` is the logits row length. The token ids let the host apply the
+     * reference's PAD/EOP/EOS rules without a second metadata channel; -1 means "unused". */
+    int64_t     n_vocab;        /* > 0 when host_sampling is 1; the logits row length */
+    int32_t     host_sampling;  /* 1: the host samples logits_out and writes text_in */
+    int32_t     pad_id;         /* the PAD token id, or -1 */
+    int32_t     eop_id;         /* the EOP token id, or -1 */
+    int32_t     eos_id;         /* the EOS token id, or -1 */
+    rad_buf     logits_out;     /* f32 [max_lanes, n_vocab], device */
+    rad_buf     pad_eop_out;    /* f32 [max_lanes, 2], device */
+    rad_buf     text_in;        /* i32 [max_lanes], device; host writes */
 } RadDuplexDecl;
 
 int rad_declare_duplex_tenant(RadBuilder* b, const RadDuplexDecl* d);
