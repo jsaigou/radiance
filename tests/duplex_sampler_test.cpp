@@ -374,3 +374,5 @@ TEST(sampler_mutation_checks) {
         CHECK(loose_token != strict_token);
     }
 }
+
+RAD_TEST_MAIN()
