@@ -594,6 +594,18 @@ int Server::submit_all(const OaiRequest& r, std::vector<Generation>* gens, ApiEr
         err->n_prompt_tokens = (int64_t)r.prompts[(size_t)g.prompt_index].tokens.size();
         return RAD_E_FULL;
     }
+    /* Refused at admission as invalid, with the scheduler's reason on the sink (a prompt token id
+     * outside the vocabulary): the client's error, a 400 and not "the engine failed this request". */
+    for (size_t i = 0; i < ids.size(); ++i) {
+        const Generation& g = (*gens)[first + i];
+        if (ids[i] != 0 || g.sink->status() != RAD_E_INVAL || !g.sink->why()) continue;
+        const size_t pl = std::strlen(kInvalidRequestPrefix);
+        if (std::strncmp(g.sink->why(), kInvalidRequestPrefix, pl) != 0) continue;
+        const std::string why = g.sink->why() + pl;
+        cancel_all(*gens, false);
+        *err = err_bad("prompt", why);
+        return RAD_E_INVAL;
+    }
     return RAD_OK;
 }
 

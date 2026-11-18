@@ -331,6 +331,12 @@ int Scheduler::add_locked(std::unique_ptr<Request> r) {
         if (t < 0 || t >= prog_->meta.n_vocab) {
             RAD_WARN("request %llu refused: prompt token id %d is outside the vocabulary [0, %lld)",
                      (unsigned long long)r->id, t, (long long)prog_->meta.n_vocab);
+            /* The client's mistake, so the sink says why and the server answers it as a 400
+             * (Server::submit_all) instead of a 500 "the engine failed this request". */
+            char why[200];
+            std::snprintf(why, sizeof why, "%sprompt token id %d is outside the model's vocabulary [0, %lld)",
+                          server::kInvalidRequestPrefix, t, (long long)prog_->meta.n_vocab);
+            server::sink_fail_copy(r->sink, RAD_E_INVAL, why);
             return RAD_E_INVAL;
         }
     /* Nor could a prompt the KV pool cannot hold even alone: admission takes only what the pool

@@ -1331,6 +1331,35 @@ TEST(a_prompt_names_real_vocabulary_rows) {
     for (int i = 1; i < 5; ++i) CHECK_EQ(rc[i], RAD_E_INVAL);
 }
 
+/* The refusal above is the client's mistake, so the sink carries the reason and its status: the
+ * server answers a failed sink at admission with RAD_E_INVAL as a 400 naming the id, where an
+ * engine failure is a 500. An admissible prompt leaves its sink alone. */
+TEST(a_prompt_id_outside_the_vocabulary_fails_its_sink_with_the_reason) {
+    Fixture f;
+    f.build(/*blocks=*/20, /*states=*/64);
+    CHECK_OK(f.start());
+    const int32_t n_vocab = (int32_t)f.prog.meta.n_vocab;
+    server::Sink bad, good;
+    std::unique_ptr<Request> rs[2];
+    for (int i = 0; i < 2; ++i) {
+        rs[i] = std::make_unique<Request>();
+        rs[i]->id = f.next_id++;
+        rs[i]->max_tokens = 1;
+        rs[i]->prompt = i == 0 ? std::vector<int32_t>{ 5, n_vocab } : std::vector<int32_t>{ 5, 6 };
+        rs[i]->sink = i == 0 ? static_cast<void*>(&bad) : static_cast<void*>(&good);
+    }
+    int rc[2] = { -1, -1 };
+    f.sch.add_all(rs, 2, rc);
+    CHECK_EQ(rc[0], RAD_E_INVAL);
+    CHECK_EQ(rc[1], RAD_OK);
+    CHECK_EQ(bad.status(), RAD_E_INVAL);
+    REQUIRE(bad.why() != nullptr);
+    CHECK(std::string(bad.why()).rfind(server::kInvalidRequestPrefix, 0) == 0);
+    CHECK(std::string(bad.why()).find("outside the model's vocabulary") != std::string::npos);
+    CHECK(std::string(bad.why()).find(std::to_string(n_vocab)) != std::string::npos);
+    CHECK(!good.done());
+}
+
 TEST(a_prefix_hit_starts_the_request_at_the_last_usable_checkpoint) {
     Fixture f;
     f.build();

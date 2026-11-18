@@ -81,6 +81,10 @@ public:
     void finish(Finish f);
     /* `why` is a client-readable sentence that outlives the sink (a literal), or null. */
     void fail(int rad_status, const char* why = nullptr);
+    /* fail() with a reason built at run time: `why` is stored as a pointer, so it must outlive the
+     * sink, and a reason that names a value cannot be a literal. This copies it (truncated to the
+     * buffer) into the sink first. One writer, before the sink finishes, like fail(). */
+    void fail_copy(int rad_status, const char* why);
 
     /* The scheduler polls this to learn the client hung up, then frees the blocks (spec §14).
      * IScheduler::cancel() also tells it; this is the cheap path with no lookup. */
@@ -166,6 +170,7 @@ private:
     std::atomic<int>      finish_{(int)Finish::None};
     std::atomic<int>      status_{RAD_OK};
     std::atomic<const char*> why_{nullptr};
+    char why_buf_[192] = {};
     std::atomic<bool>     overflow_{false};
     std::atomic<bool>     cancel_{false};
     std::atomic<bool>     quiesced_{false};   /* the producer will not touch this object again */
@@ -199,8 +204,17 @@ inline bool sink_push(void* s, int32_t token, const TokenLogprobs* lp = nullptr)
 inline void sink_finish(void* s, Finish f) {
     if (s) static_cast<Sink*>(s)->finish(f);
 }
+/* A request the scheduler refuses at admission because of what the client sent (a prompt id outside
+ * the vocabulary) fails its sink with RAD_E_INVAL and a reason that starts with this prefix; the
+ * server then answers a 400 naming the reason. Any other refusal stays "the engine failed this
+ * request" (a 500), because there the fault may be ours. */
+inline constexpr char kInvalidRequestPrefix[] = "invalid request: ";
+
 inline void sink_fail(void* s, int rad_status, const char* why = nullptr) {
     if (s) static_cast<Sink*>(s)->fail(rad_status, why);
+}
+inline void sink_fail_copy(void* s, int rad_status, const char* why) {
+    if (s) static_cast<Sink*>(s)->fail_copy(rad_status, why);
 }
 inline bool sink_cancelled(const void* s) {
     return s && static_cast<const Sink*>(s)->cancel_requested();

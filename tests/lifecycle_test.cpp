@@ -175,6 +175,30 @@ TEST(a_prompt_the_kv_cache_can_never_hold_is_a_400_at_once) {
     CHECK(f.sched.reaped.empty());
 }
 
+/* A prompt id the scheduler refuses as outside the vocabulary is the client's mistake: the sink
+ * carries the invalid-request prefix and the reason, and every route that submits a generation
+ * answers a 400 naming the id (not a 500 "the engine failed this request"). An ordinary refusal,
+ * without the prefix, stays a 500 (a_request_the_scheduler_refused_is_never_reaped). */
+TEST(a_prompt_id_the_scheduler_calls_invalid_is_a_400_naming_it) {
+    Fixture f;
+    f.sched.refuse = true;
+    f.sched.refuse_status = RAD_E_INVAL;
+    f.sched.refuse_why = "invalid request: prompt token id 99999 is outside the model's vocabulary [0, 65536)";
+    for (const auto& [path, body] : std::vector<std::pair<const char*, const char*>>{
+             { "/v1/chat/completions", kChat },
+             { "/v1/completions", R"({"prompt":"x","stream":true,"n":2})" },
+             { "/completion", R"({"prompt":"x"})" } }) {
+        const HttpResponse r = f.post(path, body);
+        CHECK_EQ(r.status, 400);
+        CHECK(has(r.body, "invalid_request_error"));
+        CHECK(has(r.body, "prompt token id 99999 is outside the model's vocabulary"));
+        CHECK(!has(r.body, "the engine failed"));
+    }
+    CHECK_EQ(f.srv->in_flight(), (int64_t)0);
+    finish_and_check_reaped(f);
+    CHECK(f.sched.reaped.empty());
+}
+
 /* Embeddings run through the scheduler like completions; each input is reaped once, after a
  * success and after a failure. */
 TEST(every_embedding_input_is_reaped_once) {

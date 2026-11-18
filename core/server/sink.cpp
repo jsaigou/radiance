@@ -1,5 +1,7 @@
 #include "sink.h"
 
+#include <cstdio>
+
 #include <algorithm>
 #include <chrono>
 #include <thread>
@@ -104,6 +106,11 @@ void Sink::fail(int rad_status, const char* why) {
     status_.store(rad_status, std::memory_order_release);
     why_.store(why, std::memory_order_release);
     finish(Finish::Error);
+}
+
+void Sink::fail_copy(int rad_status, const char* why) {
+    std::snprintf(why_buf_, sizeof why_buf_, "%s", why ? why : "");
+    fail(rad_status, why_buf_);
 }
 
 void Sink::set_prompt_stats(int32_t n_prompt, int32_t n_cached) {
