@@ -418,7 +418,7 @@ Every map entry must be declared **before** the weight it names (`rad_block_gdn.
 | linears, embedding, tied head, MLP, conv1d | F32 | BF16 | the checkpoint's own dtype — detect it with `weight_codes_dtype` after mapping `token_embd.weight` (`rad_arch.h:424-427`); a `RAD_F32` result selects the `"f32"`/`RAD_F32` pair for `geom_from`, anything else `"bf16"`/`RAD_BF16` |
 | norms, `A_log`, `dt_bias`, q/k norms, final norm | F32 | BF16 | `RAD_F32` is safe for both: exact on the tiny, an exact bf16→f32 *widen* on the real (`core/build/rad_builder.cpp:210-218`), which is what qwen35 does (`rad_block_gdn.h:156, 170-176`) |
 | activation buffers | F32 | BF16 | `g.act_dtype` |
-| full-attention KV cache | F32 | BF16 | group `dtype`; f32 is needed on the tiny to reproduce the f32 reference cache (`haru.py:80-81`, model dtype f32) |
+| full-attention KV cache | F32 | BF16 | group `dtype`; f32 is needed on the tiny to reproduce the reference cache, which stores the projection's own dtype (`modeling_qwen3_5.py:785-793`) and the tiny model is f32 |
 | GDN recurrent state | F32 | F32 | `RAD_KV_LINEAR`, `mamba_ssm_dtype: float32` (`config.json`) |
 | GDN conv state and kkt plane | F32 | BF16 | `RAD_KV_CONV` dtype; the kkt buffer follows the activation dtype (`rad_block_gdn.h:282-284`) |
 
