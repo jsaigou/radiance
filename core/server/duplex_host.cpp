@@ -43,7 +43,7 @@ void HostSampleSource::NoisePrng::normals(int n, float* out) {
     if (!out || n <= 0) return;
     for (int i = 0; i < n; i += 2) {
         double u1 = uniform();
-        if (!(u1 > 0.0)) u1 = 0x1p-53;
+        if (!(u1 > 0.0)) u1 = 1.0 / 9007199254740992.0;  /* 2^-53 */
         const double u2 = uniform();
         const double r = std::sqrt(-2.0 * std::log(u1));
         const double a = 2.0 * kPi * u2;

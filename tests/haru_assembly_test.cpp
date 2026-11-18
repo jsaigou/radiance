@@ -310,7 +310,6 @@ TEST(the_assembled_tenant_matches_the_tiny_goldens_for_the_prompt_and_24_frames)
                          g.f32(pre + ".logits_fp32_pad_eop"), tol);
         }
         drv->close(lane);
-        drv->set_host_source(nullptr);
         return true;
     };
 
@@ -386,6 +385,10 @@ TEST(the_production_host_source_is_deterministic_on_the_tiny_model) {
         o.max_lanes = dd.max_lanes;
         o.decode = [](const std::vector<int>&) { return std::string(); };
         rad::server::HostSampleSource src(std::move(o));
+        struct ClearHost {
+            rad::gen::DuplexDriver* d;
+            ~ClearHost() { if (d) d->set_host_source(nullptr); }
+        } clear_host{ drv };
         drv->set_host_source(&src);
 
         auto req = request_from_goldens(g);
@@ -407,7 +410,6 @@ TEST(the_production_host_source_is_deterministic_on_the_tiny_model) {
             audio->insert(audio->end(), r.audio.begin(), r.audio.end());
         }
         drv->close(lane);
-        drv->set_host_source(nullptr);
         return true;
     };
 
