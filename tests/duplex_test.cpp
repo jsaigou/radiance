@@ -2,6 +2,7 @@
  * model-free test tenants and a tenant that records what the endpoint delivered. */
 #include "server_fakes.h"
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -33,6 +34,16 @@ std::string frame(uint32_t seq, const std::vector<float>& samples) {
         put_le32(&s, u);
     }
     return s;
+}
+
+std::string blob(size_t n, uint32_t seed) {
+    std::string b(n, '\0');
+    uint32_t x = seed;
+    for (char& c : b) {
+        x = x * 1664525u + 1013904223u;
+        c = (char)(x >> 24);
+    }
+    return b;
 }
 
 std::vector<float> samples(int seed) {
@@ -381,7 +392,7 @@ TEST(reference_bytes_reach_the_tenant) {
         o.duplex_tenants.push_back(rec);
     } });
     Session s(f);
-    const std::string ref = "reference audio bytes";
+    const std::string ref = blob(512u << 10, 7);
     json j = start_json("record");
     j["session_id"] = "session-7";
     j["card"] = { { "voice", "calm" } };
@@ -395,6 +406,86 @@ TEST(reference_bytes_reach_the_tenant) {
         CHECK(rec->reference == std::vector<uint8_t>(ref.begin(), ref.end()));
         CHECK_EQ(rec->card.value("voice", std::string()), std::string("calm"));
     }
+}
+
+TEST(a_reference_sent_in_chunks_reaches_the_tenant_byte_identical) {
+    auto rec = std::make_shared<RecordingTenant>();
+    Fixture f(Fixture::Tweak{ [rec](ServerOptions& o, Deps&) {
+        o.duplex_test_tenants = true;
+        o.duplex_tenants.push_back(rec);
+    } });
+    Session s(f);
+    constexpr size_t kChunk = 1u << 20;
+    const std::string ref = blob(20 * kChunk, 11);
+    json j = start_json("record");
+    j["reference"] = { { "id", "ref-1" }, { "bytes", (int)ref.size() },
+                       { "transcript", "" } };
+    s.conn.client(j);
+    for (size_t off = 0; off < ref.size(); off += kChunk) {
+        s.conn.binary(ref.substr(off, std::min(kChunk, ref.size() - off)));
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(!s.conn.wait_for("ready").is_null());
+    std::lock_guard<std::mutex> lk(rec->m);
+    CHECK(rec->reference == std::vector<uint8_t>(ref.begin(), ref.end()));
+}
+
+TEST(a_reference_chunk_over_one_mib_is_refused) {
+    Fixture f(Fixture::Tweak{ [](ServerOptions& o, Deps&) { o.duplex_test_tenants = true; } });
+    Session s(f);
+    json j = start_json("echo");
+    j["reference"] = { { "id", "" }, { "bytes", 2 << 20 }, { "transcript", "" } };
+    s.conn.client(j);
+    s.conn.binary(std::string((1u << 20) + 1, 'x'));
+    const json e = s.conn.wait_for("error");
+    REQUIRE(!e.is_null());
+    CHECK_EQ(e.value("code", std::string()), std::string("bad_request"));
+    CHECK(s.conn.wait_closed());
+}
+
+TEST(more_reference_bytes_than_announced_is_refused) {
+    Fixture f(Fixture::Tweak{ [](ServerOptions& o, Deps&) { o.duplex_test_tenants = true; } });
+    Session s(f);
+    json j = start_json("echo");
+    j["reference"] = { { "id", "" }, { "bytes", (1 << 20) + (512 << 10) },
+                       { "transcript", "" } };
+    s.conn.client(j);
+    s.conn.binary(std::string(1u << 20, 'a'));
+    s.conn.binary(std::string(1u << 20, 'b'));
+    const json e = s.conn.wait_for("error");
+    REQUIRE(!e.is_null());
+    CHECK_EQ(e.value("code", std::string()), std::string("bad_request"));
+    CHECK(s.conn.wait_closed());
+}
+
+TEST(a_text_message_in_the_middle_of_a_reference_is_refused) {
+    Fixture f(Fixture::Tweak{ [](ServerOptions& o, Deps&) { o.duplex_test_tenants = true; } });
+    Session s(f);
+    json j = start_json("echo");
+    j["reference"] = { { "id", "" }, { "bytes", 2 << 20 }, { "transcript", "" } };
+    s.conn.client(j);
+    s.conn.binary(std::string(1u << 20, 'a'));
+    s.conn.client({ { "type", "flush" } });
+    const json e = s.conn.wait_for("error");
+    REQUIRE(!e.is_null());
+    CHECK_EQ(e.value("code", std::string()), std::string("bad_request"));
+    CHECK(s.conn.wait_closed());
+}
+
+TEST(a_stalled_reference_hits_the_idle_timeout) {
+    Fixture f(Fixture::Tweak{ [](ServerOptions& o, Deps&) {
+        o.duplex_test_tenants = true;
+        o.duplex_idle_s = 1;
+    } });
+    Session s(f);
+    json j = start_json("echo");
+    j["reference"] = { { "id", "" }, { "bytes", 2 << 20 }, { "transcript", "" } };
+    s.conn.client(j);
+    s.conn.binary(std::string(1u << 20, 'a'));
+    const json e = s.conn.wait_for("error", 0, 5000);
+    REQUIRE(!e.is_null());
+    CHECK_EQ(e.value("code", std::string()), std::string("timeout"));
+    CHECK(s.conn.wait_closed());
 }
 
 TEST(the_reference_limit_is_advertised_and_enforced) {
