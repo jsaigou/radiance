@@ -21,6 +21,7 @@
 #include "sample/accept.h"
 #include "sched/scheduler.h"
 #include "server/adapters.h"
+#include "server/duplex_engine.h"
 #include "server/server.h"
 #include "server/sink.h"
 #include "server/liveview.h"
@@ -3468,79 +3469,11 @@ int Engine::run_server() {
     /* A duplex tenant's endpoint: the driver's lane operations and the declared prompt, frame
      * geometry and limits. The server renders and tokenises the card/reference prompt, then calls
      * open/step/flush/close one lane at a time. */
-    struct DuplexBridge final : server::IDuplexGen {
-        enum { kWaitMs = 600000 };   /* 10 min: a prompt or a pass */
-        gen::DuplexDriver*       drv = nullptr;
-        server::DuplexGenInfo    inf;
-        const server::DuplexGenInfo& info() const override { return inf; }
-        int open(std::unique_ptr<server::DuplexGenRequest> r, int32_t* lane,
-                 std::string* why) override {
-            auto q = std::make_unique<gen::DuplexRequest>();
-            q->tokens = std::move(r->tokens);
-            q->ref_audio = std::move(r->ref_audio);
-            q->ref_cu = std::move(r->ref_cu);
-            q->ref_frame = std::move(r->ref_frame);
-            q->seed = r->seed;
-            std::shared_ptr<gen::DuplexTicket> t;
-            const int st = drv->open(std::move(q), &t, why);
-            if (st < 0) {
-                if (lane) *lane = -1;
-                return st;
-            }
-            bool timed_out = false;
-            if (!t->wait(kWaitMs, &timed_out)) {
-                if (why) *why = "the duplex prompt did not finish";
-                if (lane) *lane = -1;
-                return RAD_E_STATE;
-            }
-            if (t->status() < 0) {
-                if (why) *why = t->why();
-                if (lane) *lane = -1;
-                return t->status();
-            }
-            if (lane) *lane = t->lane();
-            return RAD_OK;
-        }
-        int step(int32_t lane, const std::vector<float>& samples, uint64_t seq,
-                 server::DuplexGenReply* out, std::string* why) override {
-            std::shared_ptr<gen::DuplexTicket> t;
-            const int st = drv->step(lane, samples.data(), (int64_t)samples.size(), seq, &t, why);
-            if (st < 0) return st;
-            gen::DuplexReply r;
-            bool timed_out = false;
-            if (!t->next(&r, kWaitMs, &timed_out)) {
-                if (why) *why = timed_out ? "the duplex step did not finish" : t->why();
-                return t->status() < 0 ? t->status() : RAD_E_STATE;
-            }
-            out->audio = std::move(r.audio);
-            out->token = r.token;
-            out->status = r.status;
-            return RAD_OK;
-        }
-        int flush(int32_t lane, uint64_t seq, server::DuplexGenReply* out,
-                  std::string* why) override {
-            std::shared_ptr<gen::DuplexTicket> t;
-            const int st = drv->flush(lane, seq, &t, why);
-            if (st < 0) return st;
-            gen::DuplexReply r;
-            bool timed_out = false;
-            if (!t->next(&r, kWaitMs, &timed_out)) {
-                if (why) *why = timed_out ? "the duplex flush did not finish" : t->why();
-                return t->status() < 0 ? t->status() : RAD_E_STATE;
-            }
-            out->audio = std::move(r.audio);
-            out->token = r.token;
-            out->status = r.status;
-            return RAD_OK;
-        }
-        void close(int32_t lane) override { drv->close(lane); }
-        int64_t queued() const override { return drv->queued(); }
-        int64_t running() const override { return drv->running(); }
-    } duplex_bridge;
+    server::EngineDuplexBridge duplex_bridge;
     if (dup_gen_) {
         const Program& pg = ranks_[0]->program;
         const RadDuplexDecl& dd = pg.duplex;
-        server::DuplexGenInfo& in = duplex_bridge.inf;
+        server::DuplexGenInfo in;
         in.name = pg.dup_str.name;
         in.tmpl = pg.dup_str.tmpl;
         in.text = dd.text != 0;
@@ -3555,7 +3488,9 @@ int Engine::run_server() {
         in.frame_rate_num = dd.frame_rate_num;
         in.frame_rate_den = dd.frame_rate_den;
         in.latent_dim = dd.latent_dim;
-        duplex_bridge.drv = dup_gen_;
+        duplex_bridge.init(dup_gen_, in,
+                           { (int)cfg_.duplex_open_timeout_ms,
+                             (int)cfg_.duplex_step_timeout_ms });
         d.duplex = &duplex_bridge;
         if (cfg_.served_model_name.empty() && !in.name.empty()) {
             o.model_id = in.name;

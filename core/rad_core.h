@@ -1141,6 +1141,12 @@ struct Config {
     /* --duplex-max-ctx: the context a duplex lane may grow to, prompt included, in rows. The
      * default is 30 minutes at 7.5 frames a second; the KV plan reserves it a lane. */
     int64_t duplex_max_ctx = 13500;
+    /* --duplex-open-timeout-ms: how long a lane's prompt may take before the engine gives up and
+     * closes it. */
+    int64_t duplex_open_timeout_ms = 120000;
+    /* --duplex-step-timeout-ms: how long one live step or flush may take. The client's frame
+     * deadline is about a second, so this defaults well below the prompt's bound. */
+    int64_t duplex_step_timeout_ms = 5000;
     /* --duplex-idle-s: how long a duplex session may receive no message at all before it is
      * closed with the "timeout" error. */
     int64_t duplex_idle_s = 30;

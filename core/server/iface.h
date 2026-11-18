@@ -797,6 +797,10 @@ struct DuplexGenReply {
     int32_t            status = 0;
 };
 
+/* IDuplexGen::step or flush returns this when the engine did not finish inside its bound. The
+ * lane has already been closed by the bridge; the endpoint answers the fatal "timeout". */
+enum { kDuplexTimeout = -1001 };
+
 class IDuplexGen {
 public:
     virtual ~IDuplexGen() = default;

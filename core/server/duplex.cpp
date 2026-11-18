@@ -97,6 +97,11 @@ json error_event(const char* code, const std::string& message) {
     return o;
 }
 
+/* A bridge deadline: the engine did not answer a step or flush in time and the lane is closed. */
+struct DuplexTimeout : std::exception {
+    const char* what() const noexcept override { return "the duplex engine timed out"; }
+};
+
 /* ------------------------------------------------------------------ echo / echo1 */
 
 struct EchoLane : DuplexLane {
@@ -179,16 +184,18 @@ struct EngineDuplexLane final : DuplexLane {
     DuplexReply step(uint32_t seq, const std::vector<float>& samples) override {
         DuplexGenReply r;
         std::string why;
-        if (gen->step(lane, samples, seq, &r, &why) < 0)
-            throw std::runtime_error("the duplex engine failed the step");
+        const int st = gen->step(lane, samples, seq, &r, &why);
+        if (st == kDuplexTimeout) throw DuplexTimeout();
+        if (st < 0) throw std::runtime_error("the duplex engine failed the step");
         last_seq = seq;
         return map(r);
     }
     DuplexReply flush() override {
         DuplexGenReply r;
         std::string why;
-        if (gen->flush(lane, last_seq, &r, &why) < 0)
-            throw std::runtime_error("the duplex engine failed the flush");
+        const int st = gen->flush(lane, last_seq, &r, &why);
+        if (st == kDuplexTimeout) throw DuplexTimeout();
+        if (st < 0) throw std::runtime_error("the duplex engine failed the flush");
         return map(r);
     }
     void close() override { gen->close(lane); }
@@ -633,6 +640,8 @@ bool Server::duplex_loop(DuplexSession& s, WsConn& ws) {
         DuplexReply r;
         try {
             r = s.lane->step(seq, samples);
+        } catch (const DuplexTimeout&) {
+            return fail("timeout", "the tenant did not answer the step in time", 1008);
         } catch (const std::exception& e) {
             RAD_ERR("duplex %s step failed: %s", s.id.c_str(), log_sanitize(e.what()).c_str());
             return fail("internal", "the tenant failed the step", 1011);
@@ -659,6 +668,8 @@ bool Server::duplex_loop(DuplexSession& s, WsConn& ws) {
             DuplexReply r;
             try {
                 r = s.lane->flush();
+            } catch (const DuplexTimeout&) {
+                return fail("timeout", "the tenant did not answer the flush in time", 1008);
             } catch (const std::exception& e) {
                 RAD_ERR("duplex %s flush failed: %s", s.id.c_str(), log_sanitize(e.what()).c_str());
                 return fail("internal", "the tenant failed the flush", 1011);
