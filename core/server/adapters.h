@@ -351,14 +351,20 @@ private:
 
 class TokenizerBridge final : public ITokenizer {
 public:
-    explicit TokenizerBridge(std::shared_ptr<const Vocab> v) : vocab_(std::move(v)) {
-        tok_.init(vocab_);
+    explicit TokenizerBridge(std::shared_ptr<const Vocab> v)
+        : vocab_(std::move(v)), tok_(std::make_shared<Tokenizer>()) {
+        tok_->init(vocab_);
     }
+
+    /* The shared Tokenizer behind this bridge. decode() is const and its only mutable state is
+     * the encode-side segment cache, which is locked (core/text/tokenizer.h:197-217); a host
+     * source may hold this handle and call decode(ids, true) directly. */
+    std::shared_ptr<const Tokenizer> tokenizer() const { return tok_; }
 
     std::vector<int32_t> encode(const std::string& text, bool add_special,
                                 bool parse_special) const override {
         std::vector<int32_t> out;
-        int st = tok_.encode(text, out, add_special, parse_special);
+        int st = tok_->encode(text, out, add_special, parse_special);
         if (st < 0) {
             /* The caller answers 400 on an empty result. A partial tokenisation would silently
              * serve a different prompt. */
@@ -371,7 +377,7 @@ public:
     std::string decode(const std::vector<int32_t>& ids) const override {
         /* Sanitised like Detokenizer::push: byte-fallback ids need not decode to valid UTF-8,
          * and one malformed byte in a JSON string breaks the whole response. */
-        return utf8_sanitize(tok_.decode(ids, /*render_special=*/false));
+        return utf8_sanitize(tok_->decode(ids, /*render_special=*/false));
     }
     int32_t eos() const override { return vocab_->eos(); }
     int32_t bos() const override { return vocab_->bos(); }
@@ -400,11 +406,11 @@ public:
     }
     std::string token_bytes(int32_t id) const override {
         if (id < 0 || id >= vocab_->n_tokens()) return std::string();
-        return tok_.decode({ id }, /*render_special=*/true);
+        return tok_->decode({ id }, /*render_special=*/true);
     }
     std::string reply_bytes(int32_t id) const override {
         if (id < 0 || id >= vocab_->n_tokens()) return std::string();
-        return tok_.decode({ id }, /*render_special=*/false);
+        return tok_->decode({ id }, /*render_special=*/false);
     }
 
     std::unique_ptr<IDetokenizer> detokenizer(
@@ -415,7 +421,7 @@ public:
 
 private:
     std::shared_ptr<const Vocab> vocab_;
-    Tokenizer                    tok_;
+    std::shared_ptr<Tokenizer>   tok_;
 };
 
 /* ================================================================== chat

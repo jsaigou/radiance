@@ -316,6 +316,22 @@ static const Flag g_flags[] = {
     "                                    closed with the timeout error (default 30)" },
     { "--duplex-max-reference-mib", "N", "the largest reference audio a duplex start may announce, in MiB\n"
     "                                    (default 64; range 1 to 512)" },
+    { "--duplex-temperature", "F",      "host text sampling temperature for a host-sampling duplex tenant\n"
+    "                                    (default 0.7; <= 0 is greedy)" },
+    { "--duplex-top-k",       "N",      "keep the N most likely tokens; 0 sorts the whole vocabulary\n"
+    "                                    (default 25)" },
+    { "--duplex-top-p",       "F",      "keep the smallest set of tokens whose mass reaches P\n"
+    "                                    (default 1; no nucleus cut)" },
+    { "--duplex-eop-bias",    "F",      "added to the EOP logit: > 0 makes it speak sooner (default 0)" },
+    { "--duplex-speak-first", nullptr,  "force one non-silent frame on frame 0. Off by default; the one-ahead\n"
+    "                                    wire drops frame 0, so enabling it needs a wire decision" },
+    { "--duplex-dry",         "ONOFF",  "the DRY repetition penalty for host text sampling (default on)" },
+    { "--duplex-dry-multiplier", "F",   "DRY penalty multiplier (default 0.8)" },
+    { "--duplex-dry-base",    "F",      "DRY penalty exponential base (default 1.75)" },
+    { "--duplex-dry-allowed-length", "N", "matches at least this long are penalised (default 1)" },
+    { "--duplex-dry-lookback", "N",     "tokens of history DRY reads (default 1024)" },
+    { "--duplex-dry-max-match", "N",    "the longest match DRY measures (default 32)" },
+    { "--duplex-dry-max-penalty", "F",  "the largest DRY penalty (default 32)" },
 
     { "--image-min-pixels",   "N",      "an image is resized to at least N pixels (default: the container's)" },
     { "--image-max-pixels",   "N",      "and to at most N; one encoder pass (--mm-max-patches) still bounds it" },
@@ -1073,6 +1089,81 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--duplex-max-reference-mib")) {
             if (!num(1, 512, &c->duplex_max_reference_mib)) return RAD_E_INVAL;
         }
+        else if (S("--duplex-temperature")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            double d = 0;
+            if (!parse_num(a.c_str(), v, &d) || d < 0) {
+                if (d < 0) RAD_ERR("--duplex-temperature must be >= 0, not %s", v);
+                return RAD_E_INVAL;
+            }
+            c->duplex_temperature = (float)d;
+        }
+        else if (S("--duplex-top-k")) {
+            if (!num(0, INT32_MAX, &c->duplex_top_k)) return RAD_E_INVAL;
+        }
+        else if (S("--duplex-top-p")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            double d = 0;
+            if (!parse_num(a.c_str(), v, &d) || d < 0.0 || d > 1.0) {
+                if (d < 0.0 || d > 1.0)
+                    RAD_ERR("--duplex-top-p must be in [0, 1], not %s", v);
+                return RAD_E_INVAL;
+            }
+            c->duplex_top_p = (float)d;
+        }
+        else if (S("--duplex-eop-bias")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            double d = 0;
+            if (!parse_num(a.c_str(), v, &d)) return RAD_E_INVAL;
+            c->duplex_eop_bias = (float)d;
+        }
+        else if (S("--duplex-dry")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            if (!std::strcmp(v, "on")) c->duplex_dry = true;
+            else if (!std::strcmp(v, "off")) c->duplex_dry = false;
+            else {
+                RAD_ERR("--duplex-dry takes on or off, not '%s'", v);
+                return RAD_E_INVAL;
+            }
+        }
+        else if (S("--duplex-speak-first")) c->duplex_speak_first = true;
+        else if (S("--duplex-dry-multiplier")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            double d = 0;
+            if (!parse_num(a.c_str(), v, &d) || d < 0.0) {
+                if (d < 0.0) RAD_ERR("--duplex-dry-multiplier must be >= 0, not %s", v);
+                return RAD_E_INVAL;
+            }
+            c->duplex_dry_multiplier = (float)d;
+        }
+        else if (S("--duplex-dry-base")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            double d = 0;
+            if (!parse_num(a.c_str(), v, &d)) return RAD_E_INVAL;
+            if (!(d > 0.0)) {
+                RAD_ERR("--duplex-dry-base must be > 0, not %s", v);
+                return RAD_E_INVAL;
+            }
+            c->duplex_dry_base = (float)d;
+        }
+        else if (S("--duplex-dry-allowed-length")) {
+            if (!num(0, INT32_MAX, &c->duplex_dry_allowed_length)) return RAD_E_INVAL;
+        }
+        else if (S("--duplex-dry-lookback")) {
+            if (!num(0, INT32_MAX, &c->duplex_dry_lookback)) return RAD_E_INVAL;
+        }
+        else if (S("--duplex-dry-max-match")) {
+            if (!num(1, INT32_MAX, &c->duplex_dry_max_match_length)) return RAD_E_INVAL;
+        }
+        else if (S("--duplex-dry-max-penalty")) {
+            if (!(v = need(i))) return RAD_E_INVAL;
+            double d = 0;
+            if (!parse_num(a.c_str(), v, &d) || d < 0.0) {
+                if (d < 0.0) RAD_ERR("--duplex-dry-max-penalty must be >= 0, not %s", v);
+                return RAD_E_INVAL;
+            }
+            c->duplex_dry_max_penalty = (float)d;
+        }
         else if (S("--image-min-pixels") || S("--image-max-pixels") || S("--video-min-pixels") ||
                  S("--video-max-pixels") || S("--max-source-pixels")) {
             if (!(v = need(i))) return RAD_E_INVAL;
@@ -1531,6 +1622,18 @@ const ShowRow kShow[] = {
     { "--duplex-step-timeout-ms", [](const Config& c) { return num(c.duplex_step_timeout_ms); } },
     { "--duplex-idle-s",      [](const Config& c) { return num(c.duplex_idle_s); } },
     { "--duplex-max-reference-mib", [](const Config& c) { return num(c.duplex_max_reference_mib); } },
+    { "--duplex-temperature", [](const Config& c) { return fnum(c.duplex_temperature); } },
+    { "--duplex-top-k",       [](const Config& c) { return num(c.duplex_top_k); } },
+    { "--duplex-top-p",       [](const Config& c) { return fnum(c.duplex_top_p); } },
+    { "--duplex-eop-bias",    [](const Config& c) { return fnum(c.duplex_eop_bias); } },
+    { "--duplex-speak-first", [](const Config& c) { return onoff(c.duplex_speak_first); } },
+    { "--duplex-dry",         [](const Config& c) { return onoff(c.duplex_dry); } },
+    { "--duplex-dry-multiplier", [](const Config& c) { return fnum(c.duplex_dry_multiplier); } },
+    { "--duplex-dry-base",    [](const Config& c) { return fnum(c.duplex_dry_base); } },
+    { "--duplex-dry-allowed-length", [](const Config& c) { return num(c.duplex_dry_allowed_length); } },
+    { "--duplex-dry-lookback", [](const Config& c) { return num(c.duplex_dry_lookback); } },
+    { "--duplex-dry-max-match", [](const Config& c) { return num(c.duplex_dry_max_match_length); } },
+    { "--duplex-dry-max-penalty", [](const Config& c) { return fnum(c.duplex_dry_max_penalty); } },
     { "--image-min-pixels",   [](const Config& c) { return opt(c.image_min_pixels, "the container's"); } },
     { "--image-max-pixels",   [](const Config& c) { return opt(c.image_max_pixels, "the container's"); } },
     { "--video-min-pixels",   [](const Config& c) { return opt(c.video_min_pixels, "the container's"); } },

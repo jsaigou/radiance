@@ -21,6 +21,7 @@
 #include "engine.h"
 #include "util/stallwatch.h"
 #include "gen/duplex_driver.h"
+#include "server/duplex_host.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -316,6 +317,109 @@ TEST(the_assembled_tenant_matches_the_tiny_goldens_for_the_prompt_and_24_frames)
     REQUIRE(run_lane("lane0", kSteps));
     REQUIRE(run_lane("lane1", 2));        /* a second lane, same schedule */
     REQUIRE(run_lane("reopen", 1));       /* close/reopen: fresh codec and latent state */
+    engine.stop_workers();
+    guard.e = nullptr;
+}
+
+/* The production host source on the tiny model: the same seed replays the same tokens and audio,
+ * a different seed does not. This exercises the driver, the plugin, the codec, the sampler and the
+ * noise stream together, with no teacher feed. */
+TEST(the_production_host_source_is_deterministic_on_the_tiny_model) {
+    tiny::TempDir dir("haru_host_det", std::getenv("RAD_DUPLEX_KEEP") != nullptr);
+    REQUIRE(dir.ok());
+    const std::string home = dir / "home";
+    std::string why;
+    REQUIRE(make_home(home, &why));
+
+    setenv("RADIANCE_HOME", home.c_str(), 1);
+    setenv("ROCR_VISIBLE_DEVICES", "99", 1);
+    setenv("RADIANCE_HOST_VRAM_MIB", "512", 1);
+    setenv("OMP_WAIT_POLICY", "passive", 1);
+
+    rad::Config cfg;
+    cfg.model = std::string(RAD_HARU_DATA) + "/haru_tiny";
+    cfg.radiance_home = home;
+    cfg.kernel_hierarchy = { "libref" };
+    cfg.accept_reference_kernels = true;
+    cfg.max_tok = 4096;
+    cfg.max_seqs = 2;
+    cfg.duplex_max_ctx = 128;
+    cfg.port = 0;
+    cfg.http_threads = 4;
+
+    rad::Engine engine(std::move(cfg));
+    if (engine.start() < 0) {
+        REQUIRE(false);
+        return;
+    }
+    if (engine.serve_prepare(nullptr) < 0) {
+        REQUIRE(false);
+        return;
+    }
+    Workers guard{ &engine };
+    if (engine.start_workers() < 0) {
+        REQUIRE(false);
+        return;
+    }
+    rad::gen::DuplexDriver* drv = engine.duplex_driver();
+    REQUIRE(drv != nullptr);
+    if (!drv) return;
+
+    const Golden& g = Golden::get();
+    const rad::RadDuplexDecl& dd = engine.program().duplex;
+    constexpr int64_t kRunSteps = 3;
+
+    auto run = [&](uint64_t seed, std::vector<int32_t>* tokens,
+                   std::vector<float>* audio) -> bool {
+        rad::server::HostSampleSource::Options o;
+        o.sampler.temperature = 0.7f;
+        o.sampler.top_k = 25;
+        o.sampler.top_p = 1.0f;
+        o.sampler.eop_bias = 0.0f;
+        o.sampler.force_text_frames = 0;
+        o.codec_noise_scale = dd.codec_noise_scale;
+        o.pad_id = dd.pad_id;
+        o.eop_id = dd.eop_id;
+        o.eos_id = dd.eos_id;
+        o.n_vocab = dd.n_vocab;
+        o.latent_dim = dd.latent_dim;
+        o.max_lanes = dd.max_lanes;
+        o.decode = [](const std::vector<int>&) { return std::string(); };
+        rad::server::HostSampleSource src(std::move(o));
+        drv->set_host_source(&src);
+
+        auto req = request_from_goldens(g);
+        req->seed = seed;
+        std::shared_ptr<rad::gen::DuplexTicket> open;
+        if (drv->open(std::move(req), &open, &why) < 0) return false;
+        bool to = false;
+        if (!open->wait(300000, &to) || open->status() != RAD_OK) return false;
+        const int32_t lane = open->lane();
+        for (int64_t s = 0; s < kRunSteps; ++s) {
+            const std::vector<float> in =
+                g.f32("frame" + std::to_string(s + 1) + ".user_audio");
+            std::shared_ptr<rad::gen::DuplexTicket> t;
+            if (drv->step(lane, in.data(), (int64_t)in.size(), (uint64_t)s, &t, &why) < 0)
+                return false;
+            rad::gen::DuplexReply r;
+            if (!t->next(&r, 300000, &to)) return false;
+            tokens->push_back(r.token);
+            audio->insert(audio->end(), r.audio.begin(), r.audio.end());
+        }
+        drv->close(lane);
+        drv->set_host_source(nullptr);
+        return true;
+    };
+
+    std::vector<int32_t> ta, tb, tc;
+    std::vector<float> aa, ab, ac;
+    REQUIRE(run(1234, &ta, &aa));
+    REQUIRE(run(1234, &tb, &ab));
+    CHECK(ta == tb);
+    CHECK(aa == ab);
+    REQUIRE(run(5678, &tc, &ac));
+    CHECK(aa != ac);
+
     engine.stop_workers();
     guard.e = nullptr;
 }

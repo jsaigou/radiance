@@ -51,7 +51,7 @@ namespace rad {
 class Kld;
 class StallWatch;
 namespace gen { class Driver; class AudioDriver; class DuplexDriver; class VideoDriver; class ShapeDriver; struct IPassDriver; }
-namespace server { class Sink; }
+namespace server { class Sink; class HostSampleSource; }
 struct TierPump;
 struct TierJob;
 struct StepSlot;
@@ -453,6 +453,10 @@ private:
      * (engine_gen.cpp). Null for every other program. `img_gen_`, `aud_gen_`, `dup_gen_`,
      * `vid_gen_` and `shp_gen_` are the same driver by its kind, for the endpoints; one of them is
      * set when `gen_` is. */
+    /* The production host source for a host-sampling duplex tenant (core/server/duplex_host.h).
+     * Declared before gen_ so the driver dies first and any lane_closed it makes still reaches a
+     * live source; serve() also clears the driver's pointer after stop_workers(). */
+    std::unique_ptr<server::HostSampleSource> duplex_host_;
     std::unique_ptr<gen::IPassDriver> gen_;
     gen::Driver*                      img_gen_ = nullptr;
     gen::AudioDriver*                 aud_gen_ = nullptr;

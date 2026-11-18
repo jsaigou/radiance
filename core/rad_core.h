@@ -1152,6 +1152,21 @@ struct Config {
     int64_t duplex_idle_s = 30;
     /* --duplex-max-reference-mib: the largest reference audio a duplex start may announce. */
     int64_t duplex_max_reference_mib = 64;
+    /* Host-side text sampling for a host-sampling duplex tenant. These are engine-wide defaults,
+     * not wire fields; the values are the reference's (.haru-ref/session.py:34-40,
+     * .haru-ref/sampling.py:14-19). */
+    float   duplex_temperature = 0.7f;        /* --duplex-temperature; <= 0 is greedy */
+    int64_t duplex_top_k = 25;                /* --duplex-top-k; 0 is a full sort */
+    float   duplex_top_p = 1.0f;              /* --duplex-top-p; 1 is no nucleus cut */
+    float   duplex_eop_bias = 0.0f;           /* --duplex-eop-bias */
+    bool    duplex_speak_first = false;       /* --duplex-speak-first; see HARU-H6-DESIGN.md 4.2 */
+    bool    duplex_dry = true;                /* --duplex-dry on|off */
+    float   duplex_dry_multiplier = 0.8f;     /* --duplex-dry-multiplier */
+    float   duplex_dry_base = 1.75f;          /* --duplex-dry-base */
+    int64_t duplex_dry_allowed_length = 1;    /* --duplex-dry-allowed-length */
+    int64_t duplex_dry_lookback = 1024;       /* --duplex-dry-lookback */
+    int64_t duplex_dry_max_match_length = 32; /* --duplex-dry-max-match */
+    float   duplex_dry_max_penalty = 32.0f;   /* --duplex-dry-max-penalty */
     /* --max-stop-strings / --max-stop-bytes: count and length limits on a request's stop strings.
      * Every stop string is searched in all generated text, so these bound that scan's cost. */
     int64_t max_stop_strings = 64;

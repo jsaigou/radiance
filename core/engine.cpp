@@ -22,6 +22,7 @@
 #include "sched/scheduler.h"
 #include "server/adapters.h"
 #include "server/duplex_engine.h"
+#include "server/duplex_host.h"
 #include "server/server.h"
 #include "server/sink.h"
 #include "server/liveview.h"
@@ -2335,6 +2336,9 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     startup_watch_.reset();
 
     stop_workers();
+    /* No pass can run after stop_workers(); drop the driver's pointer before the source is
+     * destroyed (its member is declared before gen_ so the driver dies first as a backstop). */
+    if (dup_gen_) dup_gen_->set_host_source(nullptr);
     /* A step-loop error takes precedence over the transport's status. */
     const int ls = loop_status_.load(std::memory_order_acquire);
     return ls < 0 ? ls : s;
@@ -3501,6 +3505,39 @@ int Engine::run_server() {
         in.frame_rate_num = dd.frame_rate_num;
         in.frame_rate_den = dd.frame_rate_den;
         in.latent_dim = dd.latent_dim;
+        if (dd.host_sampling == 1) {
+            /* The engine owns the Tokenizer inside tok_bridge; the source holds the same shared
+             * instance, so it outlives this function and calls decode(ids, true) (the reference's
+             * skip_special_tokens=False, .haru-ref/sampling.py:124). */
+            server::HostSampleSource::Options ho;
+            ho.sampler.temperature = cfg_.duplex_temperature;
+            ho.sampler.top_k = (int)cfg_.duplex_top_k;
+            ho.sampler.top_p = cfg_.duplex_top_p;
+            ho.sampler.eop_bias = cfg_.duplex_eop_bias;
+            ho.sampler.dry.base = cfg_.duplex_dry_base;
+            ho.sampler.dry.allowed_length = (int)cfg_.duplex_dry_allowed_length;
+            ho.sampler.dry.lookback = (int)cfg_.duplex_dry_lookback;
+            ho.sampler.dry.max_match_length = (int)cfg_.duplex_dry_max_match_length;
+            ho.sampler.dry.max_penalty = cfg_.duplex_dry_max_penalty;
+            /* DRY has no enable flag in the S2 sampler; a zero multiplier is its identity. */
+            ho.sampler.dry.multiplier =
+                cfg_.duplex_dry ? cfg_.duplex_dry_multiplier : 0.0f;
+            ho.sampler.force_text_frames = cfg_.duplex_speak_first ? 1 : 0;
+            ho.codec_noise_scale = dd.codec_noise_scale;
+            ho.pad_id = dd.pad_id;
+            ho.eop_id = dd.eop_id;
+            ho.eos_id = dd.eos_id;
+            ho.n_vocab = dd.n_vocab;
+            ho.latent_dim = dd.latent_dim;
+            ho.max_lanes = dd.max_lanes;
+            const std::shared_ptr<const Tokenizer> tk = tok_bridge.tokenizer();
+            ho.decode = [tk](const std::vector<int>& ids) {
+                return tk->decode(std::vector<int32_t>(ids.begin(), ids.end()),
+                                  /*render_special=*/true);
+            };
+            duplex_host_ = std::make_unique<server::HostSampleSource>(std::move(ho));
+            dup_gen_->set_host_source(duplex_host_.get());
+        }
         duplex_bridge.init(dup_gen_, in,
                            { (int)cfg_.duplex_open_timeout_ms,
                              (int)cfg_.duplex_step_timeout_ms });
