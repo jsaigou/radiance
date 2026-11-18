@@ -74,6 +74,7 @@ bool make_home(const std::string& home, std::string* why) {
     std::error_code ec;
     fs::create_directories(home + "/kernels", ec);
     fs::create_directories(home + "/architectures", ec);
+    fs::create_directories(home + "/quantizers", ec);
     if (ec) {
         *why = "could not make the temporary RADIANCE_HOME: " + ec.message();
         return false;
