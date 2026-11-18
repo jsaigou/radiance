@@ -62,7 +62,7 @@ std::string prepare_model(const char* tenant) {
         return std::string();
     }
     if (!c.is_object() || !c.contains("lm") || !c["lm"].is_object()) return std::string();
-    const nlohmann::json& lm = c["lm"];
+    const nlohmann::json lm = c["lm"];   /* a copy: inserting top-level keys can move it */
     for (const char* k : { "num_hidden_layers", "hidden_size", "num_attention_heads",
                            "num_key_value_heads", "head_dim", "intermediate_size", "vocab_size",
                            "max_position_embeddings", "rms_norm_eps" })
