@@ -603,6 +603,21 @@ static bool offers_key(const std::string& protocols, const std::string& key) {
     return false;
 }
 
+bool api_key_ok(const std::string& authorization, const std::string& x_api_key,
+                const std::string& websocket_protocols, const std::string& key) {
+    if (key.empty()) return true;
+    const std::string auth = authorization;
+    const size_t sp = auth.find(' ');
+    const size_t cred = sp == std::string::npos ? sp : auth.find_first_not_of(' ', sp);
+    const bool bearer = cred != std::string::npos && sp == 6 &&
+                        std::equal(auth.begin(), auth.begin() + 6, "bearer",
+                                   [](char a, char b) {
+                                       return std::tolower((unsigned char)a) == b;
+                                   });
+    return (bearer && same_secret(auth.substr(cred), key)) || same_secret(x_api_key, key) ||
+           offers_key(websocket_protocols, key);
+}
+
 /* httplib's own test for a WebSocket upgrade (RFC 6455 §4.2.1), which it applies before the
  * pre-routing handler and does not export. A request it rejects is routed as a plain GET, so the
  * pre-routing handler must not leave such a request to httplib either. */
@@ -688,16 +703,8 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
     /* Whether a request carries the API key: `Authorization: Bearer` (OpenAI; the scheme is
      * case-insensitive, RFC 9110) or `X-Api-Key` (Anthropic, also accepted by llama-server). */
     auto key_ok = [api_key](const httplib::Request& hreq) -> bool {
-        const std::string auth = hreq.get_header_value("Authorization");
-        const size_t sp = auth.find(' ');
-        const size_t cred = sp == std::string::npos ? sp : auth.find_first_not_of(' ', sp);
-        const bool bearer = cred != std::string::npos && sp == 6 &&
-                            std::equal(auth.begin(), auth.begin() + 6, "bearer",
-                                       [](char a, char b) {
-                                           return std::tolower((unsigned char)a) == b;
-                                       });
-        return (bearer && same_secret(auth.substr(cred), api_key)) ||
-               same_secret(hreq.get_header_value("X-Api-Key"), api_key);
+        return api_key_ok(hreq.get_header_value("Authorization"),
+                          hreq.get_header_value("X-Api-Key"), "", api_key);
     };
 
     /* What a request must pass before its body is read, so a refused one never has it buffered. */
@@ -886,8 +893,8 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
      * ways a socket client can carry it, and, with CORS off, by its Origin: a browser lets any
      * page open a socket to any host, and CORS is what would otherwise keep another site's page
      * out. True when the upgrade may proceed; false with the refusal in `s`. */
-    auto socket_gate = [api_key, cors, key_ok, who](const httplib::Request& q,
-                                                    httplib::Response& s) -> bool {
+    auto socket_gate = [api_key, cors, who](const httplib::Request& q,
+                                            httplib::Response& s) -> bool {
         auto refuse = [&](int status, const char* type, const std::string& why) {
             RAD_INFO("req refused from %s -> %d %s: %s", who(q).c_str(),
                      status, type, why.c_str());
@@ -903,8 +910,9 @@ int HttpTransport::serve(const Router& router, const TransportOptions& o) {
                 return refuse(403, "permission_error",
                               "a page on another origin may not open this socket (--no-cors)");
         }
-        if (!api_key.empty() && !key_ok(q) &&
-            !offers_key(q.get_header_value("Sec-WebSocket-Protocol"), api_key))
+        if (!api_key.empty() &&
+            !api_key_ok(q.get_header_value("Authorization"), q.get_header_value("X-Api-Key"),
+                        q.get_header_value("Sec-WebSocket-Protocol"), api_key))
             return refuse(401, "authentication_error", "invalid api key");
         return true;
     };

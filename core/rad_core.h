@@ -1125,6 +1125,17 @@ struct Config {
     /* --max-queued-requests: requests admitted and unfinished at once, beyond which the answer is
      * 429. 0 is 8 x --max-num-seqs. */
     int64_t max_queued_requests = 0;
+    /* --duplex-test-tenants: register the contract's model-free echo and echo1 tenants on
+     * /duplex/v1/session. Off by default: a deployment should not advertise test lanes. */
+    bool    duplex_test_tenants = false;
+    /* --duplex-max-lanes: the conversations one duplex test tenant holds at once; past it a start
+     * is session_limit. */
+    int64_t duplex_max_lanes = 2;
+    /* --duplex-idle-s: how long a duplex session may receive no message at all before it is
+     * closed with the "timeout" error. */
+    int64_t duplex_idle_s = 30;
+    /* --duplex-max-reference-mib: the largest reference audio a duplex start may announce. */
+    int64_t duplex_max_reference_mib = 64;
     /* --max-stop-strings / --max-stop-bytes: count and length limits on a request's stop strings.
      * Every stop string is searched in all generated text, so these bound that scan's cost. */
     int64_t max_stop_strings = 64;
