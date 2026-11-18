@@ -99,8 +99,15 @@ struct Conn : WsConn {
         close_code = code;
         cv.notify_all();
     }
-    void client(const json& j) { put(j.dump(), false); }
-    void binary(const std::string& b) { put(b, true); }
+    /* What the client sends is what the server reads: the queue `read` drains, not `out`, which
+     * holds what the server sent. */
+    void to_server(const std::string& s, bool binary) {
+        std::lock_guard<std::mutex> lk(m);
+        in.emplace_back(s, binary);
+        cv.notify_all();
+    }
+    void client(const json& j) { to_server(j.dump(), false); }
+    void binary(const std::string& b) { to_server(b, true); }
     void hangup() {
         std::lock_guard<std::mutex> lk(m);
         hung_up = true;
