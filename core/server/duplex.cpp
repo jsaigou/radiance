@@ -39,6 +39,7 @@ namespace server {
 namespace {
 
 using json = nlohmann::ordered_json;
+using Clock = std::chrono::steady_clock;
 
 constexpr int32_t  kSampleRate = 24000;
 constexpr size_t   kSamples = 3200;
@@ -213,6 +214,7 @@ struct Server::DuplexSession {
     uint32_t last_seq = 0;
     bool have_step = false;
     uint64_t steps = 0;
+    Clock::time_point last_message;
 
     void release() {
         if (lane) {
@@ -491,19 +493,29 @@ bool Server::duplex_loop(DuplexSession& s, WsConn& ws) {
         return take_text(msg);
     };
 
+    const auto idle_for =
+        std::chrono::seconds(std::max<int64_t>(1, opt_.duplex_idle_s));
+    s.last_message = Clock::now();
     RAD_INFO("duplex %s open from %s", s.id.c_str(), s.peer.c_str());
     for (;;) {
+        const auto now = Clock::now();
+        auto wait = std::chrono::milliseconds(100);
+        const auto idle_left = std::chrono::duration_cast<std::chrono::milliseconds>(
+            idle_for - (now - s.last_message));
+        if (idle_left < wait)
+            wait = std::chrono::milliseconds(std::max<int64_t>(0, idle_left.count()));
+
         std::deque<std::pair<std::string, bool>> got;
         bool gone = false, overflow = false;
         {
             std::unique_lock<std::mutex> lk(s.m);
-            if (s.inbox.empty() && !s.peer_gone && !s.overflow)
-                s.cv.wait_for(lk, std::chrono::milliseconds(100));
+            if (s.inbox.empty() && !s.peer_gone && !s.overflow) s.cv.wait_for(lk, wait);
             got.swap(s.inbox);
             s.inbox_bytes = 0;
             gone = s.peer_gone;
             overflow = s.overflow;
         }
+        if (!got.empty()) s.last_message = Clock::now();
         if (overflow)
             return fail("bad_request", fmt("the session fell more than %zu MiB of messages behind",
                                            kMaxQueuedBytes >> 20), 1008);
@@ -512,6 +524,10 @@ bool Server::duplex_loop(DuplexSession& s, WsConn& ws) {
         if (gone) return false;
         if (stopping_.load())
             return fail("internal", "the server is shutting down", 1001);
+        if (got.empty() && Clock::now() - s.last_message >= idle_for)
+            return fail("timeout",
+                        fmt("the session received no message for more than %lld seconds",
+                            (long long)opt_.duplex_idle_s), 1008);
     }
 }
 

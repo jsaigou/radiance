@@ -129,6 +129,7 @@ struct ServerOptions {
      * extra model-free tenants the embedding server already holds (tests and future engines). */
     bool        duplex_test_tenants = false;
     int64_t     duplex_max_lanes = 2;
+    int64_t     duplex_idle_s = 30;
     std::vector<std::shared_ptr<DuplexTenant>> duplex_tenants;
 
     int64_t     max_ctx = 0;

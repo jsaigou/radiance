@@ -100,6 +100,8 @@ A `message` must not contain reference audio, card text, keys or tokens.
 - Step time target: p95 under 100 ms (the frame period is 133.33 ms). Never block the accept path
   while loading: answer `ready: false` until the weights are resident.
 - Lane limits are the engine's: `max_lanes` in `/info`; beyond it, `session_limit`.
+- An engine MAY close a lane that has received no message for its idle limit, or that has run past
+  `start.max_minutes`, with a fatal `timeout` error.
 - A lane holds no state that affects a later lane. Closing a lane releases all of its state.
 - A step message of the wrong length is `bad_frame`; a `seq` other than the next expected is
   `bad_sequence`. Both are fatal.

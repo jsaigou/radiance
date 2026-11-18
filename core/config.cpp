@@ -306,6 +306,8 @@ static const Flag g_flags[] = {
     { "--duplex-test-tenants", nullptr, "serve the duplex contract's model-free echo and echo1 tenants on\n"
     "                                    /duplex/v1/session, for checking a client without a model" },
     { "--duplex-max-lanes",   "N",      "conversations one duplex test tenant holds at once (default 2)" },
+    { "--duplex-idle-s",      "S",      "seconds a duplex session may receive no message before it is\n"
+    "                                    closed with the timeout error (default 30)" },
 
     { "--image-min-pixels",   "N",      "an image is resized to at least N pixels (default: the container's)" },
     { "--image-max-pixels",   "N",      "and to at most N; one encoder pass (--mm-max-patches) still bounds it" },
@@ -1052,6 +1054,7 @@ int config_parse(int argc, char** argv, Config* c) {
         else if (S("--no-cors"))               c->cors = false;
         else if (S("--duplex-test-tenants"))   c->duplex_test_tenants = true;
         else if (S("--duplex-max-lanes"))      { if (!num(1, INT32_MAX, &c->duplex_max_lanes)) return RAD_E_INVAL; }
+        else if (S("--duplex-idle-s"))         { if (!num(1, INT32_MAX, &c->duplex_idle_s)) return RAD_E_INVAL; }
         else if (S("--image-min-pixels") || S("--image-max-pixels") || S("--video-min-pixels") ||
                  S("--video-max-pixels") || S("--max-source-pixels")) {
             if (!(v = need(i))) return RAD_E_INVAL;
@@ -1505,6 +1508,7 @@ const ShowRow kShow[] = {
           return std::string(c.cors ? "not given: CORS headers sent" : "no CORS headers"); } },
     { "--duplex-test-tenants", [](const Config& c) { return onoff(c.duplex_test_tenants); } },
     { "--duplex-max-lanes",   [](const Config& c) { return num(c.duplex_max_lanes); } },
+    { "--duplex-idle-s",      [](const Config& c) { return num(c.duplex_idle_s); } },
     { "--image-min-pixels",   [](const Config& c) { return opt(c.image_min_pixels, "the container's"); } },
     { "--image-max-pixels",   [](const Config& c) { return opt(c.image_max_pixels, "the container's"); } },
     { "--video-min-pixels",   [](const Config& c) { return opt(c.video_min_pixels, "the container's"); } },
