@@ -430,6 +430,26 @@ says so with `RAD_ARCH_SERVES_IMPORTS(0)` (`qwen35_w8a8` does), and imports keep
   vectors. The declaration is accepted now; the pass driver and the `/duplex/v1` bridge are
   follow-ups.
 
+### Running the test-only duplex plugin
+
+`tests/duplex_plugin` is the smallest real architecture plugin that declares a duplex tenant
+(architecture id `radtestduplex`, tenant `radtest-duplex`). It is built under
+`$RADIANCE_HOME/archtest`, never `architectures`, so a normal run does not load it. The test can
+leave a checkpoint and a temporary `RADIANCE_HOME` behind for a manual run:
+
+```sh
+cmake --build build --target duplex_plugin_test
+RAD_DUPLEX_KEEP=1 ./build/tests/duplex_plugin_test
+# prints: kept the checkpoint and RADIANCE_HOME under /tmp/radiance_duplex_plugin.XXXXXX
+RADIANCE_HOME=/tmp/radiance_duplex_plugin.XXXXXX/home \
+  ./build/radiance --model /tmp/radiance_duplex_plugin.XXXXXX \
+  --kernels libref --debug-accept-reference-kernels --host 127.0.0.1 --port 8000
+```
+
+Then `GET /duplex/v1/info` lists `radtest-duplex`; the echo tenants are absent because
+`--duplex-test-tenants` is not given. The test itself starts the same binary with that home and
+checks the info route before shutting it down.
+
 ---
 
 ## 12. Quantiser plugins
