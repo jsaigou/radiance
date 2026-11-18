@@ -278,11 +278,22 @@ View run_conv(RadCtx* c, const ConvLayer& L, int64_t lane, RadOperand in, int64_
 /* One Block's step. */
 View run_block(RadCtx* c, const BlockLayer& B, int64_t lane, RadOperand in, int64_t rows) {
     const RadOperand state = brow_slice(B.state, lane * B.context, B.context, B.dim);
-    RAD_ISSUE_N(c, B.rms1, rows, in, RAD_W(B.norm), RAD_B(B.n1));
+    /* Every row-wise operand is narrowed to this step's valid rows. A full buffer left at its
+     * declared max_rows would make the kernel process (and read stale bytes from) the rows past
+     * the partial frame's valid ones, even though the next layer would not read them. */
+    const RadOperand n1 = brow_slice(B.n1, 0, rows, B.dim);
+    const RadOperand scaled1 = brow_slice(B.scaled1, 0, rows, B.dim);
+    const RadOperand x1 = brow_slice(B.x1, 0, rows, B.dim);
+    const RadOperand n2 = brow_slice(B.n2, 0, rows, B.dim);
+    const RadOperand h1 = brow_slice(B.h1, 0, rows, 4 * B.dim);
+    const RadOperand h2 = brow_slice(B.h2, 0, rows, 4 * B.dim);
+    const RadOperand h3 = brow_slice(B.h3, 0, rows, B.dim);
+    const RadOperand scaled2 = brow_slice(B.scaled2, 0, rows, B.dim);
+    const RadOperand x2 = brow_slice(B.x2, 0, rows, B.dim);
+    RAD_ISSUE_N(c, B.rms1, rows, in, RAD_W(B.norm), n1);
     RAD_ISSUE_N(c, B.copy_state_in, B.context, state,
                 brow_slice(B.combined, 0, B.context, B.dim));
-    RAD_ISSUE_N(c, B.copy_input, rows, brow_slice(B.n1, 0, rows, B.dim),
-                brow_slice(B.combined, B.context, rows, B.dim));
+    RAD_ISSUE_N(c, B.copy_input, rows, n1, brow_slice(B.combined, B.context, rows, B.dim));
     if (rows < B.max_rows)
         RAD_ISSUE_N(c, B.fill_pad, B.max_rows - rows,
                     brow_slice(B.combined, B.context + rows, B.max_rows - rows, B.dim));
@@ -291,16 +302,14 @@ View run_block(RadCtx* c, const BlockLayer& B, int64_t lane, RadOperand in, int6
     RAD_ISSUE_N(c, B.copy_state_out, B.context,
                 brow_slice(B.combined, B.max_rows, B.context, B.dim), state);
     RAD_ISSUE_N(c, B.scale1, rows, brow_slice(B.dw_out, B.context, rows, B.dim), RAD_W(B.gamma),
-                RAD_B(B.scaled1));
-    RAD_ISSUE_N(c, B.add1, rows, in, RAD_B(B.scaled1), RAD_B(B.x1));
-    RAD_ISSUE_N(c, B.rms2, rows, RAD_B(B.x1), RAD_W(B.ffn_norm), RAD_B(B.n2));
-    RAD_ISSUE_N(c, B.fc1, rows, RAD_B(B.n2), RAD_W(B.fc1_w), RAD_W(B.fc1_b), RAD_NONE,
-                RAD_B(B.h1));
-    RAD_ISSUE_N(c, B.gelu, rows, RAD_B(B.h1), RAD_B(B.h2));
-    RAD_ISSUE_N(c, B.fc2, rows, RAD_B(B.h2), RAD_W(B.fc2_w), RAD_W(B.fc2_b), RAD_NONE,
-                RAD_B(B.h3));
-    RAD_ISSUE_N(c, B.scale2, rows, RAD_B(B.h3), RAD_W(B.ffn_gamma), RAD_B(B.scaled2));
-    RAD_ISSUE_N(c, B.add2, rows, RAD_B(B.x1), RAD_B(B.scaled2), RAD_B(B.x2));
+                scaled1);
+    RAD_ISSUE_N(c, B.add1, rows, in, scaled1, x1);
+    RAD_ISSUE_N(c, B.rms2, rows, x1, RAD_W(B.ffn_norm), n2);
+    RAD_ISSUE_N(c, B.fc1, rows, n2, RAD_W(B.fc1_w), RAD_W(B.fc1_b), RAD_NONE, h1);
+    RAD_ISSUE_N(c, B.gelu, rows, h1, h2);
+    RAD_ISSUE_N(c, B.fc2, rows, h2, RAD_W(B.fc2_w), RAD_W(B.fc2_b), RAD_NONE, h3);
+    RAD_ISSUE_N(c, B.scale2, rows, h3, RAD_W(B.ffn_gamma), scaled2);
+    RAD_ISSUE_N(c, B.add2, rows, x1, scaled2, x2);
     return View{ brow_slice(B.x2, 0, rows, B.dim), rows };
 }
 
