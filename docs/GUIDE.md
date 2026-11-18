@@ -2187,6 +2187,8 @@ by 0.002-0.003 nats.
 | `--max-body-mib N` | 512 | the largest request body; images and video arrive base64 inside it |
 | `--retry-after S` | 1 | the `Retry-After` a 429 carries |
 | `--no-cors` | CORS on | send no CORS headers (§6.6) |
+| `--duplex-test-tenants` | off | serve the duplex contract's model-free `echo` and `echo1` tenants on `/duplex/v1/session`, for checking a client without a model (§5.19) |
+| `--duplex-max-lanes N` | 2 | conversations one duplex test tenant holds at once; past it a start is `session_limit` |
 
 **Request defaults and bounds** (§4.9). A request that names the field wins.
 
@@ -2273,6 +2275,7 @@ flags are refused on it, and so are the pixel bands.
 | `GET /v1/realtime` (WebSocket) | OpenAI's realtime transcription session: audio streamed in, the words back as they are spoken (§5.14) |
 | `POST /v1/audio/speech` | OpenAI's speech API, whole or streamed: speech from a speech model (Breeze-TTS-2, `instructions` describing the voice; drama-3, speakers and direction in the input); songs from a music model (MiniMax-Music3), `input` the lyrics and `instructions` the song; else 501 (§5.15) |
 | `GET /v1/audio/speech/stream` (WebSocket) | vLLM-Omni's realtime speech session: text streamed in, each sentence's audio streamed out as soon as the sentence is complete; needs an audio generation model (§5.15) |
+| `GET /duplex/v1/info`, `GET /duplex/v1/session` (WebSocket) | the duplex engine contract: one conversation per socket, one binary step answered by one binary reply; the echo test tenants are served under `--duplex-test-tenants` (§5.19) |
 | `POST /v1/videos`, `GET /v1/videos[/:id[/content]]`, `DELETE /v1/videos/:id` | OpenAI's video jobs: a video with its soundtrack from a prompt, made in the background and downloaded as MP4; needs a video model (MiniMax-H3), else 501 (§5.16) |
 | `POST /generate`, `POST /send`, `GET /status/:uid` | Hunyuan3D-2's API server's routes: a 3-D mesh (GLB, OBJ, PLY or STL) from a picture, at once or in the background; needs a shape model (Hunyuan3D-2), else 501 (§5.17) |
 | `POST /v1/messages`, `POST /v1/messages/count_tokens` | Anthropic's Messages API, for Claude Code and the Anthropic SDKs (§5.9, §5.11) |
@@ -3696,6 +3699,26 @@ mixed image+text traffic sees every encode pass as a decode stall.
 The reference's `infer` opens its prompt with the BOS the chat template omits, and the chat path
 supplies it; `/v1/completions` prompts are served exactly as sent (the reference has no
 completions entry point), so prompt parity with the reference is a chat-endpoint property.
+
+### 5.19 Duplex engine sessions: `/duplex/v1`
+
+Radiance serves the engine side of the duplex contract in [DUPLEX-ENGINE.md](DUPLEX-ENGINE.md): a
+client owns the audio clock and the user connection, and the engine answers one 3200-sample frame
+with exactly one reply. `GET /duplex/v1/info` reports the contract version, the tenants this engine
+serves, their lane limits and the frame shape (24 kHz, 3200 samples, `f32le`). A conversation is one
+WebSocket at `/duplex/v1/session`: the first text frame is `start`, audio steps are binary frames
+(the `uint32` little-endian `seq` then 3200 little-endian `float32` samples), and each reply is one
+binary frame (the echoed `seq`, flags, optional text, optional audio). `flush`, `close` and the
+contract's error codes are as the document states; an error after `ready` is fatal and closes the
+socket. The socket is the lane: a drop or an error releases the lane and its state.
+
+No model is needed for the two built-in test tenants, which are off unless
+`--duplex-test-tenants` is given. `echo` returns each frame unchanged in the same step; `echo1`
+returns it one step later, with the first reply empty, and `flush` returns the frame it still holds.
+`--duplex-max-lanes N` sets how many conversations one test tenant holds at once (default 2); a start
+beyond it is `session_limit`. With the flag off, `/duplex/v1/info` lists no tenants and any start is
+`tenant_unavailable`. When `--api-key` is set, both the discovery request and the upgrade carry the
+key as they do for the other routes.
 
 ## 6. Operation
 
