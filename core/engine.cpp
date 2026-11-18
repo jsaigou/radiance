@@ -3679,6 +3679,9 @@ int Engine::run_server() {
     else if (shp_gen_)
         RAD_INFO("serving on http://%s:%d  (/generate, /send and /status/{uid}; completions and "
                  "chat are 501%s)", o.host.c_str(), o.port, keyed);
+    else if (dup_gen_)
+        RAD_INFO("serving on http://%s:%d  (/duplex/v1/info and /duplex/v1/session; completions and "
+                 "chat are 501%s)", o.host.c_str(), o.port, keyed);
     else if (gen_)
         RAD_INFO("serving on http://%s:%d  (/v1/images/generations%s; completions and chat are "
                  "501%s)", o.host.c_str(), o.port,
