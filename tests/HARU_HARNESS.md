@@ -80,3 +80,28 @@ public:
 - The block's own sources live in `arch/haru_common/haru_<b>.{h,cpp}` and are compiled into the test plugin by path (as hyv3_common is).
 - Tolerances are evidence-based. Start from `Tol{1e-4, 1e-4}` for float32 on the host reference unless the README's sensitivity
   section says otherwise, record the measured maximum error in the test's comment, and tighten or justify any loosening in the report.
+
+## Additions for the harness' own test
+
+- `Engine::start_with(plugin_so, model_dir, extra_args, why)` starts the engine with an explicit plugin and model
+  directory instead of `RAD_HARU_PLUGIN` and `RAD_HARU_DATA "/haru_tiny"`; the harness self-test uses it with the existing
+  `radtest_duplex` plugin and a tiny checkpoint it writes. `Engine::start` is `start_with(RAD_HARU_PLUGIN,
+  std::string(RAD_HARU_DATA) + "/haru_tiny", extra_args, why)`.
+- `Engine::log()` is the child's output so far. Every `Engine` and `Lane` failure's `why` ends with it, and a server-sent
+  error keeps its `code: message` (for example `tenant_unavailable: no tenant by that name is registered; ...`).
+- `Engine::stop()` stops the child early and returns its exit status (`~Engine` calls it too); a test uses it to check a clean
+  exit. `HARU_REQUIRE_CLOSE` is REQUIRE-style: on failure it prints the `Diff` and returns from the case.
+
+Run the self-test by hand from a configured build tree:
+
+```sh
+build/tests/haru_harness_test
+```
+
+or through ctest:
+
+```sh
+ctest --test-dir build -R haru_harness_test --output-on-failure
+```
+
+`RAD_DUPLEX_KEEP=1` leaves the engine's temporary `RADIANCE_HOME` and the test's checkpoint on disk.
