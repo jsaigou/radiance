@@ -95,6 +95,13 @@ static int declare(RadBuilder* b, const RadModelMeta*, const RadBuildCtx* ctx) {
 
     /* The twitch: the per-frame tables are in the checkpoint; `one` makes mul_weight an exact
      * copy (x * 1, including -0). */
+    /* The loader maps checkpoint tensors to declared weights by the plugin's own name map: with no
+     * entry a declared weight is 'absent from the container' and the model cannot run. The tiny
+     * checkpoint's tensors are named as the weights are. The entries come BEFORE the weights they
+     * name: a weight declared first is read as plain f32 and the engine refuses the program. */
+    RAD_ARCH_TRY(map_copy(b, "duplex.text0", "duplex.text0"));
+    RAD_ARCH_TRY(map_copy(b, "duplex.text1", "duplex.text1"));
+    RAD_ARCH_TRY(map_copy(b, "duplex.one", "duplex.one"));
     m.text0 = decl_w(b, "duplex.text0", RAD_F32, { kTextRows, 1 }, RAD_ACCESS_PER_TOKEN,
                      RAD_SHARD_NONE, grp_model());
     m.text1 = decl_w(b, "duplex.text1", RAD_F32, { kTextRows, 1 }, RAD_ACCESS_PER_TOKEN,

@@ -109,7 +109,7 @@ struct Server {
         std::vector<std::string> argv = {
             RAD_E2E_SERVER, "--model", model, "--kernels", "libref",
             "--debug-accept-reference-kernels", "--host", "127.0.0.1", "--port", "0",
-            "--http-threads", "2",
+            "--http-threads", "4",
         };
         std::vector<std::string> env = {
             "ROCR_VISIBLE_DEVICES=99", "RADIANCE_HOST_VRAM_MIB=512", "OMP_WAIT_POLICY=passive",
