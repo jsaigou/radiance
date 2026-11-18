@@ -12,9 +12,19 @@ fork or copy it.
 A duplex step carries exactly 3200 float32 in and 3200 float32 out. A test plugin is a duplex tenant whose STEP computes the
 block under test from `audio_in` and writes its result to `audio_out`. A tensor of N <= 3200 floats occupies the first N
 samples; the rest are zero. A tensor longer than 3200 uses several steps (document the order in the test). The text channel
-and status are unused. Per-lane state (a codec's history, a KV cache) lives in the plugin and is reset when a lane opens. A
-plugin may declare several tenants (for example `encode` and `decode`); the test picks one in the start message. Integers
-(token ids) are passed as floats and cast in the plugin (exact for ids < 2^24).
+and status are unused. Per-lane state (a codec's history, a KV cache) lives in the plugin and is reset when a lane opens.
+Integers (token ids) are passed as floats and cast in the plugin (exact for ids < 2^24).
+
+**A plugin declares exactly ONE duplex tenant** (the engine keeps one declaration per program; a second declaration overwrites
+the first, `core/build/rad_builder.cpp` declare_duplex_tenant). An earlier version of this file said a plugin could declare
+several and the test pick one by name; that was wrong. To test several operations of one block (for example encode, decode,
+debug), the test selects the operation through the **mode channel**: the start message's `card` is tokenised by the engine with
+the plugin's template, and the plugin's PROMPT pass sees the row count in the host-readable `RadDuplexBatch::n_tok`; the plugin
+records `mode[lane]` from it. A test opens the lane with a card of `m` DISTINCT ASCII letters (`a`, `ab`, `abc` ...) for mode
+`m`. This is fragile if the tokenizer ever merges those letters, so every test that uses it MUST include a self-check case that
+proves the mapping (for example mode 0 echoes a known input and a mode-to-token-count probe), and fail with a clear message if it
+does not hold. Alternatively build the plugin once per mode (a compile-time define) and start one engine per mode with
+`Engine::start_with` (see "What the harness adds"); both are acceptable, pick the simpler for your block.
 
 ## API
 
