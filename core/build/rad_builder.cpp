@@ -2213,6 +2213,13 @@ int Builder::declare_duplex_tenant(const RadDuplexDecl* d) {
         if (!id_ok(d->pad_id, "pad_id") || !id_ok(d->eop_id, "eop_id") ||
             !id_ok(d->eos_id, "eos_id"))
             return RAD_E_INVAL;
+        /* The host draws N(0,1) and multiplies by this; the plugin owns the checkpoint's
+         * latent_std and the reference's fixed 0.8 (vibevoice_codec.py:196-200). */
+        if (!(d->codec_noise_scale > 0.0) || !std::isfinite(d->codec_noise_scale)) {
+            err(RAD_E_INVAL, "declare_duplex_tenant '%s': codec_noise_scale %g must be > 0 and "
+                             "finite when host_sampling is 1", nm, d->codec_noise_scale);
+            return RAD_E_INVAL;
+        }
     }
     prog_.dup_str.name = nm;
     prog_.dup_str.tmpl = d->tmpl;

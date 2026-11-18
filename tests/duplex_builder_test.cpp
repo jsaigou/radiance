@@ -8,6 +8,7 @@
 
 #include "build/rad_build.h"
 
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
@@ -78,6 +79,22 @@ struct Fixture {
         d.audio_out = buf("wire_out", RAD_F32, d.max_lanes, d.samples_per_frame);
         d.text_out = buf("text_out", RAD_I32, d.max_lanes);
         d.status = buf("status", RAD_I32, d.max_lanes);
+        return d;
+    }
+
+    /* The ABI 39 host-sampling declaration: the logits/PAD-EOP readbacks, text_in and the
+     * codec-noise coefficient the host multiplies its normal draws by. */
+    RadDuplexDecl host_decl() {
+        RadDuplexDecl d = decl();
+        d.n_vocab = 8;
+        d.host_sampling = 1;
+        d.pad_id = 0;
+        d.eop_id = 1;
+        d.eos_id = 2;
+        d.logits_out = buf("logits_out", RAD_F32, d.max_lanes, d.n_vocab);
+        d.pad_eop_out = buf("pad_eop_out", RAD_F32, d.max_lanes, 2);
+        d.text_in = buf("text_in", RAD_I32, d.max_lanes);
+        d.codec_noise_scale = 0.625;
         return d;
     }
 };
@@ -154,6 +171,43 @@ TEST(each_validation_rule_is_refused_by_name) {
     check([](Fixture& f, RadDuplexDecl& d) {
         d.status = f.buf("host_status", RAD_I32, d.max_lanes, 1, RAD_DOMAIN_HOST);
     }, "status");
+}
+
+/* ABI 39: host sampling declares the codec-noise coefficient the host multiplies N(0,1) by. The
+ * declaration must be positive and finite; a host-sampling tenant with a missing value would draw
+ * zero noise silently. A plugin-sampling declaration is unaffected. */
+TEST(host_sampling_requires_a_positive_finite_codec_noise_scale) {
+    {
+        Fixture f;
+        RadDuplexDecl d = f.host_decl();
+        CHECK_OK(f.b->declare_duplex_tenant(&d));
+        CHECK_EQ(f.b->program().duplex.codec_noise_scale, 0.625);
+    }
+    {
+        Fixture f;
+        RadDuplexDecl d = f.host_decl();
+        d.codec_noise_scale = 0.0;
+        refused_by_name(*f.b, d, "codec_noise_scale");
+    }
+    {
+        Fixture f;
+        RadDuplexDecl d = f.host_decl();
+        d.codec_noise_scale = std::numeric_limits<double>::infinity();
+        refused_by_name(*f.b, d, "codec_noise_scale");
+    }
+    {
+        Fixture f;
+        RadDuplexDecl d = f.host_decl();
+        d.codec_noise_scale = std::numeric_limits<double>::quiet_NaN();
+        refused_by_name(*f.b, d, "codec_noise_scale");
+    }
+    {
+        /* Zero is the natural "unused" value of a plugin-sampling declaration. */
+        Fixture f;
+        RadDuplexDecl d = f.decl();
+        d.codec_noise_scale = 0.0;
+        CHECK_OK(f.b->declare_duplex_tenant(&d));
+    }
 }
 
 /* A program that already declared a piece generator refuses a duplex tenant, by the existing

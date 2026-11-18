@@ -1673,6 +1673,12 @@ typedef struct RadDuplexDecl {
     rad_buf     logits_out;     /* f32 [max_lanes, n_vocab], device */
     rad_buf     pad_eop_out;    /* f32 [max_lanes, 2], device */
     rad_buf     text_in;        /* i32 [max_lanes], device; host writes */
+
+    /* ---- ABI 39: the codec-noise coefficient the host multiplies its normal draws by.
+     * .haru-ref/vibevoice_codec.py:196-200: combined = scale * (latent_std / 0.8) * raw.
+     * The host does not read the checkpoint; the plugin declares latent_std / 0.8 here.
+     * Required (> 0 and finite) when host_sampling is 1; ignored otherwise. */
+    double      codec_noise_scale;
 } RadDuplexDecl;
 
 int rad_declare_duplex_tenant(RadBuilder* b, const RadDuplexDecl* d);

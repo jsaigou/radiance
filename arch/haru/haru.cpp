@@ -236,6 +236,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     d.logits_out = m.logits_out;
     d.pad_eop_out = m.pad_eop_out;
     d.text_in = m.text_in;
+    /* .haru-ref/vibevoice_codec.py:196-200: the host draws the normal and multiplies by
+     * latent_std / 0.8. The checkpoint owns latent_std; the host does not read it. */
+    d.codec_noise_scale = cg.latent_std / 0.8;
     RAD_ARCH_TRY(rad_declare_duplex_tenant(b, &d));
 
     rad_note(b, "haru: %lld lanes, %lld-sample frames, latent %lld, vocab %lld; one-ahead "
