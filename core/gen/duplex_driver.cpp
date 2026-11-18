@@ -463,6 +463,7 @@ int DuplexDriver::open(std::unique_ptr<DuplexRequest> r, std::shared_ptr<DuplexT
                 free_lanes_.pop_back();
                 j->req = std::move(r);
                 j->open_ticket = t;
+                t->set_lane(j->lane);
                 j->T = T;
                 j->seed = j->req->seed;
                 jobs_.push_back(std::move(j));

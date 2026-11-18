@@ -74,6 +74,11 @@ public:
     bool finished() const;
     int  status() const;
     std::string why() const;
+    /* For an open: the lane the driver admitted this conversation to, valid as soon as open()
+     * returned RAD_OK (the lane is assigned at admission, not when the prompt runs). It is the
+     * handle step(), flush() and close() take. -1 on a ticket that was refused. */
+    int32_t lane() const { return lane_.load(); }
+    void    set_lane(int32_t l) { lane_.store(l); }
 
     std::atomic<bool> cancel{false};
 
@@ -84,6 +89,7 @@ private:
     bool                    done_ = false;
     int                     status_ = RAD_OK;
     std::string             why_;
+    std::atomic<int32_t>    lane_{-1};
 };
 
 /* What a server hands open(): the prompt rows (card tokens and one placeholder per reference
