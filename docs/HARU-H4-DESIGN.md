@@ -276,7 +276,7 @@ This tree stages exactly those positions and nothing else:
 
 - PROMPT: `pos[i] = i` for the lane's rows (`core/gen/duplex_driver.cpp:750-753`); STEP: one row
   per lane at `pos = j.pos`, the lane's next row (`:842-847`), which the driver advances by one per
-  completed prompt and step (`:966-972, 1005-1007`).
+  completed prompt and step (`:972, 1009-1010`).
 - `RadBatch::rope_pos` is left null and `rope_mixed` 0 (`base_batches`, `:663-705`; neither field
   is set anywhere in the file).
 - `rope_posmc` therefore returns the rank-1 `positions` operand (`arch/common/rad_arch.h:1333-1336`).
