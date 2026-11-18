@@ -142,8 +142,7 @@ TEST(the_meanflow_head_matches_the_goldens) {
             fprintf(stderr, "    frame %d: %s\n", t, why.c_str());
             REQUIRE(false);
         }
-        if (!check_close(("frame " + std::to_string(t) + " head").c_str(), out, want))
-            REQUIRE(false);
+        REQUIRE(check_close(("frame " + std::to_string(t) + " head").c_str(), out, want));
     }
 
     /* No golden exists for other guidance values; check the runtime scalar actually reaches the
@@ -232,8 +231,7 @@ TEST(the_audio_embedding_matches_the_goldens) {
             fprintf(stderr, "    frame %d: %s\n", t, why.c_str());
             REQUIRE(false);
         }
-        if (!check_close(("frame " + std::to_string(t) + " embed").c_str(), out, want))
-            REQUIRE(false);
+        REQUIRE(check_close(("frame " + std::to_string(t) + " embed").c_str(), out, want));
     }
 
     /* Every prompt position, with the masks the reference used. */
@@ -271,7 +269,7 @@ TEST(the_audio_embedding_matches_the_goldens) {
             fprintf(stderr, "    prompt row %zu: %s\n", i, why.c_str());
             REQUIRE(false);
         }
-        if (!check_close(("prompt row " + std::to_string(i)).c_str(), out, want)) REQUIRE(false);
+        REQUIRE(check_close(("prompt row " + std::to_string(i)).c_str(), out, want));
     }
 }
 
