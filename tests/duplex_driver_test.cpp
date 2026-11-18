@@ -15,8 +15,11 @@ using namespace sched_fake;
 
 #include "gen/duplex_driver.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <memory>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -517,3 +520,130 @@ TEST(the_context_bound_refuses_a_step_past_it) {
 }
 
 RAD_TEST_MAIN()
+
+/* The single-threaded cases above cannot show what the driver is for: server threads calling
+ * open/step/close while the engine thread runs next()/done(). Here four client threads each hold
+ * a lane, step it many times, check every reply bit for bit, and sometimes close it with a step in
+ * flight, while one engine thread plays the plugin. Every ticket must finish (no hang), no reply
+ * may carry another lane's data, and every lane must be reusable afterwards. */
+TEST(concurrent_lanes_never_hang_mix_data_or_leak_a_lane) {
+    constexpr int kWorkers = 4, kRounds = 12, kSteps = 6;
+    /* The fake KV has 128 blocks and a placeholder group at index 0 that counts a row a block, so
+     * kWorkers lanes of ctx rows fit while kWorkers * ctx <= 128. 32 rows hold the 2-row card and
+     * the kSteps live frames. */
+    Fixture f(/*ctx=*/32, /*lanes=*/kWorkers, /*max_prompt=*/16);
+    REQUIRE_EQ(f.init(), RAD_OK);
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> engine_passes{0};
+    std::thread engine([&] {
+        int step = 0;
+        while (!stop.load()) {
+            const RadBatch* b = f.drv.next(step++);
+            if (!b) { std::this_thread::sleep_for(std::chrono::microseconds(50)); continue; }
+            if (b->gen == RAD_GEN_PASS_DUPLEX_STEP && b->dup_b) {
+                /* The fake plugin, as answer_step plays it, without the test macros: those are
+                 * not for use off the test's thread. */
+                const RadDuplexBatch* D = b->dup_b;
+                const float* in = static_cast<const float*>(f.prog.buffers[f.d.audio_in].ptr);
+                float* out = nullptr; int32_t* text = nullptr; int32_t* stat = nullptr;
+                for (const gen::IPassDriver::Readback& rb : f.drv.readbacks()) {
+                    if (rb.buf == f.d.audio_out) out = static_cast<float*>(rb.host);
+                    else if (rb.buf == f.d.text_out) text = static_cast<int32_t*>(rb.host);
+                    else if (rb.buf == f.d.status) stat = static_cast<int32_t*>(rb.host);
+                }
+                if (out && text && stat)
+                    for (int64_t i = 0; i < D->n_lane; ++i) {
+                        const int32_t lane = D->lane_h[(size_t)i];
+                        for (int64_t k = 0; k < f.d.samples_per_frame; ++k) {
+                            const size_t j = (size_t)lane * (size_t)f.d.samples_per_frame + (size_t)k;
+                            out[j] = in[j] * 2.0f;
+                        }
+                        text[lane] = lane * 1000 + D->frame_h[(size_t)i];
+                        stat[lane] = 0;
+                    }
+            }
+            f.drv.done();
+            engine_passes.fetch_add(1);
+        }
+    });
+
+    std::atomic<int> wrong{0}, hung{0}, replies{0}, closed_early{0}, open_failed{0};
+    auto worker = [&](int id) {
+        for (int round = 0; round < kRounds; ++round) {
+            std::shared_ptr<gen::DuplexTicket> ot;
+            std::string why;
+            int st = RAD_E_FULL;
+            for (int tries = 0; tries < 2000 && st != RAD_OK; ++tries) {   /* a lane may be busy */
+                auto r = std::make_unique<gen::DuplexRequest>();
+                r->tokens = { 1, 2 };
+                r->seed = (uint64_t)id;
+                st = f.drv.open(std::move(r), &ot, &why);
+                if (st != RAD_OK) std::this_thread::sleep_for(std::chrono::microseconds(200));
+            }
+            if (st != RAD_OK) {
+                if (open_failed.fetch_add(1) == 0)
+                    fprintf(stderr, "    open refused (%d): %s\n", st, why.c_str());
+                continue;
+            }
+            bool to = false;
+            if (!ot->wait(5000, &to) || ot->status() != RAD_OK) { hung.fetch_add(1); continue; }
+            /* The lane the driver admitted this conversation to: the handle step/close take. */
+            int32_t lane = ot->lane();
+            if (lane < 0) { wrong.fetch_add(1); continue; }
+            const bool cut_short = (round % 3) == 2;       /* close with a step still in flight */
+            for (int frame = 0; frame < kSteps; ++frame) {
+                std::vector<float> in((size_t)f.d.samples_per_frame);
+                for (size_t i = 0; i < in.size(); ++i)
+                    in[i] = (float)(id * 100 + frame * 10) + (float)i;
+                std::shared_ptr<gen::DuplexTicket> t;
+                if (f.drv.step(lane, in.data(), (int64_t)in.size(), 1000 + frame, &t, &why) !=
+                    RAD_OK) {
+                    closed_early.fetch_add(1);
+                    break;
+                }
+                if (cut_short && frame == kSteps / 2) {
+                    f.drv.close(lane);
+                    gen::DuplexReply r;
+                    bool timeout = false;
+                    t->next(&r, 5000, &timeout);           /* a reply or a clean failure, not a hang */
+                    if (timeout) hung.fetch_add(1);
+                    lane = -2;
+                    break;
+                }
+                gen::DuplexReply r;
+                bool timeout = false;
+                if (!t->next(&r, 5000, &timeout)) { if (timeout) hung.fetch_add(1); break; }
+                replies.fetch_add(1);
+                bool ok = r.status == 0 && r.has_audio && r.seq == (uint64_t)(1000 + frame) &&
+                          r.audio.size() == in.size() && r.token == lane * 1000 + frame;
+                for (size_t i = 0; ok && i < in.size(); ++i) ok = r.audio[i] == in[i] * 2.0f;
+                if (!ok) wrong.fetch_add(1);
+            }
+            if (lane >= 0) f.drv.close(lane);
+        }
+    };
+    std::vector<std::thread> ts;
+    for (int i = 0; i < kWorkers; ++i) ts.emplace_back(worker, i);
+    for (std::thread& t : ts) t.join();
+    stop.store(true);
+    engine.join();
+
+    CHECK_EQ(hung.load(), 0);
+    CHECK_EQ(wrong.load(), 0);
+    CHECK_EQ(open_failed.load(), 0);
+    CHECK_EQ(closed_early.load(), 0);   /* a step is only refused if its lane was closed under it */
+    CHECK(replies.load() > 0);
+    CHECK(engine_passes.load() > 0);
+    /* Drain whatever a close left staged, then every lane must be admittable again. */
+    for (int i = 0; i < 8; ++i) { if (f.drv.next(100000 + i)) f.drv.done(); }
+    std::vector<std::shared_ptr<gen::DuplexTicket>> held;
+    for (int i = 0; i < kWorkers; ++i) {
+        std::shared_ptr<gen::DuplexTicket> t;
+        std::string why;
+        auto r = std::make_unique<gen::DuplexRequest>();
+        r->tokens = { 1 };
+        CHECK_EQ(f.drv.open(std::move(r), &t, &why), (int)RAD_OK);
+        held.push_back(t);
+    }
+}
