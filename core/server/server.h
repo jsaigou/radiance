@@ -14,6 +14,7 @@
  */
 #pragma once
 #include <functional>
+#include "duplex.h"
 #include "http.h"
 #include "iface.h"
 #include "laya.h"
@@ -122,6 +123,13 @@ struct ServerOptions {
     int64_t     queue_depth = 0;
     int64_t     max_seqs = 256;
     int         retry_after_s = 1;
+
+    /* The duplex engine endpoint (duplex.h, docs/DUPLEX-ENGINE.md). The echo test tenants take no
+     * model and are registered only when --duplex-test-tenants asks for them; `duplex_tenants` are
+     * extra model-free tenants the embedding server already holds (tests and future engines). */
+    bool        duplex_test_tenants = false;
+    int64_t     duplex_max_lanes = 2;
+    std::vector<std::shared_ptr<DuplexTenant>> duplex_tenants;
 
     int64_t     max_ctx = 0;
     int64_t     default_max_tokens = 0;     /* 0: what the context leaves (OaiLimits) */
@@ -268,6 +276,8 @@ private:
     struct TranscriptionJob;   /* speech.cpp */
     struct RealtimeSession;    /* realtime.cpp */
     struct SpeechSession;      /* speech_stream.cpp */
+    struct DuplexSession;      /* duplex.cpp */
+    struct DuplexTenantSlot;   /* duplex.cpp */
     struct VideoJob;           /* videos.cpp */
     struct ShapeJob;           /* shapes.cpp */
     struct StreamState;
@@ -354,6 +364,14 @@ private:
     void handle_speech_stream(const HttpRequest& req, WsConn& ws);
     void speech_stream_run(SpeechSession& s, WsConn& ws);
     bool speech_stream_loop(SpeechSession& s, WsConn& ws);
+
+    /* ------------------------------------------------------------------ duplex.cpp
+     * The duplex engine contract: /duplex/v1/info and the model-free /duplex/v1/session. */
+    void init_duplex_tenants();
+    HttpResponse handle_duplex_info(const HttpRequest& req);
+    void handle_duplex(const HttpRequest& req, WsConn& ws);
+    void duplex_run(DuplexSession& s, WsConn& ws);
+    bool duplex_loop(DuplexSession& s, WsConn& ws);
 
     /* ------------------------------------------------------------------ admin.cpp
      * vLLM's non-generation surface, answered on the HTTP thread without the step path, the
@@ -452,6 +470,8 @@ private:
     int64_t              queue_depth_ = 0;
     std::atomic<int64_t> realtime_sessions_{0};
     std::atomic<int64_t> speech_sessions_{0};
+    /* Fixed after construction; each slot's lane count is its own, for max_lanes. */
+    std::vector<std::unique_ptr<DuplexTenantSlot>> duplex_tenants_;
     std::atomic<bool>    stopping_{false};
     std::atomic<bool>    stuck_told_{false};   /* the stuck device's E line is out (handle_ping) */
     int64_t              started_at_ = 0;
@@ -473,6 +493,13 @@ private:
     /* The background shapes (/send), oldest first, and their threads (shapes.cpp). */
     std::mutex                              shapes_m_;
     std::vector<std::shared_ptr<ShapeJob>>  shapes_;
+};
+
+/* One registered duplex tenant and the lanes it holds now (docs/DUPLEX-ENGINE.md section 6). */
+struct Server::DuplexTenantSlot {
+    std::shared_ptr<DuplexTenant> tenant;
+    std::atomic<int64_t>          lanes{0};
+    explicit DuplexTenantSlot(std::shared_ptr<DuplexTenant> t) : tenant(std::move(t)) {}
 };
 
 }  /* namespace server */

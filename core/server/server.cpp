@@ -55,6 +55,7 @@ Server::Server(const Deps& d, const ServerOptions& o)
 
     queue_depth_ = opt_.queue_depth > 0 ? opt_.queue_depth : opt_.max_seqs * 8;
     started_at_ = unix_now();
+    init_duplex_tenants();
     register_routes();
 }
 
@@ -148,6 +149,21 @@ void Server::register_routes() {
         e.status = 426;
         e.type = "invalid_request_error";
         e.message = "/v1/realtime is a WebSocket: connect with an Upgrade: websocket request";
+        HttpResponse r = error_response(e, q.peer);
+        r.set_header("Upgrade", "websocket");
+        return r;
+    });
+    /* The duplex engine contract: discovery, and one WebSocket per conversation lane. */
+    router_.get ("/duplex/v1/info",
+                 [this](const HttpRequest& q) { return handle_duplex_info(q); });
+    router_.socket("/duplex/v1/session",
+                   [this](const HttpRequest& q, WsConn& c) { handle_duplex(q, c); });
+    router_.get ("/duplex/v1/session", [this](const HttpRequest& q) {
+        ApiError e;
+        e.status = 426;
+        e.type = "invalid_request_error";
+        e.message = "/duplex/v1/session is a WebSocket: connect with an Upgrade: websocket "
+                    "request";
         HttpResponse r = error_response(e, q.peer);
         r.set_header("Upgrade", "websocket");
         return r;
