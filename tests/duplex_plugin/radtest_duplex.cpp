@@ -161,11 +161,11 @@ static void step(RadCtx* c, const RadBatch* batch) {
         const RadKVGroupBatch* kb = batch->n_kv_groups > 0 ? &batch->kv[0] : nullptr;
         RAD_ISSUE_N(c, m.op_attn, batch->max_q_len,
                     RAD_B_N(m.q, 0, T), RAD_KV(m.kv, 0),
-                    RAD_P_T2(kb ? kb->block_table : nullptr, RAD_I32, batch->n_seq,
-                             kb ? kb->block_table_pitch : 0),
-                    RAD_P_T2(kb ? kb->seqused : nullptr, RAD_I32, batch->n_seq, 1),
+                    praw2(kb ? kb->block_table : nullptr, RAD_I32, batch->n_seq,
+                          kb ? kb->block_table_pitch : 0),
+                    praw(kb ? kb->seqused : nullptr, RAD_I32, batch->n_seq),
                     RAD_NONE, RAD_NONE,
-                    RAD_P_T2(batch->cu_seqlens, RAD_I32, batch->n_seq + 1, 1),
+                    praw(batch->cu_seqlens, RAD_I32, batch->n_seq + 1),
                     RAD_B_N(m.attn, 0, T));
         return;
     }
@@ -180,7 +180,7 @@ static void step(RadCtx* c, const RadBatch* batch) {
         const int32_t lane = d->lane_h[i];
         const rad_op op = lane == 1 ? m.op_text1 : m.op_text0;
         const rad_weight w = lane == 1 ? m.text1 : m.text0;
-        RAD_ISSUE_N(c, op, 1, RAD_P_T2(d->frame + i, RAD_I32, 1, 1), RAD_W(w),
+        RAD_ISSUE_N(c, op, 1, praw(d->frame + i, RAD_I32, 1), RAD_W(w),
                     RAD_B(m.text_tmp));
         RAD_ISSUE_N(c, m.op_cast, 1, RAD_B(m.text_tmp), RAD_B_N(m.text_out, lane, 1));
     }
