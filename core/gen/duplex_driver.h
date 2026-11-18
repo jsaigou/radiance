@@ -57,6 +57,11 @@ struct DuplexReply {
     std::vector<float> audio;
     int32_t            token = -1;
     int32_t            status = 0;
+    /* The host text stream's delta for this reply. `host_text` says it came from the source's
+     * StreamDetokenizer (and may legitimately be empty); false leaves the reply on the
+     * plugin-sampling path, where the server decodes `token` itself. */
+    std::string        text;
+    bool               host_text = false;
 };
 
 /* One lane operation's completion. The driver writes, the caller reads. */
@@ -110,11 +115,14 @@ struct DuplexHostPass {
     const int32_t* lane = nullptr;    /* [n_lane] */
     const int32_t* frame = nullptr;   /* [n_lane]; null on PROMPT */
     int64_t        n_tok = 0;         /* PROMPT rows */
+    const int32_t* ref_frame = nullptr; /* PROMPT: [n_tok], -1 card/text, >= 0 a reference frame */
     int64_t        latent_dim = 0;
     int64_t        n_vocab = 0;
     int32_t        pad_id = -1, eop_id = -1, eos_id = -1;
-    const float*   logits = nullptr;  /* tokens(): [n_lane, n_vocab] */
-    const float*   pad_eop = nullptr; /* tokens(): [n_lane, 2] */
+    /* tokens(): the declaration's staging base. Rows are lane-indexed, not entry-indexed: lane
+     * `l`'s logits are at `logits + l*n_vocab`, its PAD/EOP pair at `pad_eop + 2*l`. */
+    const float*   logits = nullptr;
+    const float*   pad_eop = nullptr;
 };
 
 /* The narrow host seam for host-side text sampling and host noise (ABI 39). The driver calls
@@ -125,14 +133,33 @@ class DuplexHostSource {
 public:
     virtual ~DuplexHostSource() = default;
 
+    /* One conversation's lifetime. The driver calls lane_opened() after assigning the lane index
+     * and before any PROMPT pass can be staged, and lane_closed() before the index is reused.
+     * Both run while the driver's mutex is held. The seed is DuplexRequest::seed. */
+    virtual void lane_opened(int32_t lane, uint64_t seed) {
+        (void)lane;
+        (void)seed;
+    }
+    virtual void lane_closed(int32_t lane) { (void)lane; }
+
     /* Before a pass. codec_noise is [n_tok, latent_dim] on PROMPT and [n_lane, latent_dim] on
-     * STEP; head_noise is [n_lane, latent_dim] on both. Both are host f32. */
+     * STEP; head_noise is [n_lane, latent_dim] on both. Both are host f32 and entry-indexed. */
     virtual int noise(const DuplexHostPass& pass, float* codec_noise, float* head_noise,
                       std::string* why) = 0;
 
-    /* After the pass's readbacks. One token per lane, in pass.lane order; a negative entry
+    /* After the pass's readbacks. One token per entry, in pass.lane order; a negative entry
      * leaves the reply's token to the plugin's text_out and does not update text_in. */
     virtual int tokens(const DuplexHostPass& pass, int32_t* out, std::string* why) = 0;
+
+    /* The STEP reply's detokenized delta. RAD_OK means this lane's text is a stream delta;
+     * RAD_E_UNSUPPORTED (the default) leaves the reply on the plugin-sampling path. Called for a
+     * STEP's lane after its token was sampled; not called on PROMPT. */
+    virtual int reply_text(int32_t lane, std::string* out, std::string* why) {
+        (void)lane;
+        (void)out;
+        (void)why;
+        return RAD_E_UNSUPPORTED;
+    }
 };
 
 class DuplexDriver final : public IPassDriver {

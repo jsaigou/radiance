@@ -378,6 +378,7 @@ void DuplexDriver::release_locked(Job& j) {
         j.have_kv = false;
     }
     if (j.lane >= 0) {
+        if (host_source_) host_source_->lane_closed(j.lane);
         free_lanes_.push_back(j.lane);
         j.lane = -1;
     }
@@ -504,6 +505,7 @@ int DuplexDriver::open(std::unique_ptr<DuplexRequest> r, std::shared_ptr<DuplexT
                 t->set_lane(j->lane);
                 j->T = T;
                 j->seed = j->req->seed;
+                if (host_source_) host_source_->lane_opened(j->lane, j->seed);
                 jobs_.push_back(std::move(j));
             }
         }
@@ -757,6 +759,9 @@ void DuplexDriver::make_host_pass(int kind, int64_t n_lane, int64_t n_tok,
     out->lane = h_lane_.data();
     out->frame = kind == RAD_GEN_PASS_DUPLEX_STEP ? h_frame_.data() : nullptr;
     out->n_tok = n_tok;
+    out->ref_frame = kind == RAD_GEN_PASS_DUPLEX_PROMPT && !h_ref_frame_.empty()
+                         ? h_ref_frame_.data()
+                         : nullptr;
     out->latent_dim = decl_.latent_dim;
     out->n_vocab = decl_.n_vocab;
     out->pad_id = decl_.pad_id;
@@ -1159,6 +1164,13 @@ int DuplexDriver::done() {
                     const int32_t host_tok =
                         i < host_tokens.size() ? host_tokens[i] : -1;
                     s.r.token = host_tok >= 0 ? host_tok : (decl_.text ? text[j->lane] : -1);
+                    if (host_source_ && decl_.host_sampling) {
+                        std::string delta, twhy;
+                        if (host_source_->reply_text(j->lane, &delta, &twhy) >= 0) {
+                            s.r.text = std::move(delta);
+                            s.r.host_text = true;
+                        }
+                    }
                     if (st == 0) {
                         const size_t off = (size_t)j->lane * (size_t)decl_.samples_per_frame;
                         s.r.audio.assign(audio + off,

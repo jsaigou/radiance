@@ -19,6 +19,7 @@ using namespace sched_fake;
 #include <chrono>
 #include <cstring>
 #include <memory>
+#include <set>
 #include <thread>
 #include <string>
 #include <vector>
@@ -232,14 +233,51 @@ struct TeacherSource final : gen::DuplexHostSource {
     }
 };
 
+/* A source that proves the driver's readbacks are lane-indexed: the test's answer_logits() writes
+ * lane L's row as `L * 100`, and this source reads only `logits + lane*n_vocab`. It also records
+ * the lane lifetime notifications. */
+struct LaneSource final : gen::DuplexHostSource {
+    std::set<int32_t> open;
+    int64_t noise_calls = 0;
+    int64_t token_calls = 0;
+
+    void lane_opened(int32_t lane, uint64_t) override { open.insert(lane); }
+    void lane_closed(int32_t lane) override { open.erase(lane); }
+
+    int noise(const gen::DuplexHostPass& p, float* codec_noise, float* head_noise,
+              std::string*) override {
+        ++noise_calls;
+        const int64_t rows = p.kind == RAD_GEN_PASS_DUPLEX_PROMPT ? p.n_tok : p.n_lane;
+        for (int64_t r = 0; r < rows * p.latent_dim; ++r) codec_noise[r] = 0.0f;
+        for (int64_t r = 0; r < p.n_lane * p.latent_dim; ++r) head_noise[r] = 0.0f;
+        return RAD_OK;
+    }
+    int tokens(const gen::DuplexHostPass& p, int32_t* out, std::string*) override {
+        ++token_calls;
+        for (int64_t i = 0; i < p.n_lane; ++i) {
+            const int32_t lane = p.lane ? p.lane[i] : (int32_t)i;
+            const float* row = p.logits ? p.logits + (size_t)lane * p.n_vocab : nullptr;
+            const int32_t tok = row && p.n_vocab > 0 ? (int32_t)(row[0] / 100.0f) : -1;
+            out[i] = tok >= 0 && tok < p.n_vocab ? tok : -1;
+        }
+        return RAD_OK;
+    }
+    int reply_text(int32_t, std::string* out, std::string*) override {
+        out->clear();
+        return RAD_OK;
+    }
+};
+
 }  /* namespace */
 
 /* ABI 39: the driver stages host noise, reads the row's logits back to the source, and feeds the
  * sampled token into the declaration's text_in for the next STEP. */
 TEST(host_sampling_seam_stages_noise_and_feeds_the_token_back) {
+    /* The source outlives the fixture: the driver's destructor releases its lanes and calls
+     * lane_closed while the source must still be alive. */
+    TeacherSource src;
     Fixture f(64, 1, 16, /*host_sampling=*/true);
     REQUIRE_EQ(f.init(), RAD_OK);
-    TeacherSource src;
     src.codec.assign(64 * 2, 0.5f);
     src.head.assign(64 * 2, 0.25f);
     src.script = { 5, 6, 7 };
@@ -290,6 +328,70 @@ TEST(host_sampling_seam_stages_noise_and_feeds_the_token_back) {
     CHECK_OK(f.drv.done());
     REQUIRE(t2->next(&r, 0, &to));
     CHECK_EQ(r.token, 7);
+}
+
+/* A two-entry STEP in lane order [1, 0], not entry order. The source reads the lane-indexed
+ * readbacks and returns a token derived from that lane's row; a source that indexed by entry
+ * would return lane 0's token for lane 1 and the tickets would disagree. */
+TEST(two_entry_step_uses_lane_indexed_readbacks_and_lane_order) {
+    LaneSource src;  /* outlives the fixture, whose destructor closes the lanes */
+    Fixture f(64, 2, 16, /*host_sampling=*/true);
+    REQUIRE_EQ(f.init(), RAD_OK);
+    f.drv.set_host_source(&src);
+
+    auto open_prompt = [&](std::shared_ptr<gen::DuplexTicket>* t) -> bool {
+        std::string why;
+        if (f.open({ 1, 2 }, t, &why) < 0) return false;
+        const RadBatch* b = f.drv.next(f.step++);
+        if (!b || !b->dup_b) return false;
+        if (b->dup_b->n_lane != 1 || b->dup_b->lane_h[0] != (*t)->lane()) return false;
+        f.answer_logits(b, 0.0f);
+        if (f.drv.done() < 0) return false;
+        bool to = false;
+        if (!(*t)->wait(0, &to) || (*t)->status() != RAD_OK) return false;
+        return true;
+    };
+
+    std::shared_ptr<gen::DuplexTicket> a, bb, c;
+    REQUIRE(open_prompt(&a));
+    REQUIRE(open_prompt(&bb));
+    CHECK_EQ(a->lane(), 0);
+    CHECK_EQ(bb->lane(), 1);
+    CHECK_EQ(src.open.count(0), (size_t)1);
+    CHECK_EQ(src.open.count(1), (size_t)1);
+
+    /* Close lane 0 and reopen it: the new job is appended after lane 1, so the next multi-lane
+     * STEP is staged [1, 0]. */
+    CHECK_OK(f.drv.close(a->lane()));
+    CHECK_EQ(src.open.count(0), (size_t)0);
+    REQUIRE(open_prompt(&c));
+    CHECK_EQ(c->lane(), 0);
+
+    std::string why;
+    std::shared_ptr<gen::DuplexTicket> tb, tc;
+    REQUIRE_EQ(f.queue_step(bb->lane(), 100, 1.0f, &tb, &why), RAD_OK);
+    REQUIRE_EQ(f.queue_step(c->lane(), 0, 2.0f, &tc, &why), RAD_OK);
+    const RadBatch* b = f.drv.next(f.step++);
+    REQUIRE(b != nullptr);
+    CHECK_EQ(b->gen, (int32_t)RAD_GEN_PASS_DUPLEX_STEP);
+    REQUIRE(b->dup_b != nullptr);
+    CHECK_EQ(b->dup_b->n_lane, (int64_t)2);
+    CHECK_EQ(b->dup_b->lane_h[0], 1);
+    CHECK_EQ(b->dup_b->lane_h[1], 0);
+    f.answer_logits(b, 0.0f);
+    f.answer_step(b);
+    CHECK_OK(f.drv.done());
+
+    gen::DuplexReply rb, rc;
+    bool to = false;
+    REQUIRE(tb->next(&rb, 0, &to));
+    REQUIRE(tc->next(&rc, 0, &to));
+    CHECK_EQ(rb.token, 1);
+    CHECK_EQ(rc.token, 0);
+    REQUIRE_EQ(rb.audio.size(), (size_t)f.d.samples_per_frame);
+    REQUIRE_EQ(rc.audio.size(), (size_t)f.d.samples_per_frame);
+    CHECK_EQ(rb.audio[0], 2.0f);
+    CHECK_EQ(rc.audio[0], 4.0f);
 }
 
 /* A card-only prompt: the card rows, their positions, the lane's last row, no references. */

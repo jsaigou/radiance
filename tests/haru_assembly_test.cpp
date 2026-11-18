@@ -112,18 +112,26 @@ struct TeacherSource final : rad::gen::DuplexHostSource {
 
     int tokens(const rad::gen::DuplexHostPass& p, int32_t* out, std::string*) override {
         if (p.kind == RAD_GEN_PASS_DUPLEX_PROMPT) {
-            if (p.logits) s.prompt_logits.assign(p.logits, p.logits + p.n_vocab);
-            if (p.pad_eop) s.prompt_pad.assign(p.pad_eop, p.pad_eop + 2);
+            const int32_t lane = p.lane ? p.lane[0] : 0;
+            /* Readbacks are lane-indexed, not entry-indexed (core/gen/duplex_driver.h). */
+            if (p.logits)
+                s.prompt_logits.assign(p.logits + (size_t)lane * p.n_vocab,
+                                       p.logits + (size_t)(lane + 1) * p.n_vocab);
+            if (p.pad_eop) s.prompt_pad.assign(p.pad_eop + (size_t)lane * 2,
+                                               p.pad_eop + (size_t)(lane + 1) * 2);
             s.prompt_token = s.tokens.empty() ? -1 : s.tokens[0];
             out[0] = s.prompt_token;
         } else {
             for (int64_t l = 0; l < p.n_lane; ++l) {
                 const int64_t f = p.frame ? p.frame[l] : 0;
+                const int32_t lane = p.lane ? p.lane[l] : (int32_t)l;
                 /* Record one lane's row; the test drives one lane at a time. */
                 if (p.logits)
-                    s.last_logits.assign(p.logits + l * p.n_vocab,
-                                         p.logits + (l + 1) * p.n_vocab);
-                if (p.pad_eop) s.last_pad.assign(p.pad_eop + l * 2, p.pad_eop + (l + 1) * 2);
+                    s.last_logits.assign(p.logits + (size_t)lane * p.n_vocab,
+                                         p.logits + (size_t)(lane + 1) * p.n_vocab);
+                if (p.pad_eop)
+                    s.last_pad.assign(p.pad_eop + (size_t)lane * 2,
+                                      p.pad_eop + (size_t)(lane + 1) * 2);
                 out[l] = (f + 1 < (int64_t)s.tokens.size()) ? s.tokens[(size_t)(f + 1)] : -1;
             }
         }
