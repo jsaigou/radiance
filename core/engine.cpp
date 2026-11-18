@@ -2895,6 +2895,8 @@ int Engine::run_server() {
     o.local_hosts = cfg_.allow_hosts;
     o.trusted_proxies = cfg_.trusted_proxies;
     o.max_seqs = cfg_.max_seqs;
+    o.duplex_test_tenants = cfg_.duplex_test_tenants;
+    o.duplex_max_lanes = cfg_.duplex_max_lanes;
     /* `n` fans one request out over the batch, so the default scales with --max-num-seqs; the
      * floor of 8 keeps a small batch from refusing what it would queue. */
     o.max_n    = cfg_.max_n > 0 ? (int)cfg_.max_n : (int)std::max<int64_t>(o.max_n, cfg_.max_seqs);
