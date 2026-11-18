@@ -1156,9 +1156,10 @@ int Engine::declare() {
                 decide("--max-num-seqs", "8", "a duplex tenant: its conversations at once");
             }
             if (!cfg_.given.count("--max-model-len") && cfg_.max_ctx == 0) {
-                cfg_.max_ctx = pb.gen_ctx > 0 ? pb.gen_ctx : pb.gen_rows;
+                const int64_t probe_ctx = pb.gen_ctx > 0 ? pb.gen_ctx : pb.gen_rows;
+                cfg_.max_ctx = std::max<int64_t>(probe_ctx, cfg_.duplex_max_ctx);
                 decide("--max-model-len", std::to_string(cfg_.max_ctx),
-                       "a duplex tenant: the prompt and a lane's live context");
+                       "--duplex-max-ctx: a lane's prompt and live frames");
             }
             if (cfg_.mm_max_patches < 0) cfg_.mm_max_patches = 0;
             if (cfg_.n_spec < 0) cfg_.n_spec = 0;

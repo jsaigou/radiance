@@ -1138,6 +1138,9 @@ struct Config {
     /* --duplex-max-lanes: the conversations one duplex test tenant holds at once; past it a start
      * is session_limit. */
     int64_t duplex_max_lanes = 2;
+    /* --duplex-max-ctx: the context a duplex lane may grow to, prompt included, in rows. The
+     * default is 30 minutes at 7.5 frames a second; the KV plan reserves it a lane. */
+    int64_t duplex_max_ctx = 13500;
     /* --duplex-idle-s: how long a duplex session may receive no message at all before it is
      * closed with the "timeout" error. */
     int64_t duplex_idle_s = 30;

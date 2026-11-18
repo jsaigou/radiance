@@ -35,6 +35,8 @@ static const char* pass_name(int gen) {
     case RAD_GEN_PASS_SSTEP:   return "sstep";
     case RAD_GEN_PASS_SLATENT: return "slatent";
     case RAD_GEN_PASS_SQUERY:  return "squery";
+    case RAD_GEN_PASS_DUPLEX_PROMPT: return "duplex_prompt";
+    case RAD_GEN_PASS_DUPLEX_STEP:   return "duplex_step";
     default:                   return "";
     }
 }

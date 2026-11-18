@@ -766,6 +766,60 @@ public:
     virtual int64_t running() const = 0;
 };
 
+/* The duplex tenant (core/gen/duplex_driver.h, abi/rad_builder.h's RadDuplexDecl), for a model
+ * that answers one audio frame at a time: its declaration and one synchronous lane operation at a
+ * time. The server renders the card/reference prompt, opens a lane and feeds the driver one frame
+ * per step. */
+struct DuplexGenInfo {
+    std::string name, tmpl;
+    bool    text = false;
+    int64_t max_lanes = 1;
+    int64_t max_prompt = 0, max_ref_frames = 0, ref_rate = 0, ref_hop = 0;
+    int64_t sample_rate = 0, samples_per_frame = 0, channels = 1;
+    int64_t frame_rate_num = 1, frame_rate_den = 1, latent_dim = 0;
+};
+
+/* What the server hands the driver for a lane: its prompt rows, the reference clips end to end,
+ * their bounds and the frame each prompt row embeds (-1 for a card/text row). */
+struct DuplexGenRequest {
+    std::vector<int32_t> tokens;
+    std::vector<float>   ref_audio;
+    std::vector<int32_t> ref_cu;
+    std::vector<int32_t> ref_frame;
+    uint64_t             seed = 0;
+};
+
+/* One lane operation's answer: status 0 has an audio frame, 1 has none (audio is empty), < 0 is a
+ * failed lane. `token` is the optional text token, -1 for none. */
+struct DuplexGenReply {
+    std::vector<float> audio;
+    int32_t            token = -1;
+    int32_t            status = 0;
+};
+
+class IDuplexGen {
+public:
+    virtual ~IDuplexGen() = default;
+    virtual const DuplexGenInfo& info() const = 0;
+    /* Open a lane and wait for its prompt to be in the KV. `*lane` is the handle step(), flush()
+     * and close() take. RAD_E_FULL when no lane or no KV is free. */
+    virtual int open(std::unique_ptr<DuplexGenRequest> r, int32_t* lane, std::string* why) = 0;
+    /* One frame in, one reply. Blocks until the pass has run. */
+    virtual int step(int32_t lane, const std::vector<float>& samples, uint64_t seq,
+                     DuplexGenReply* out, std::string* why) = 0;
+    virtual int flush(int32_t lane, uint64_t seq, DuplexGenReply* out, std::string* why) = 0;
+    virtual void close(int32_t lane) = 0;
+    /* The text one token adds, when the model's vocabulary needs more than the server tokenizer;
+     * false means the server decodes the id itself. */
+    virtual bool decode_token(int32_t token, std::string* out) const {
+        (void)token;
+        (void)out;
+        return false;
+    }
+    virtual int64_t queued() const = 0;
+    virtual int64_t running() const = 0;
+};
+
 /* The video generator (core/gen/video_driver.h), for a model that makes a video and its
  * soundtrack from text: its declared prompt template, sizes and lengths, and its request queue.
  * The server renders and tokenises the prompt, queues the request as a job, and turns what the
