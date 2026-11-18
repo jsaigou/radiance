@@ -463,6 +463,27 @@ TEST(a_silent_session_times_out_before_start_and_releases_its_lane_after) {
     }
 }
 
+TEST(start_max_minutes_times_out_and_releases_the_lane) {
+    auto rec = std::make_shared<RecordingTenant>();
+    Fixture f(Fixture::Tweak{ [rec](ServerOptions& o, Deps&) {
+        o.duplex_test_tenants = true;
+        o.duplex_minute_ms = 50;
+        o.duplex_tenants.push_back(rec);
+    } });
+    Session s(f);
+    json j = start_json("record");
+    j["max_minutes"] = 1;
+    s.conn.client(j);
+    REQUIRE(!s.conn.wait_for("ready").is_null());
+    const json e = s.conn.wait_for("error", 0, 5000);
+    REQUIRE(!e.is_null());
+    CHECK_EQ(e.value("code", std::string()), std::string("timeout"));
+    CHECK(s.conn.wait_closed());
+    s.join();
+    std::lock_guard<std::mutex> lk(rec->m);
+    CHECK_EQ(rec->closes, 1);
+}
+
 TEST(a_lane_is_released_when_the_client_drops_the_socket) {
     auto rec = std::make_shared<RecordingTenant>();
     Fixture f(Fixture::Tweak{ [rec](ServerOptions& o, Deps&) {

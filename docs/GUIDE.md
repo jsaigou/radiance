@@ -3718,9 +3718,10 @@ No model is needed for the two built-in test tenants, which are off unless
 returns it one step later, with the first reply empty, and `flush` returns the frame it still holds.
 `--duplex-max-lanes N` sets how many conversations one test tenant holds at once (default 2); a start
 beyond it is `session_limit`. A session that receives no message for `--duplex-idle-s` seconds
-(default 30) is closed with the fatal `timeout` error. With the flag off, `/duplex/v1/info` lists no
-tenants and any start is `tenant_unavailable`. When `--api-key` is set, both the discovery request
-and the upgrade carry the key as they do for the other routes.
+(default 30) is closed with the fatal `timeout` error, and a lane that runs past
+`start.max_minutes` (when positive) is closed the same way. With the flag off,
+`/duplex/v1/info` lists no tenants and any start is `tenant_unavailable`. When `--api-key` is set,
+both the discovery request and the upgrade carry the key as they do for the other routes.
 
 ## 6. Operation
 

@@ -130,6 +130,8 @@ struct ServerOptions {
     bool        duplex_test_tenants = false;
     int64_t     duplex_max_lanes = 2;
     int64_t     duplex_idle_s = 30;
+    /* Test-only scale for start.max_minutes; never set from a flag or the environment. */
+    int64_t     duplex_minute_ms = 60 * 1000;
     std::vector<std::shared_ptr<DuplexTenant>> duplex_tenants;
 
     int64_t     max_ctx = 0;

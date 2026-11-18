@@ -215,6 +215,8 @@ struct Server::DuplexSession {
     bool have_step = false;
     uint64_t steps = 0;
     Clock::time_point last_message;
+    Clock::time_point opened;
+    int64_t max_minutes = 0;
 
     void release() {
         if (lane) {
@@ -315,6 +317,8 @@ bool Server::duplex_loop(DuplexSession& s, WsConn& ws) {
             return fail("internal", "the tenant could not open the session", 1011);
         }
         s.lane = std::move(lane);
+        s.opened = Clock::now();
+        s.max_minutes = s.pending->max_minutes;
         s.pending.reset();
         s.phase = DuplexSession::Phase::Running;
         s.next_seq = 0;
@@ -524,6 +528,14 @@ bool Server::duplex_loop(DuplexSession& s, WsConn& ws) {
         if (gone) return false;
         if (stopping_.load())
             return fail("internal", "the server is shutting down", 1001);
+        if (s.max_minutes > 0) {
+            const double elapsed = std::chrono::duration<double, std::milli>(
+                Clock::now() - s.opened).count();
+            const double limit = (double)s.max_minutes *
+                                 (double)std::max<int64_t>(1, opt_.duplex_minute_ms);
+            if (elapsed >= limit)
+                return fail("timeout", "the session reached start.max_minutes", 1008);
+        }
         if (got.empty() && Clock::now() - s.last_message >= idle_for)
             return fail("timeout",
                         fmt("the session received no message for more than %lld seconds",
