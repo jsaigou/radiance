@@ -76,6 +76,8 @@ set(RAD_TEST_CORE stdc++ rad_core)
 # A test-only architecture plugin (tests/duplex_plugin), built into $RADIANCE_HOME/archtest so a
 # normal radiance run never scans it. duplex_plugin_test copies it into a temporary home.
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/duplex_plugin ${CMAKE_CURRENT_BINARY_DIR}/duplex_plugin)
+# The Haru building blocks' test plugins (arch/haru_common), added per block once it has a CMakeLists.txt.
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/haru_plugins ${CMAKE_CURRENT_BINARY_DIR}/haru_plugins)
 
 # harness_test runs harness_fixture's cases through the harness's command line (rad_test.h).
 set(RAD_TESTS_HARNESS harness_test)
@@ -391,6 +393,20 @@ if(TARGET duplex_plugin_test AND TARGET radtest_duplex)
   add_dependencies(duplex_plugin_test radiance libref radtest_duplex)
   set_tests_properties(duplex_plugin_test PROPERTIES LABELS "e2e" TIMEOUT 300)
 endif()
+
+# The Haru block tests (tests/haru_<block>_test.cpp, plugin radtest_haru_<block>): the binary, libref and the
+# block's test plugin, kept out of the fast tier like the other e2e runs. Active per block once both exist.
+foreach(block codec head lm)
+  if(TARGET haru_${block}_test AND TARGET radtest_haru_${block})
+    target_compile_definitions(haru_${block}_test PRIVATE
+      RAD_E2E_SERVER="$<TARGET_FILE:radiance>"
+      RAD_E2E_HOME="${RAD_PLUGIN_OUT}"
+      RAD_HARU_PLUGIN="$<TARGET_FILE:radtest_haru_${block}>"
+      RAD_HARU_DATA="${CMAKE_SOURCE_DIR}/tests/data/haru")
+    add_dependencies(haru_${block}_test radiance libref radtest_haru_${block})
+    set_tests_properties(haru_${block}_test PROPERTIES LABELS "e2e" TIMEOUT 600)
+  endif()
+endforeach()
 
 # abi_layout_test compares the ABI's struct layouts with a C translation unit's: abi_c_test.c
 # includes every abi/ header as strict C11, so a header only C++ accepts fails the build.
