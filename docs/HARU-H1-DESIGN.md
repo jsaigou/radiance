@@ -510,8 +510,9 @@ directory `tests/haru_plugins/codec/` currently holds only `.gitkeep`.
 `Engine::start` (host libref, tiny model directory) must pass `--http-threads 4` (the engine's minimum;
 `tests/duplex_plugin_test.cpp:108-117` uses exactly 4) and `--debug-accept-reference-kernels`; libref is
 the only kernel library. The plugin still needs a minimal `RAD_KV_FULL` group and a PROMPT pass because
-the duplex driver requires exactly one full-attention group and at least one prompt consumer
-(`core/gen/duplex_driver.cpp:200-226`; `tests/duplex_plugin/radtest_duplex.cpp:64-83, 164-177`). The
+the duplex driver requires exactly one full-attention group and a nonzero block size, and the block size
+comes from the group's first consumer op (`core/gen/duplex_driver.cpp:200-226`;
+`core/build/rad_builder.cpp:383-440`; `tests/duplex_plugin/radtest_duplex.cpp:64-83, 164-177`). The
 codec work runs in STEP.
 
 ### 6.2 One tenant, several modes: the ABI fact to settle first
