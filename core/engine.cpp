@@ -2321,6 +2321,22 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
 
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
 
+    const int ws = start_workers();
+    if (ws < 0) return ws;
+    if (cfg_.kld() || cfg_.calib()) {
+        print_startup_report(RAD_OK);
+        startup_watch_.reset();
+    }
+    int s = cfg_.kld() ? run_kld() : cfg_.calib() ? run_calib() : run_server();
+    startup_watch_.reset();
+
+    stop_workers();
+    /* A step-loop error takes precedence over the transport's status. */
+    const int ls = loop_status_.load(std::memory_order_acquire);
+    return ls < 0 ? ls : s;
+}
+
+int Engine::start_workers() {
     if (const int xs = xstats_open(); xs < 0) return xs;
 
     barrier_ = std::make_unique<RankBarrier>(cfg_.tp + 1);
@@ -2331,26 +2347,19 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
 
     rank_threads_.clear();
     for (int i = 0; i < cfg_.tp; ++i) rank_threads_.emplace_back([this, i] { rank_loop(i); });
-    std::thread stepper([this] { if (gen_) gen_loop(); else step_loop(); });
+    stepper_ = std::thread([this] { if (gen_) gen_loop(); else step_loop(); });
+    return RAD_OK;
+}
 
-    if (cfg_.kld() || cfg_.calib()) {
-        print_startup_report(RAD_OK);
-        startup_watch_.reset();
-    }
-    int s = cfg_.kld() ? run_kld() : cfg_.calib() ? run_calib() : run_server();
-    startup_watch_.reset();
-
+void Engine::stop_workers() {
     /* Stop the step loop before the server's storage is destroyed: Request::sink points into it,
      * and an unfinished request still writes there (server.h). */
     stopping_.store(true, std::memory_order_release);
-    barrier_->abort();
-    if (stepper.joinable()) stepper.join();
+    if (barrier_) barrier_->abort();
+    if (stepper_.joinable()) stepper_.join();
     for (auto& t : rank_threads_) if (t.joinable()) t.join();
     rank_threads_.clear();
     xstats_close();
-    /* A step-loop error takes precedence over the transport's status. */
-    const int ls = loop_status_.load(std::memory_order_acquire);
-    return ls < 0 ? ls : s;
 }
 
 /* The state slots a sequence owns, one per KV group, -1 where the group is not stateful. Read from

@@ -408,6 +408,18 @@ foreach(block codec head lm)
   endif()
 endforeach()
 
+# The assembled Haru tenant: the in-process engine, its worker loops without the HTTP server, and
+# DuplexDriver driven directly with a recorded ABI 39 teacher feed.
+if(TARGET haru_assembly_test AND TARGET haru)
+  target_compile_definitions(haru_assembly_test PRIVATE
+    RAD_E2E_SERVER="$<TARGET_FILE:radiance>"
+    RAD_E2E_HOME="${RAD_PLUGIN_OUT}"
+    RAD_HARU_PLUGIN="$<TARGET_FILE:haru>"
+    RAD_HARU_DATA="${CMAKE_SOURCE_DIR}/tests/data/haru")
+  add_dependencies(haru_assembly_test radiance libref haru)
+  set_tests_properties(haru_assembly_test PROPERTIES LABELS "e2e" TIMEOUT 600)
+endif()
+
 # The shared harness' own test: the goldens, compare(), and a real engine and lane against the
 # existing model-free radtest-duplex plugin (a zero-delay echo) with a tiny checkpoint.
 if(TARGET haru_harness_test AND TARGET radtest_duplex)

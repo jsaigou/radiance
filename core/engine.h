@@ -84,6 +84,13 @@ public:
     const Program& program() const;
     const Config&  config()  const { return cfg_; }
 
+    /* Test seam: the rank and generator/step loops without the HTTP server. start_workers() is
+     * what serve() starts before run_server(); a driver test uses it to call a pass driver
+     * directly. Production code never calls these. */
+    int  start_workers();
+    void stop_workers();
+    gen::DuplexDriver* duplex_driver() { return dup_gen_; }
+
     /* The startup report (core/diag/diag.h): every option with its value and source, the
      * machine, and what on it costs speed or correctness. serve() prints it with RAD_OK before
      * listening; main prints it with the error start() or serve() failed with, so a server that
@@ -138,6 +145,7 @@ private:
      * span the startup watch covers (main.cpp creates it here and ends it at the listen). */
     uint64_t              startup_begin_ns_ = 0;
     std::vector<std::thread>           rank_threads_;
+    std::thread                        stepper_;
 
     Config cfg_;
     /* The VRAM split each rank actually takes, filled by Engine::plan. Equal to cfg_ on every
