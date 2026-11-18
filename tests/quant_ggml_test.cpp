@@ -62,9 +62,10 @@ const Type kTypes[] = {
                "zero=bf16[1x32]", true, 256, 0.751 },
     { "iq1_m", "affine:codes=u11[1x8],grid=i8{2048x8},scale=u4[1x16],scale.1=f16[1x256],"
                "zero=bf16[1x8]", false, 256, 0.770 },
-    /* Q2_0's four levels are (-1, 0, +1, +2) x the block amax, so on this fixture's 10x outliers
-     * the positive ones clamp at +2d and the relative error is far above the other types'; the
-     * bound only has to be tight enough to catch a wrong plane layout (which decodes to noise). */
+    /* Q2_0's codes name (-1, 0, +1, +2) x the scale, and the core's generic decoder has no offset
+     * to apply to a u2 plane with no zero plane, so it reads the raw code x scale. This case only
+     * checks the layout (a wrong one decodes to noise); the real Q2_0 error, with the offset, is in
+     * q2_0_scale_search_beats_the_amax_rule_and_nearly_reaches_the_optimum below. */
     { "q2_0", "u2*f16[1x64]", false, 64, 4.2 },
 };
 
@@ -188,8 +189,8 @@ TEST(the_imatrix_reaches_the_search) {
     NEED_LIBQUANT();
     /* With importances the search minimises the importance-weighted error, so every type that
      * has a search must lower it measurably (2.5-25% on this weight). q8_0 has no search
-     * (llama.cpp rounds to nearest either way) and must not change at all; nor does q2_0, whose
-     * llama.cpp quantiser has no imatrix path. */
+     * (llama.cpp rounds to nearest either way) and must not change at all. q2_0's scale search
+     * is importance-weighted here, so it must lower the weighted error like the others. */
     const int64_t R = 32, C = 1024;
     const std::vector<float> w = draw(R * C, 11, 10.0f);
     const std::vector<float> imp = importance(C, 12);
@@ -199,7 +200,7 @@ TEST(the_imatrix_reaches_the_search) {
         Quantised b = quantise_ggml(t.name, R, C, w, imp.data(), 8);
         REQUIRE_EQ(a.status, RAD_OK);
         REQUIRE_EQ(b.status, RAD_OK);
-        if (!std::strcmp(t.name, "q8_0") || !std::strcmp(t.name, "q2_0")) {
+        if (!std::strcmp(t.name, "q8_0")) {
             CHECK(a.planes == b.planes);
             continue;
         }
@@ -207,6 +208,55 @@ TEST(the_imatrix_reaches_the_search) {
         const double eb = weighted_err(w, decode(b, R, C), imp, C);
         CHECK(eb < 0.99 * ea);
     }
+}
+
+TEST(q2_0_scale_search_beats_the_amax_rule_and_nearly_reaches_the_optimum) {
+    NEED_LIBQUANT();
+    /* Q2_0 codes name (-1, 0, +1, +2) x one f16 scale per 64 values. llama.cpp's reference sets the
+     * scale to the block's amax, so a value below amax/2 becomes zero; libquant instead searches
+     * the scale. Restated here from the definition: the amax rule's error, and the best error a
+     * fine scan of the scale can reach (the optimum for one block). The search must never lose to
+     * the amax rule and must land within 2% of the scan. */
+    const int64_t R = 8, C = 512;
+    const std::vector<float> w = draw(R * C, 61, 3.0f);
+    Quantised q = quantise_ggml("q2_0", R, C, w, nullptr);
+    REQUIRE_EQ(q.status, RAD_OK);
+    std::vector<float> dec = decode(q, R, C);
+    REQUIRE_EQ(dec.size(), (size_t)(R * C));
+    /* the core's decoder returns code x scale; the value is (code - 1) x scale */
+    for (int64_t b = 0; b < R * C / 64; ++b) {
+        uint16_t h;
+        std::memcpy(&h, q.planes[1].data() + 2 * b, 2);
+        const float sc = rad_f16_to_f32(h);
+        for (int j = 0; j < 64; ++j) dec[(size_t)(64 * b + j)] -= sc;
+    }
+    double e_search = 0, e_amax = 0, e_best = 0;
+    for (int64_t b = 0; b < R * C / 64; ++b) {
+        const float* x = w.data() + 64 * b;
+        float amax = 0;
+        for (int j = 0; j < 64; ++j) amax = std::fmax(amax, std::fabs(x[j]));
+        auto err_at = [&](float d) {
+            const float dd = rad_f16_to_f32(rad_f32_to_f16(d)), id = dd > 0 ? 1.0f / dd : 0.0f;
+            double e = 0;
+            for (int j = 0; j < 64; ++j) {
+                const int qv = std::min(3, std::max(0, (int)std::roundf(x[j] * id) + 1));
+                const double r = (double)x[j] - dd * (qv - 1);
+                e += r * r;
+            }
+            return e;
+        };
+        e_amax += err_at(amax);
+        double best = err_at(amax);
+        for (int k = 1; k <= 4000; ++k) best = std::min(best, err_at(amax * (0.15f + 0.9f * (float)k / 4000.0f)));
+        e_best += best;
+        for (int j = 0; j < 64; ++j) {
+            const double r = (double)x[j] - dec[(size_t)(64 * b + j)];
+            e_search += r * r;
+        }
+    }
+    CHECK(e_search <= e_amax);
+    CHECK(e_search < 0.9 * e_amax);
+    CHECK(e_search <= 1.02 * e_best);
 }
 
 TEST(q8_0_is_round_to_nearest_against_amax_over_127) {

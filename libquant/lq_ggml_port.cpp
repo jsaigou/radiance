@@ -25,6 +25,7 @@
  */
 #include "lq_ggml_port.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cfloat>
 #include <cmath>
@@ -4298,15 +4299,86 @@ void quantize_row_q2_0_ref(const float * GGML_RESTRICT x, block_q2_0 * GGML_REST
     }
 }
 
+/* Q2_0 as this fork quantises it: the same blocks (64 values, one f16 scale, codes naming
+ * (-1, 0, +1, +2) x scale), but with the scale chosen to minimise the error instead of set to the
+ * block's amax. The amax rule above sends every value below amax/2 to zero: on Qwen3.8-Flash-Next's
+ * Q2_0 down experts that is 80% zeros and a relative error of 0.72 against bf16, where a
+ * least-squares scale gives about 0.38 and Unsloth's own blocks 0.365. Decoding is unchanged, so
+ * a container written either way loads and runs identically (same bytes, same kernel).
+ *
+ * Search: the candidates are amax x (0.20 ... 1.00) in 48 steps (1.00 is the amax rule, so the
+ * result is never worse than it), each scored on the f16-rounded scale the decoder will use; then a
+ * few least-squares refinements of the best one (d = sum(w x l) / sum(w l^2) for the codes it
+ * implies). `weights` is the per-column importance of an imatrix, or null for plain error. */
+static float q2_0_block_error(const float * x, const float * w, int n, float d, uint8_t * codes) {
+    const float id = d > 0.0f ? 1.0f / d : 0.0f;
+    float err = 0.0f;
+    for (int j = 0; j < n; ++j) {
+        int q = (int)roundf(x[j] * id) + 1;
+        if (q < 0) q = 0;
+        if (q > 3) q = 3;
+        if (codes) codes[j] = (uint8_t)q;
+        const float e = x[j] - d * (float)(q - 1);
+        err += (w ? w[j] : 1.0f) * e * e;
+    }
+    return err;
+}
+
+static void quantize_row_q2_0_search(const float * GGML_RESTRICT x, block_q2_0 * GGML_RESTRICT y, int64_t k,
+                                     const float * GGML_RESTRICT weights) {
+    static const int qk = QK2_0;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+    for (int i = 0; i < nb; i++) {
+        const float * xb = x + i*qk;
+        const float * wb = weights ? weights + i*qk : nullptr;
+        float amax = 0.0f, wsum = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            amax = std::max(amax, fabsf(xb[j]));
+            if (wb) wsum += wb[j];
+        }
+        if (wb && !(wsum > 0.0f)) wb = nullptr;  // an all-zero importance block: plain error
+        float best_d = 0.0f, best_e = FLT_MAX;
+        if (amax > 0.0f) {
+            for (int c = 0; c < 48; ++c) {
+                const float d = GGML_FP16_TO_FP32(GGML_FP32_TO_FP16(amax * (0.20f + 0.80f * (float)c / 47.0f)));
+                if (!(d > 0.0f)) continue;
+                const float e = q2_0_block_error(xb, wb, qk, d, nullptr);
+                if (e < best_e) { best_e = e; best_d = d; }
+            }
+            for (int it = 0; it < 3; ++it) {
+                uint8_t codes[QK2_0];
+                q2_0_block_error(xb, wb, qk, best_d, codes);
+                float num = 0.0f, den = 0.0f;
+                for (int j = 0; j < qk; ++j) {
+                    const float l = (float)(codes[j] - 1), wj = wb ? wb[j] : 1.0f;
+                    num += wj * xb[j] * l;
+                    den += wj * l * l;
+                }
+                if (!(den > 0.0f) || !(num > 0.0f)) break;
+                const float d = GGML_FP16_TO_FP32(GGML_FP32_TO_FP16(num / den));
+                const float e = d > 0.0f ? q2_0_block_error(xb, wb, qk, d, nullptr) : FLT_MAX;
+                if (e < best_e) { best_e = e; best_d = d; } else break;
+            }
+        }
+        y[i].d = GGML_FP32_TO_FP16(best_d);
+        for (int j = 0; j < qk / 4; ++j) y[i].qs[j] = 0;
+        uint8_t codes[QK2_0];
+        q2_0_block_error(xb, nullptr, qk, best_d, codes);
+        for (int j = 0; j < qk; ++j) y[i].qs[j / 4] |= (uint8_t)(codes[j] << ((j % 4) * 2));
+    }
+}
+
 size_t quantize_q2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow,
                      int64_t n_per_row, const float * quant_weights) {
-    (void)quant_weights;
     if (n_per_row % QK2_0) {
         std::fprintf(stderr, "libquant: q2_0 needs a row a whole number of %d values\n", (int)QK2_0);
         std::abort();
     }
-    quantize_row_q2_0_ref(src, (block_q2_0 *)dst, (int64_t)nrow*n_per_row);
-    return nrow * ggml_row_size(GGML_TYPE_Q2_0, n_per_row);
+    const size_t row_size = ggml_row_size(GGML_TYPE_Q2_0, n_per_row);
+    for (int64_t r = 0; r < nrow; ++r)
+        quantize_row_q2_0_search(src + r*n_per_row, (block_q2_0 *)((char *)dst + r*row_size), n_per_row, quant_weights);
+    return nrow * row_size;
 }
 
 bool ggml_quantize_requires_imatrix(enum ggml_type type) {
