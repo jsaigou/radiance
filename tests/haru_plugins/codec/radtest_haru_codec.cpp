@@ -51,7 +51,7 @@ struct Model {
     rad_buf q = 0, attn = 0;
     rad_kvgroup kv = 0;
     rad_op op_fill_q = 0, op_attn = 0, op_status_err = 0;
-    std::array<rad_op, kProbeMax + 1> probe_fill{};
+    std::array<rad_op, (size_t)(kProbeMax + 1)> probe_fill{};
     int32_t mode[kMaxLanes] = {};
 };
 
