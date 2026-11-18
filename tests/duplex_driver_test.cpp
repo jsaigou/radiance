@@ -136,7 +136,7 @@ struct Fixture {
 
     /* The fake plugin's STEP: read what the driver uploaded into the declared audio_in buffer,
      * write the declared outputs. */
-    void answer_step(const RadBatch* b) {
+    void answer_step(const RadBatch* b, int32_t status = 0) {
         const RadDuplexBatch* D = b->dup_b;
         CHECK(D != nullptr);
         if (!D) return;
@@ -154,12 +154,14 @@ struct Fixture {
         for (int64_t i = 0; i < D->n_lane; ++i) {
             const int32_t lane = D->lane_h[(size_t)i];
             const int32_t frame = D->frame_h[(size_t)i];
-            for (int64_t s = 0; s < d.samples_per_frame; ++s) {
-                const size_t k = (size_t)lane * (size_t)d.samples_per_frame + (size_t)s;
-                out[k] = in[k] * 2.0f;
+            if (status == 0) {
+                for (int64_t s = 0; s < d.samples_per_frame; ++s) {
+                    const size_t k = (size_t)lane * (size_t)d.samples_per_frame + (size_t)s;
+                    out[k] = in[k] * 2.0f;
+                }
             }
             text[lane] = lane * 1000 + frame;
-            stat[lane] = 0;
+            stat[lane] = status;
         }
     }
 };
@@ -271,6 +273,35 @@ TEST(a_step_returns_the_lanes_model_frame) {
         CHECK(std::memcmp(r.audio.data(), want.data(), want.size() * 4) == 0);
         CHECK(t->finished());
     }
+}
+
+/* Status 1 is a reply with no audio: the driver does not read audio_out and the reply carries no
+ * samples, while its text token is still delivered. */
+TEST(a_status_one_reply_has_no_audio) {
+    Fixture f;
+    REQUIRE_EQ(f.init(), RAD_OK);
+    std::shared_ptr<gen::DuplexTicket> open;
+    std::string why;
+    REQUIRE_EQ(f.open({ 1, 2 }, &open, &why), RAD_OK);
+    const RadBatch* b = f.run_prompt(open);
+    REQUIRE(b != nullptr);
+    const int32_t lane = open->lane();
+    CHECK_EQ(lane, b->dup_b->lane_h[0]);
+
+    std::shared_ptr<gen::DuplexTicket> t;
+    REQUIRE_EQ(f.queue_step(lane, 31, 7.0f, &t, &why), RAD_OK);
+    b = f.drv.next(f.step++);
+    REQUIRE(b != nullptr);
+    f.answer_step(b, 1);
+    CHECK_OK(f.drv.done());
+    gen::DuplexReply r;
+    bool to = false;
+    REQUIRE(t->next(&r, 0, &to));
+    CHECK_EQ(r.seq, (uint64_t)31);
+    CHECK_EQ(r.status, 1);
+    CHECK(!r.has_audio);
+    CHECK(r.audio.empty());
+    CHECK_EQ(r.token, lane * 1000);
 }
 
 /* Two lanes with inputs waiting go in one STEP pass, each with its own row, position and frame;

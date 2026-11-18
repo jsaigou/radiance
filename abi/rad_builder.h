@@ -1652,7 +1652,10 @@ typedef struct RadDuplexDecl {
     rad_buf     audio_in;          /* f32 [max_lanes, samples_per_frame] */
     rad_buf     audio_out;         /* f32 [max_lanes, samples_per_frame] */
     rad_buf     text_out;          /* i32 [max_lanes], -1 = no token; required with text */
-    rad_buf     status;            /* i32 [max_lanes], 0 = replied, < 0 = fatal */
+    /* i32 [max_lanes], one a lane. 0: replied with an audio frame. 1: replied with NO audio (a
+     * silent frame); audio_out is not read. < 0: fatal. This is a comment-only meaning, not a
+     * layout change. */
+    rad_buf     status;
 } RadDuplexDecl;
 
 int rad_declare_duplex_tenant(RadBuilder* b, const RadDuplexDecl* d);

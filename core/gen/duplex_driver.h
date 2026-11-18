@@ -49,7 +49,8 @@ struct IKVManager;
 namespace gen {
 
 /* One step's reply: the echoed wire sequence, the lane's model frame (when it made one), an
- * optional text token (-1 for none) and the plugin's status (0 replied, < 0 fatal). */
+ * optional text token (-1 for none) and the plugin's status (0 replied with audio, 1 replied with
+ * no audio, < 0 fatal). `audio` is empty for status 1 and `has_audio` is false. */
 struct DuplexReply {
     uint64_t           seq = 0;
     bool               has_audio = false;

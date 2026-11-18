@@ -988,15 +988,22 @@ int DuplexDriver::done() {
                     fail_locked(*j, st, "the duplex lane failed", &fin);
                     continue;
                 }
+                if (st > 1) {
+                    fail_locked(*j, RAD_E_INVAL, "the duplex lane returned an invalid status", &fin);
+                    continue;
+                }
                 if (j->step_ticket) {
                     Send s;
                     s.t = j->step_ticket;
                     s.r.seq = j->pending_seq;
                     s.r.status = st;
-                    s.r.has_audio = true;
+                    s.r.has_audio = st == 0;
                     s.r.token = decl_.text ? text[j->lane] : -1;
-                    const size_t off = (size_t)j->lane * (size_t)decl_.samples_per_frame;
-                    s.r.audio.assign(audio + off, audio + off + (size_t)decl_.samples_per_frame);
+                    if (st == 0) {
+                        const size_t off = (size_t)j->lane * (size_t)decl_.samples_per_frame;
+                        s.r.audio.assign(audio + off,
+                                         audio + off + (size_t)decl_.samples_per_frame);
+                    }
                     send.push_back(std::move(s));
                 }
                 j->pos += 1;
