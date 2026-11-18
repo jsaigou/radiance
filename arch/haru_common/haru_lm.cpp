@@ -156,8 +156,8 @@ int HaruLm::declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* 
     if (!kv_conv) return RAD_E_INVAL;
 
     /* ---- buffers, shared by every layer of a kind (qwen35_bf16.cpp:259-294). */
-    b_x  = decl_b(b, nm.f("x"), g.act_dtype, {g.max_tok, g.n_embd});
-    b_h  = decl_b(b, nm.f("h"), g.act_dtype, {g.max_tok, g.n_embd});
+    b_x  = decl_b(b, nm.f("x"), g.act_dtype, {g.max_tok, g.n_embd}, RAD_BUF_PERSIST);
+    b_h  = decl_b(b, nm.f("h"), g.act_dtype, {g.max_tok, g.n_embd}, RAD_BUF_PERSIST);
     b_qg = decl_b(b, nm.f("attn_qg"),  g.act_dtype, {g.max_tok, g.n_head, 2 * g.head_dim});
     b_k  = decl_b(b, nm.f("attn_k"),   g.act_dtype, {g.max_tok, kv_dim});
     b_v  = decl_b(b, nm.f("attn_v"),   g.act_dtype, {g.max_tok, kv_dim});

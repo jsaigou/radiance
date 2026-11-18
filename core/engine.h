@@ -76,6 +76,9 @@ public:
      * server listens, or the KL mode starts scoring, so the stretch from start() to there
      * reports where it waits like start() itself. */
     int serve(std::unique_ptr<StallWatch> watch);
+    /* serve() up to the point where the worker threads start: builds the pass driver and the
+     * scheduler. Test seam, with start_workers() below; production calls serve(). */
+    int serve_prepare(std::unique_ptr<StallWatch> watch);
 
     /* --debug-graph and friends: print everything declare and plan learned, without serving. A
      * first-class mode rather than a verbose-flag side effect, so what runs is always visible. */

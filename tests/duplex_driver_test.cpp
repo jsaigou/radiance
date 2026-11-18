@@ -211,7 +211,7 @@ struct Fixture {
 struct TeacherSource final : gen::DuplexHostSource {
     std::vector<float>   codec;
     std::vector<float>   head;
-    std::vector<int32_t> tokens;
+    std::vector<int32_t> script;
     int64_t noise_calls = 0;
     size_t  token_at = 0;
 
@@ -227,7 +227,7 @@ struct TeacherSource final : gen::DuplexHostSource {
     }
     int tokens(const gen::DuplexHostPass& p, int32_t* out, std::string*) override {
         for (int64_t i = 0; i < p.n_lane; ++i)
-            out[i] = token_at < tokens.size() ? tokens[token_at++] : -1;
+            out[i] = token_at < script.size() ? script[token_at++] : -1;
         return RAD_OK;
     }
 };
@@ -242,7 +242,7 @@ TEST(host_sampling_seam_stages_noise_and_feeds_the_token_back) {
     TeacherSource src;
     src.codec.assign(64 * 2, 0.5f);
     src.head.assign(64 * 2, 0.25f);
-    src.tokens = { 5, 6, 7 };
+    src.script = { 5, 6, 7 };
     f.drv.set_host_source(&src);
 
     std::shared_ptr<gen::DuplexTicket> open;

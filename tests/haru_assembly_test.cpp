@@ -19,6 +19,7 @@
 #include "haru_harness.h"
 
 #include "engine.h"
+#include "util/stallwatch.h"
 #include "gen/duplex_driver.h"
 
 #include <algorithm>
@@ -225,6 +226,10 @@ TEST(the_assembled_tenant_matches_the_tiny_goldens_for_the_prompt_and_24_frames)
         REQUIRE(false);
         return;
     }
+    if (engine.serve_prepare(nullptr) < 0) {
+        REQUIRE(false);
+        return;
+    }
     Workers guard{ &engine };
     if (engine.start_workers() < 0) {
         REQUIRE(false);
@@ -300,9 +305,9 @@ TEST(the_assembled_tenant_matches_the_tiny_goldens_for_the_prompt_and_24_frames)
         return true;
     };
 
-    if (!run_lane("lane0", kSteps)) return;
-    if (!run_lane("lane1", 2)) return;        /* a second lane, same schedule */
-    if (!run_lane("reopen", 1)) return;       /* close/reopen: fresh codec and latent state */
+    REQUIRE(run_lane("lane0", kSteps));
+    REQUIRE(run_lane("lane1", 2));        /* a second lane, same schedule */
+    REQUIRE(run_lane("reopen", 1));       /* close/reopen: fresh codec and latent state */
     engine.stop_workers();
     guard.e = nullptr;
 }

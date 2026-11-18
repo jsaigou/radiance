@@ -2040,7 +2040,7 @@ void Engine::clear_fresh_states() {
     ranks_[0]->kv.clear_state_clears();
 }
 
-int Engine::serve(std::unique_ptr<StallWatch> watch) {
+int Engine::serve_prepare(std::unique_ptr<StallWatch> watch) {
     startup_watch_ = std::move(watch);
     if (ranks_.empty() || !ranks_[0]->ctx.program()) {
         RAD_ERR("serve: start() has not run, or stopped at --debug-graph");
@@ -2320,7 +2320,11 @@ int Engine::serve(std::unique_ptr<StallWatch> watch) {
     }
 
     for (auto& r : ranks_) r->sampler.attach_vocab(vocab_view_.get());
+    return RAD_OK;
+}
 
+int Engine::serve(std::unique_ptr<StallWatch> watch) {
+    if (const int ps = serve_prepare(std::move(watch)); ps < 0) return ps;
     const int ws = start_workers();
     if (ws < 0) return ws;
     if (cfg_.kld() || cfg_.calib()) {
