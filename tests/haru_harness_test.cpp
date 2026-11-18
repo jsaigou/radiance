@@ -198,6 +198,18 @@ TEST(a_lane_echoes_six_distinct_frames_bit_exactly) {
         REQUIRE_EQ(out.size(), in.size());
         CHECK(std::memcmp(out.data(), in.data(), in.size() * sizeof(float)) == 0);
     }
+
+    /* run() pads a short tensor to a frame and returns only the prefix asked for. */
+    {
+        const std::vector<float> small = { 1.5f, -2.25f, 0.0f, 3.0f };
+        std::vector<float> out;
+        if (!lane->run(small, small.size(), &out, &why)) {
+            fprintf(stderr, "    run failed: %s\n", why.c_str());
+            REQUIRE(false);
+        }
+        REQUIRE_EQ(out.size(), small.size());
+        CHECK(std::memcmp(out.data(), small.data(), small.size() * sizeof(float)) == 0);
+    }
     lane->close();
 }
 
