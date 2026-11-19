@@ -222,13 +222,16 @@ void HaruProj::issue(RadCtx* c, RadOperand token, RadOperand model_latent, RadOp
 
 void HaruProj::unscale(RadCtx* c, RadOperand normalized, RadOperand out) const {
     if (!c) return;
-    /* r = 1 / latent_scale, by Newton's iteration from 0.75. The assumed range is [0.5, 2.0];
-     * after six steps the relative error is below f32 rounding at both ends of that range. */
+    /* r = 1 / latent_scale, by Newton's iteration from 0.75. It converges for 0 < s < 2.67 and,
+     * with twelve steps, reaches f32 exactness for s in [0.05, 2.6]: the error e = 1 - s r0 is
+     * squared each step, and the worst case (s = 0.05, e = 0.9625) is below 1e-30 at step 12.
+     * The real Haru-4B checkpoint has latent_scale = 0.1963 (bf16), which six steps left at a
+     * relative error of 4e-5 (found in Phase 0 on the real checkpoint, 2026-11-19). */
     RAD_ISSUE_N(c, op_fill_r0, 1, RAD_B(b_r0));
     RAD_ISSUE_N(c, op_fill_two, 1, RAD_B(b_two));
     RAD_ISSUE_N(c, op_fill_minus1, 1, RAD_B(b_minus1));
     rad_buf cur = b_r0, nxt = b_r1;
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < kUnscaleSteps; ++i) {
         RAD_ISSUE_N(c, op_mulw_scale1, 1, RAD_B(cur), RAD_W(latent_scale), RAD_B(b_u)); /* s r */
         RAD_ISSUE_N(c, op_mul_1, 1, RAD_B(b_u), RAD_B(b_minus1), RAD_B(b_v));      /* -s r */
         RAD_ISSUE_N(c, op_add_1, 1, RAD_B(b_two), RAD_B(b_v), RAD_B(b_s));          /* 2 - s r */

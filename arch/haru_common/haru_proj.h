@@ -53,10 +53,12 @@ struct HaruProj {
     rad_op op_mask = 0, op_add_h = 0;
 
     /* unscale: raw = z / latent_scale - latent_bias. The reciprocal is Newton's iteration on
-     * the device (no host read of a weight). The assumed range is latent_scale in [0.5, 2.0];
-     * r0 = 0.75 and six steps take the relative error below f32 rounding in that range. A
-     * checkpoint outside it would need a different seed/step count; the value is not
-     * host-readable at declare, so this is documented, not checked. */
+     * the device (no host read of a weight). From r0 = 0.75 and kUnscaleSteps = 12 steps the
+     * relative error is below f32 rounding for latent_scale in [0.05, 2.6]; it diverges at
+     * 2.67 and above. The real checkpoint's value is 0.1963. A checkpoint outside the range
+     * needs another step count; the value is not host-readable at declare, so this is
+     * documented and covered by a test, not checked. */
+    static constexpr int kUnscaleSteps = 12;
     rad_op op_mul_1 = 0, op_add_1 = 0, op_mulw_scale1 = 0;
     rad_op op_scale_row = 0, op_mul_d = 0;
     rad_op op_fill_r0 = 0, op_fill_two = 0, op_fill_minus1 = 0;

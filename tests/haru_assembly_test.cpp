@@ -22,6 +22,7 @@
 #include "util/stallwatch.h"
 #include "gen/duplex_driver.h"
 #include "server/duplex_host.h"
+#include "../arch/haru_common/haru_proj.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -196,15 +197,19 @@ std::unique_ptr<rad::gen::DuplexRequest> request_from_goldens(const Golden& g) {
 
 }  /* namespace */
 
-/* The same arithmetic HaruProj::unscale runs: r0 = 0.75 and six Newton steps. The documented
- * range is latent_scale in [0.5, 2.0]; the tiny checkpoint is 0.8 and the real scalar is not
- * host-readable here, so the real value is covered only by this range statement. */
+/* The same arithmetic HaruProj::unscale runs: r0 = 0.75 and HaruProj::kUnscaleSteps Newton steps.
+ * The documented range is latent_scale in [0.05, 2.6]. The tiny checkpoint is 0.8; the real
+ * Haru-4B value is 0.1962890625 (bf16), which the original six steps got wrong by 4e-5. */
 TEST(unscale_newton_covers_the_documented_latent_scale_range) {
-    for (float s : { 0.5f, 0.8f, 1.0f, 1.5f, 2.0f }) {
+    for (float s : { 0.05f, 0.1f, 0.1962890625f, 0.5f, 0.8f, 1.0f, 1.5f, 2.0f, 2.5f, 2.6f }) {
         float r = 0.75f;
-        for (int i = 0; i < 6; ++i) r = r * (2.0f - s * r);
+        for (int i = 0; i < rad::arch::HaruProj::kUnscaleSteps; ++i) r = r * (2.0f - s * r);
         CHECK(std::fabs(r * s - 1.0f) < 1e-6f);
     }
+    /* The six steps the first version used were not enough for the real value. */
+    float r = 0.75f;
+    for (int i = 0; i < 6; ++i) r = r * (2.0f - 0.1962890625f * r);
+    CHECK(std::fabs(r * 0.1962890625f - 1.0f) > 1e-5f);
 }
 
 TEST(the_assembled_tenant_matches_the_tiny_goldens_for_the_prompt_and_24_frames) {
