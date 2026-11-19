@@ -32,6 +32,62 @@ bool ends_with_replacement(const std::string& s) {
            static_cast<unsigned char>(s[s.size() - 3]) == 0xEF;
 }
 
+/* Length of the well-formed UTF-8 sequence starting at s[i], or 0 if there is none. Overlong forms,
+ * surrogates and code points above U+10FFFF are not well-formed. `incomplete` is set when the bytes
+ * are a valid prefix of a sequence that the end of the string cut short. */
+size_t utf8_seq(const std::string& s, size_t i, bool* incomplete) {
+    const unsigned char c = static_cast<unsigned char>(s[i]);
+    *incomplete = false;
+    if (c < 0x80) return 1;
+    size_t n;
+    unsigned char lo = 0x80, hi = 0xBF;
+    if (c >= 0xC2 && c <= 0xDF) n = 2;
+    else if (c == 0xE0) { n = 3; lo = 0xA0; }
+    else if (c == 0xED) { n = 3; hi = 0x9F; }
+    else if (c >= 0xE1 && c <= 0xEF) n = 3;
+    else if (c == 0xF0) { n = 4; lo = 0x90; }
+    else if (c == 0xF4) { n = 4; hi = 0x8F; }
+    else if (c >= 0xF1 && c <= 0xF3) n = 4;
+    else return 0;
+    for (size_t k = 1; k < n; ++k) {
+        if (i + k >= s.size()) { *incomplete = true; return 0; }
+        const unsigned char d = static_cast<unsigned char>(s[i + k]);
+        const unsigned char l = (k == 1) ? lo : 0x80, h = (k == 1) ? hi : 0xBF;
+        if (d < l || d > h) return 0;
+    }
+    return n;
+}
+
+/* Does the string end inside a multi-byte character that later bytes could still complete? */
+bool ends_incomplete(const std::string& s) {
+    size_t i = 0;
+    while (i < s.size()) {
+        bool inc = false;
+        const size_t n = utf8_seq(s, i, &inc);
+        if (inc) return true;
+        i += n ? n : 1;
+    }
+    return false;
+}
+
+/* The same text with every ill-formed byte replaced by U+FFFD, so the wire never carries bytes
+ * that are not UTF-8. */
+std::string sanitize_utf8(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    size_t i = 0;
+    while (i < s.size()) {
+        bool inc = false;
+        const size_t n = utf8_seq(s, i, &inc);
+        if (n) { out.append(s, i, n); i += n; }
+        else { out += "\xEF\xBF\xBD"; ++i; }
+    }
+    return out;
+}
+
+/* A character is at most 4 bytes; a held run longer than this is not going to complete. */
+constexpr size_t kMaxPendingTokens = 8;
+
 }  // namespace
 
 LaneSampler::LaneSampler(const SamplerConfig& config, int pad_id, int eop_id, int eos_id,
@@ -219,9 +275,15 @@ std::string StreamDetokenizer::push(int token) {
     in_gap_ = false;
     pending_.push_back(token);
     const std::string text = decode_ ? decode_(pending_) : std::string();
-    if (ends_with_replacement(text)) return std::string();  /* sampling.py:123-124 */
+    /* The reference holds while the decoded text ends in U+FFFD (sampling.py:123-124). A tokenizer
+     * that returns the raw bytes of a split character does not produce U+FFFD, so an incomplete
+     * UTF-8 tail is held too, and what is finally emitted is always well-formed UTF-8. A run that
+     * cannot complete (kMaxPendingTokens) is flushed with U+FFFD instead of being held forever. */
+    if ((ends_with_replacement(text) || ends_incomplete(text)) &&
+        pending_.size() < kMaxPendingTokens)
+        return std::string();
     pending_.clear();
-    return text;
+    return sanitize_utf8(text);
 }
 
 }  // namespace gen

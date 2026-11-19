@@ -235,6 +235,39 @@ TEST(sampler_internal_rng_statistics) {
     }
 }
 
+/* A tokenizer that returns the raw bytes of a split character (no U+FFFD): the stream holds an
+ * incomplete UTF-8 tail, completes it, replaces a stray continuation byte, and flushes a run that
+ * can never complete. What leaves the detokenizer is always well-formed UTF-8. */
+TEST(stream_detokenizer_holds_raw_partial_utf8_and_never_emits_invalid_bytes) {
+    auto decode = [](const std::vector<int>& ids) -> std::string {
+        std::string out;
+        for (int id : ids) {
+            if (id == 200) out += "\xE2";            /* first byte of a 3-byte character */
+            else if (id == 201) out += "\x82";       /* its second byte */
+            else if (id == 202) out += "\xAC";       /* its third: U+20AC */
+            else if (id == 210) out += "\xBC";       /* a stray continuation byte */
+            else if (id == 220) out += "\xF0";       /* a lead byte that never completes */
+            else if (id == 10) out += "a";
+        }
+        return out;
+    };
+    StreamDetokenizer d(decode, { 0, 1 });
+    CHECK(d.push(200) == "");
+    CHECK(d.push(201) == "");
+    CHECK(d.push(202) == "\xE2\x82\xAC");
+    CHECK(d.push(10) == "a");
+    CHECK(d.push(210) == "\xEF\xBF\xBD");   /* not held (it cannot be completed), and replaced */
+    CHECK(d.push(10) == "a");
+    for (int i = 0; i < 7; ++i) CHECK(d.push(220) == "");
+    const std::string flushed = d.push(220);     /* the 8th: flushed, never held forever */
+    CHECK(!flushed.empty());
+    for (size_t i = 0; i < flushed.size(); ) {  /* only whole U+FFFD sequences */
+        CHECK(flushed.compare(i, 3, "\xEF\xBF\xBD") == 0);
+        i += 3;
+    }
+    CHECK(d.push(10) == "a");
+}
+
 TEST(stream_detokenizer_rules) {
     /* A fake byte-level tokenizer: 10/11 are "a"/"b", 100 alone is an incomplete multi-byte
      * character (the reference's decode then ends in U+FFFD), 100+101 completes "é". */
