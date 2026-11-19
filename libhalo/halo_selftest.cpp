@@ -7335,6 +7335,130 @@ static void head_f32_ops_case(const Plugin& pl) {
     ok(what, bad_total == 0, bad_total ? detail : std::string("all paths agree"));
 }
 
+
+/* The skinny biased GEMMs (bf16 for the codec's FFNs, f32 for the audio projectors), against f64 host
+ * evaluations that apply the epilogue roundings the tiled rows promise. Every (rows, columns-in-flight)
+ * instantiation, an N that does not fill the last wave, unaligned and pitched activations, both bias
+ * dtypes, the three activations, an in-place residual, and a bf16 output from the f32 row. */
+static double bf16_round_d(double v) { return (double)h_bf16(h_to_bf16((float)v)); }
+static double gelu_erf_d(double t) { return 0.5 * t * (1.0 + std::erf(t * 0.70710678118654752)); }
+static double gelu_tanh_d(double t) { const double u = 0.7978845608028654 * (t + 0.044715 * t * t * t); return 0.5 * t * (1.0 + std::tanh(u)); }
+
+static void skinny_bias_case(const Plugin& pl) {
+    const char* what = "the skinny biased GEMMs (bf16 and f32) against f64 evaluations of the epilogue";
+    const RadKernelInfo* kb = find(pl, "gemm_bf16_nt_bias_skinny");
+    const RadKernelInfo* kf = find(pl, "gemm_f32_nt_bias_skinny");
+    if (!kb || !kf) { ok(what, false, "a row is absent"); return; }
+
+    auto fvals = [](size_t cnt, uint32_t seed, float scale) {
+        std::vector<float> v(cnt);
+        uint32_t x = seed * 2654435761u + 31u;
+        for (size_t i = 0; i < cnt; ++i) {
+            x = x * 1664525u + 1013904223u;
+            v[i] = ((float)((x >> 8) & 0xffff) / 65535.0f - 0.5f) * 2.0f * scale;
+        }
+        return v;
+    };
+    auto up = [&](const void* h, size_t bytes) { void* d = dalloc(bytes ? bytes : 4); if (d && bytes) st_memcpy(d, h, bytes, hipMemcpyHostToDevice); return d; };
+    int bad_total = 0; std::string detail;
+    auto fail = [&](const std::string& m) { ++bad_total; if (detail.size() < 700) detail += m + "; "; };
+
+    struct C { int64_t M, N, K, lda, ldy; int a_off; bool bias_f32; const char* act; bool res; };
+    // ---- bf16
+    for (const C c : { C{1, 8192, 2048, 2048, 8192, 0, true, "gelu", false}, C{1, 2048, 8192, 8192, 2048, 0, true, "none", true},
+                       C{1, 2560, 64, 64, 2560, 0, false, "gelu_tanh", false}, C{2, 1000, 136, 136, 1000, 0, true, "gelu", true},
+                       C{3, 33, 8, 8, 33, 0, true, "none", false}, C{5, 777, 520, 528, 790, 0, false, "gelu", true},
+                       C{8, 4097, 1032, 1032, 4097, 0, true, "none", false}, C{16, 513, 264, 264, 513, 0, true, "gelu", false},
+                       C{1, 300, 256, 256, 300, 3, false, "none", false}, C{4, 2048, 2048, 2048, 2048, 0, true, "gelu", true},
+                       C{9, 129, 96, 96, 129, 0, true, "gelu_tanh", true} }) {
+        std::vector<uint16_t> ab((size_t)c.M * c.lda + 16), wb((size_t)c.N * c.K), rb((size_t)c.M * c.ldy), biasb((size_t)c.N);
+        const std::vector<float> af = fvals(ab.size(), 3, 1.0f), wf = fvals(wb.size(), 4, 0.1f), rf = fvals(rb.size(), 5, 1.0f), bf = fvals((size_t)c.N, 6, 1.0f);
+        for (size_t i = 0; i < ab.size(); ++i) ab[i] = h_to_bf16(af[i]);
+        for (size_t i = 0; i < wb.size(); ++i) wb[i] = h_to_bf16(wf[i]);
+        for (size_t i = 0; i < rb.size(); ++i) rb[i] = h_to_bf16(rf[i]);
+        for (size_t i = 0; i < biasb.size(); ++i) biasb[i] = h_to_bf16(bf[i]);
+        void* da = up(ab.data(), ab.size() * 2); void* dw = up(wb.data(), wb.size() * 2);
+        void* dbias = c.bias_f32 ? up(bf.data(), bf.size() * 4) : up(biasb.data(), biasb.size() * 2);
+        void* dr = up(rb.data(), rb.size() * 2);
+        std::vector<uint16_t> yinit(rb);   // in place: the output starts as the residual when res is on
+        void* dy = c.res ? up(rb.data(), rb.size() * 2) : up(std::vector<uint16_t>(rb.size(), 0x5555).data(), rb.size() * 2);
+        if (!da || !dw || !dbias || !dr || !dy) { ok(what, false, "hipMalloc failed"); return; }
+        RadTensor ta = T((char*)da + (size_t)c.a_off * 2, RAD_BF16, { c.M, c.K }); ta.stride[0] = c.lda;
+        RadTensor ty = T(dy, RAD_BF16, { c.M, c.N }); ty.stride[0] = c.ldy;
+        RadTensor tr = T(c.res ? dy : dr, RAD_BF16, { c.M, c.N }); tr.stride[0] = c.ldy;
+        RadTensor none; std::memset(&none, 0, sizeof none);
+        std::vector<RadTensor> ts = { ta, T(dw, RAD_BF16, { c.N, c.K }), T(dbias, c.bias_f32 ? RAD_F32 : RAD_BF16, { c.N }), c.res ? tr : none, ty };
+        std::vector<RadParam> ps = { PI("M", c.M), PI("N", c.N), PI("K", c.K), PS("act", c.act), PS("dtype", "bf16") };
+        if (!run_row_f32(kb, ts, ps)) { fail(fmt("bf16 M=%lld N=%lld K=%lld launch failed", (long long)c.M, (long long)c.N, (long long)c.K)); continue; }
+        std::vector<uint16_t> got(rb.size());
+        st_memcpy(got.data(), dy, got.size() * 2, hipMemcpyDeviceToHost);
+        int64_t bad = 0; double worst = 0;
+        for (int64_t m = 0; m < c.M; ++m)
+            for (int64_t n = 0; n < c.N; ++n) {
+                double acc = 0;
+                for (int64_t k = 0; k < c.K; ++k)
+                    acc += (double)h_bf16(ab[(size_t)(c.a_off + m * c.lda + k)]) * (double)h_bf16(wb[(size_t)(n * c.K + k)]);
+                const double b = c.bias_f32 ? (double)bf[(size_t)n] : (double)h_bf16(biasb[(size_t)n]);
+                double t = bf16_round_d(acc + b);
+                if (!std::strcmp(c.act, "gelu")) t = bf16_round_d(gelu_erf_d(t));
+                else if (!std::strcmp(c.act, "gelu_tanh")) t = bf16_round_d(gelu_tanh_d(t));
+                if (c.res) t = bf16_round_d((double)h_bf16(yinit[(size_t)(m * c.ldy + n)]) + t);
+                const double g = (double)h_bf16(got[(size_t)(m * c.ldy + n)]);
+                const double e = std::fabs(g - t);
+                worst = std::max(worst, e);
+                // the accumulation order differs from the host's: allow a few bf16 ulps and f32-sum noise
+                if (e > 0.02 * std::fabs(t) + 0.02 + 1e-3 * std::sqrt((double)c.K) * 0.0) ++bad;
+            }
+        if (bad) fail(fmt("bf16 M=%lld N=%lld K=%lld act=%s res=%d bias_f32=%d a_off=%d bad=%lld worst=%g", (long long)c.M, (long long)c.N, (long long)c.K, c.act, (int)c.res, (int)c.bias_f32, c.a_off, (long long)bad, worst));
+    }
+    // ---- f32 (output f32, and bf16 out of the f32 row)
+    struct F { int64_t M, N, K, lda, ldy; int a_off; bool bias_f32; const char* act; bool res; bool out_bf16; };
+    for (const F c : { F{1, 2560, 2560, 2560, 2560, 0, true, "none", false, false}, F{1, 2560, 256, 256, 2560, 0, false, "gelu", false, false},
+                       F{1, 64, 2560, 2560, 64, 0, true, "none", true, false}, F{3, 777, 132, 132, 777, 0, true, "gelu_tanh", false, false},
+                       F{8, 129, 4, 4, 129, 0, false, "none", false, false}, F{2, 1000, 260, 264, 1000, 1, true, "gelu", true, false},
+                       F{4, 513, 520, 520, 513, 0, true, "none", false, true}, F{1, 2048, 1024, 1024, 2048, 0, true, "gelu", true, true} }) {
+        const std::vector<float> af = fvals((size_t)c.M * c.lda + 16, 3, 1.0f), wf = fvals((size_t)c.N * c.K, 4, 0.1f), bf = fvals((size_t)c.N, 6, 1.0f), rf = fvals((size_t)c.M * c.ldy, 5, 1.0f);
+        std::vector<uint16_t> biasb((size_t)c.N), rfb((size_t)c.M * c.ldy);
+        std::vector<float> bias_eff = bf;
+        for (size_t i = 0; i < biasb.size(); ++i) { biasb[i] = h_to_bf16(bf[i]); if (!c.bias_f32) bias_eff[i] = h_bf16(biasb[i]); }
+        std::vector<float> res_eff = rf;
+        for (size_t i = 0; i < rfb.size(); ++i) { rfb[i] = h_to_bf16(rf[i]); if (c.out_bf16) res_eff[i] = h_bf16(rfb[i]); }
+        void* da = up(af.data(), af.size() * 4); void* dw = up(wf.data(), wf.size() * 4);
+        void* dbias = c.bias_f32 ? up(bf.data(), bf.size() * 4) : up(biasb.data(), biasb.size() * 2);
+        void* dy;
+        if (c.out_bf16) dy = c.res ? up(rfb.data(), rfb.size() * 2) : up(std::vector<uint16_t>(rfb.size(), 0x5555).data(), rfb.size() * 2);
+        else dy = c.res ? up(rf.data(), rf.size() * 4) : up(std::vector<float>(rf.size(), 9.0f).data(), rf.size() * 4);
+        if (!da || !dw || !dbias || !dy) { ok(what, false, "hipMalloc failed"); return; }
+        RadTensor ta = T((char*)da + (size_t)c.a_off * 4, RAD_F32, { c.M, c.K }); ta.stride[0] = c.lda;
+        RadTensor ty = T(dy, c.out_bf16 ? RAD_BF16 : RAD_F32, { c.M, c.N }); ty.stride[0] = c.ldy;
+        RadTensor none; std::memset(&none, 0, sizeof none);
+        std::vector<RadTensor> ts = { ta, T(dw, RAD_F32, { c.N, c.K }), T(dbias, c.bias_f32 ? RAD_F32 : RAD_BF16, { c.N }), c.res ? ty : none, ty };
+        std::vector<RadParam> ps = { PI("M", c.M), PI("N", c.N), PI("K", c.K), PS("act", c.act), PS("dtype", "f32") };
+        if (!run_row_f32(kf, ts, ps)) { fail(fmt("f32 M=%lld N=%lld K=%lld launch failed", (long long)c.M, (long long)c.N, (long long)c.K)); continue; }
+        std::vector<float> goutf; std::vector<uint16_t> goutb;
+        if (c.out_bf16) { goutb.resize(rfb.size()); st_memcpy(goutb.data(), dy, goutb.size() * 2, hipMemcpyDeviceToHost); }
+        else { goutf.resize(rf.size()); st_memcpy(goutf.data(), dy, goutf.size() * 4, hipMemcpyDeviceToHost); }
+        int64_t bad = 0; double worst = 0;
+        for (int64_t m = 0; m < c.M; ++m)
+            for (int64_t n = 0; n < c.N; ++n) {
+                double acc = 0;
+                for (int64_t k = 0; k < c.K; ++k) acc += (double)af[(size_t)(c.a_off + m * c.lda + k)] * (double)wf[(size_t)(n * c.K + k)];
+                double t = acc + (double)bias_eff[(size_t)n];
+                if (c.out_bf16) t = bf16_round_d(t);
+                if (!std::strcmp(c.act, "gelu")) t = gelu_erf_d(t); else if (!std::strcmp(c.act, "gelu_tanh")) t = gelu_tanh_d(t);
+                if (c.out_bf16 && std::strcmp(c.act, "none")) t = bf16_round_d(t);
+                if (c.res) { t = (double)res_eff[(size_t)(m * c.ldy + n)] + t; if (c.out_bf16) t = bf16_round_d(t); }
+                const double g = c.out_bf16 ? (double)h_bf16(goutb[(size_t)(m * c.ldy + n)]) : (double)goutf[(size_t)(m * c.ldy + n)];
+                const double e = std::fabs(g - t);
+                worst = std::max(worst, e);
+                const double tol = c.out_bf16 ? 0.02 * std::fabs(t) + 0.02 : 3e-5 * std::fabs(t) + 2e-5;
+                if (e > tol) ++bad;
+            }
+        if (bad) fail(fmt("f32 M=%lld N=%lld K=%lld act=%s res=%d bias_f32=%d out_bf16=%d a_off=%d bad=%lld worst=%g", (long long)c.M, (long long)c.N, (long long)c.K, c.act, (int)c.res, (int)c.bias_f32, (int)c.out_bf16, c.a_off, (long long)bad, worst));
+    }
+    ok(what, bad_total == 0, bad_total ? detail : std::string("all paths agree"));
+}
+
 /* gelu_mul, against an f64 evaluation of the tanh-approximation GELU.
  *
  * Fixed signed magnitudes for the gate and up halves; the f64 oracle
@@ -34573,6 +34697,11 @@ static void device_phase(const Plugin& pl) {
     if (sel("rmsnorm_p_bf16")) {
         if (!g_case) std::printf("\nthe weightless RMS norm, against the formula it implements\n");
         rmsnorm_p_case(pl);
+    }
+
+    if (sel("gemm_bf16_nt_bias_skinny") || sel("gemm_f32_nt_bias_skinny")) {
+        if (!g_case) std::printf("\nthe skinny biased GEMMs, against f64 evaluations of the epilogue\n");
+        skinny_bias_case(pl);
     }
 
     if (sel("gemm_f32_nt_skinny") || sel("rmsnorm_f32") || sel("embed_lookup_f32")) {

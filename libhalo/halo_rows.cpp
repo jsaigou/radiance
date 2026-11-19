@@ -4598,6 +4598,8 @@ static const RadConstraint cFp8F32Scale[] = {
 };
 static const RadConstraint cGemmSkinnyF32[] = { C_GE("M", 1), C_LE("M", 8), C_DIV("K", 4),
                                                 C_IN("dtype", "f32") };
+static const RadConstraint cGemmBiasSkinnyBf16[] = { C_GE("M", 1), C_LE("M", 16), C_DIV("K", 8), C_IN("dtype", "bf16") };
+static const RadConstraint cGemmBiasSkinnyF32[]  = { C_GE("M", 1), C_LE("M", 8),  C_DIV("K", 4), C_IN("dtype", "f32") };
 static const RadConstraint cGemmNtF32[] = { C_GE("M", 1),         C_LE("M", 65535),
                                             C_GE("N", 1),         C_LE("N", 512),
                                             C_GE("K", 1),         C_LE("K", 16384),
@@ -5963,6 +5965,26 @@ static const RadKernelInfo kKernels[] = {
   ROW(cGemmSkinnyF32), NOTUNE,
   nullptr, nullptr, halo_rad_gemm_nt_f32_skinny, nullptr, nullptr, nullptr,
   halo_shape_gemm_nt },
+
+{ "gemm_bf16_nt_bias_skinny", "gemm_nt_bias", "gemm",
+  "skinny biased GEMM C = res + act(A @ W^T + bias) for up to 16 rows: a streaming dot product, a wave "
+  "owns up to eight columns, lanes stride K in 16-byte chunks with non-temporal weight loads",
+  "M <= 16; K divisible by 8; weights 16-byte aligned; any N; `res` may be the output itself",
+  "bf16 A / W / C / res, bf16 or f32 bias, fp32 accumulate, three RNE roundings in the store",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_GEMM_M16,
+  ROW(cGemmBiasSkinnyBf16), NOTUNE,
+  nullptr, nullptr, halo_rad_gemm_nt_bias_skinny_bf16, nullptr, nullptr, nullptr,
+  halo_shape_gemm_nt_bias },
+
+{ "gemm_f32_nt_bias_skinny", "gemm_nt_bias", "gemm",
+  "skinny f32 biased GEMM C = res + act(A @ W^T + bias) for up to 8 rows: a streaming dot product with "
+  "non-temporal weight loads",
+  "M <= 8; K divisible by 4; weights 16-byte aligned; any N; `res` may be the output itself",
+  "f32 A / W, f32 or bf16 bias, f32 accumulate, C f32 or bf16 with res in C's dtype",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_GEMM_M16,
+  ROW(cGemmBiasSkinnyF32), NOTUNE,
+  nullptr, nullptr, halo_rad_gemm_nt_bias_skinny_f32, nullptr, nullptr, nullptr,
+  halo_shape_gemm_nt_bias },
 
 { "add_bf16", "add", "elem",
   "elementwise sum, with the one row-broadcast form; `div` divides the rounded sum",

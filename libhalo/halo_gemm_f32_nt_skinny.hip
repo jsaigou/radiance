@@ -26,7 +26,7 @@ constexpr uint32_t kThr = kWaves * 32;
 typedef float f32x4 __attribute__((ext_vector_type(4)));
 
 // MR rows of A, RPW output columns per wave in flight. VECA: A's rows are 16-byte aligned.
-template <uint32_t MR, uint32_t RPW, bool VECA>
+template <uint32_t MR, uint32_t RPW, bool VECA, uint32_t UNR>
 __global__ __launch_bounds__(kThr) void gemv_f32_kernel(
     const float* __restrict__ a, uint32_t lda, const float* __restrict__ w, uint32_t K,
     float* __restrict__ y, uint32_t ldy, uint32_t N, uint32_t M) {
@@ -51,22 +51,34 @@ __global__ __launch_bounds__(kThr) void gemv_f32_kernel(
 #pragma unroll
         for (uint32_t m = 0; m < MR; ++m) acc[r][m] = 0.0f;
 
-    for (uint32_t k4 = lane; k4 < K4; k4 += 32) {
-        f32x4 wv[RPW];
+    // UNR consecutive 16-byte chunks per lane per step are loaded together (UNR * RPW loads in flight),
+    // so a wave reads UNR * 512 contiguous bytes of a row before it moves on.
+    for (uint32_t kb = lane; kb < K4; kb += 32 * UNR) {
+        f32x4 wv[UNR][RPW];
 #pragma unroll
-        for (uint32_t r = 0; r < RPW; ++r) wv[r] = __builtin_nontemporal_load(wr[r] + k4);
-#pragma unroll
-        for (uint32_t m = 0; m < MR; ++m) {
-            f32x4 xv;
-            if (VECA) {
-                xv = *(const f32x4*)(ar[m] + 4u * k4);
-            } else {
-                xv = f32x4{ ar[m][4u * k4], ar[m][4u * k4 + 1], ar[m][4u * k4 + 2], ar[m][4u * k4 + 3] };
-            }
+        for (uint32_t u = 0; u < UNR; ++u) {
+            const uint32_t k4 = kb + 32 * u;
 #pragma unroll
             for (uint32_t r = 0; r < RPW; ++r)
-                acc[r][m] = fmaf(wv[r].x, xv.x, fmaf(wv[r].y, xv.y, fmaf(wv[r].z, xv.z,
-                                 fmaf(wv[r].w, xv.w, acc[r][m]))));
+                wv[u][r] = k4 < K4 ? __builtin_nontemporal_load(wr[r] + k4) : f32x4{ 0, 0, 0, 0 };
+        }
+#pragma unroll
+        for (uint32_t u = 0; u < UNR; ++u) {
+            const uint32_t k4 = kb + 32 * u;
+            if (k4 >= K4) break;
+#pragma unroll
+            for (uint32_t m = 0; m < MR; ++m) {
+                f32x4 xv;
+                if (VECA) {
+                    xv = *(const f32x4*)(ar[m] + 4u * k4);
+                } else {
+                    xv = f32x4{ ar[m][4u * k4], ar[m][4u * k4 + 1], ar[m][4u * k4 + 2], ar[m][4u * k4 + 3] };
+                }
+#pragma unroll
+                for (uint32_t r = 0; r < RPW; ++r)
+                    acc[r][m] = fmaf(wv[u][r].x, xv.x, fmaf(wv[u][r].y, xv.y, fmaf(wv[u][r].z, xv.z,
+                                     fmaf(wv[u][r].w, xv.w, acc[r][m]))));
+            }
         }
     }
 
@@ -105,26 +117,28 @@ extern "C" int halo_rad_gemm_nt_f32_skinny(const RadArgs* a, RadStream stream) {
 
     const bool veca = (lda % 4 == 0) && halo_aligned(A->data, 16);
     const unsigned mr = M <= 1 ? 1u : M <= 2 ? 2u : M <= 4 ? 4u : 8u;
-    // Columns per wave in flight: enough independent 512-byte loads to cover the memory latency,
-    // few enough that a narrow projection still spreads over the card (about 160+ waves).
-    const unsigned budget = 8u / mr;
-    const unsigned want = N >= 4096 ? 8u : N >= 1024 ? 4u : N >= 256 ? 2u : 1u;
-    const unsigned rpw = want < budget ? want : budget;
+    // One column a wave, UNR chunks a lane in flight: measured on the card, more columns a wave
+    // (fewer waves, each with more rows open) is slower at every shape the head issues.
+    const unsigned rpw = 1;
+    const unsigned unr = K / 4 >= 32 * 8 ? 8u : K / 4 >= 32 * 4 ? 4u : K / 4 >= 32 * 2 ? 2u : 1u;
     const unsigned cols_per_block = kWaves * rpw;
     const dim3 grid((unsigned)((N + cols_per_block - 1) / cols_per_block));
     const dim3 block(kThr);
 
-#define GS_L(MR_, RPW_)                                                                           \
+#define GS_L1(MR_, RPW_, UNR_)                                                                    \
     do {                                                                                          \
         if (veca)                                                                                 \
-            return HALO_EMIT(stream, (gemv_f32_kernel<MR_, RPW_, true>), grid, block, 0,          \
+            return HALO_EMIT(stream, (gemv_f32_kernel<MR_, RPW_, true, UNR_>), grid, block, 0,     \
                              (const float*)A->data, (uint32_t)lda, (const float*)W->data,         \
                              (uint32_t)K, (float*)Y->data, (uint32_t)ldy, (uint32_t)N,            \
                              (uint32_t)M);                                                        \
-        return HALO_EMIT(stream, (gemv_f32_kernel<MR_, RPW_, false>), grid, block, 0,             \
+        return HALO_EMIT(stream, (gemv_f32_kernel<MR_, RPW_, false, UNR_>), grid, block, 0,       \
                          (const float*)A->data, (uint32_t)lda, (const float*)W->data,             \
                          (uint32_t)K, (float*)Y->data, (uint32_t)ldy, (uint32_t)N, (uint32_t)M);  \
     } while (0)
+#define GS_L(MR_, RPW_)                                                                           \
+    do { if (unr == 8) GS_L1(MR_, RPW_, 8); if (unr == 4) GS_L1(MR_, RPW_, 4);                    \
+         if (unr == 2) GS_L1(MR_, RPW_, 2); GS_L1(MR_, RPW_, 1); } while (0)
     if (mr == 1) {
         if (rpw == 8) GS_L(1, 8);
         if (rpw == 4) GS_L(1, 4);
@@ -141,5 +155,6 @@ extern "C" int halo_rad_gemm_nt_f32_skinny(const RadArgs* a, RadStream stream) {
         GS_L(4, 1);
     }
     GS_L(8, 1);
+#undef GS_L1
 #undef GS_L
 }

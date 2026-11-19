@@ -224,6 +224,7 @@ TEST(the_real_haru_on_the_gpu_matches_the_reference_teacher_forced) {
     cfg.duplex_max_ctx = std::max<int64_t>(1024, T + frames + 64);
     cfg.port = 0;
     cfg.http_threads = 4;
+    if (env("RAD_HARU_REAL_PROFILE")) cfg.profile_ops = true;   // per-op device timing at stop
 
     rad::Engine engine(std::move(cfg));
     REQUIRE(engine.start() >= 0);

@@ -810,6 +810,8 @@ int halo_rad_gemm_nt_bias    (const RadArgs*, RadStream);
 /* gemm_nt_bias at f32 (halo_gemm_f32_nt_bias.hip). */
 int halo_rad_gemm_f32_nt_bias(const RadArgs*, RadStream);
 int halo_rad_gemm_nt_f32_skinny(const RadArgs*, RadStream);
+int halo_rad_gemm_nt_bias_skinny_bf16(const RadArgs*, RadStream);
+int halo_rad_gemm_nt_bias_skinny_f32(const RadArgs*, RadStream);
 int halo_rad_kv_store        (const RadArgs*, RadStream);
 int halo_rad_kv_store_fp8    (const RadArgs*, RadStream);
 int halo_rad_kv_store_fp8v4  (const RadArgs*, RadStream);
