@@ -527,6 +527,95 @@ static int launch_rmsnorm_p_f32_vec(const float* x, float* y, uint32_t n, float 
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
+// The weighted f32 norm: y = x / sqrt(mean(x^2) + eps) * (w + wadd) * mult, f32 in and out, the gain
+// f32 (the checkpoint's bf16 gain widened at load). The same shape as the weightless kernel above: a
+// row of up to 4096 elements is read once, held in registers across the reduction, and written from
+// them, on a block as narrow as the row. The Haru head's norms (n = 2560, eps 1e-5) and the LM's
+// final norm run here. The multiplies keep the bf16 kernel's order: x, then the scale, the gain, mult.
+template <uint32_t THR, uint32_t CACHE>
+__global__ __launch_bounds__(THR) void rmsnorm_w_f32_vec_kernel(
+    const float4* __restrict__ x, const float4* __restrict__ w, float4* __restrict__ y,
+    uint32_t n4, float inv_n, float eps, float wadd, float mult, uint32_t x_ld4, uint32_t y_ld4,
+    uint32_t M) {
+    __shared__ float lds[THR / kWave];
+    const uint32_t m = blockIdx.x;
+    if (m >= M) return;
+    const float4* __restrict__ xr = x + (size_t)m * x_ld4;
+    float4* __restrict__ yr = y + (size_t)m * y_ld4;
+    float4 r[CACHE];
+    float ss = 0.0f;
+#pragma unroll
+    for (uint32_t k = 0; k < CACHE; ++k) {
+        const uint32_t i = threadIdx.x + k * THR;
+        if (i < n4) {
+            const float4 v = xr[i];
+            r[k] = v;
+            ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        } else {
+            r[k] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+    }
+    ss = block_sum<THR / kWave>(ss, lds);
+    const float sc = 1.0f / sqrtf(ss * inv_n + eps);
+#pragma unroll
+    for (uint32_t k = 0; k < CACHE; ++k) {
+        const uint32_t i = threadIdx.x + k * THR;
+        if (i < n4) {
+            const float4 g = w[i];
+            yr[i] = make_float4(r[k].x * sc * (g.x + wadd) * mult, r[k].y * sc * (g.y + wadd) * mult,
+                                r[k].z * sc * (g.z + wadd) * mult, r[k].w * sc * (g.w + wadd) * mult);
+        }
+    }
+}
+
+__global__ __launch_bounds__(kThreads) void rmsnorm_w_f32_kernel(
+    const float* __restrict__ x, const float* __restrict__ w, float* __restrict__ y, uint32_t n,
+    float eps, float wadd, float mult, uint32_t x_ld, uint32_t y_ld, uint32_t M) {
+    __shared__ float lds[kThreads / kWave];
+    const uint32_t m = blockIdx.x;
+    if (m >= M) return;
+    const float* __restrict__ xr = x + (size_t)m * x_ld;
+    float* __restrict__ yr = y + (size_t)m * y_ld;
+    float ss = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += kThreads) { const float v = xr[i]; ss += v * v; }
+    ss = block_sum<kThreads / kWave>(ss, lds);
+    const float sc = 1.0f / sqrtf(ss / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += kThreads) yr[i] = xr[i] * sc * (w[i] + wadd) * mult;
+}
+
+template <uint32_t THR, uint32_t CACHE>
+static int launch_rmsnorm_w_f32_vec(const float* x, const float* w, float* y, uint32_t n, float eps,
+                                    float wadd, float mult, uint32_t x_ld, uint32_t y_ld,
+                                    uint32_t M, hipStream_t s) {
+    hipLaunchKernelGGL((rmsnorm_w_f32_vec_kernel<THR, CACHE>), dim3(M), dim3(THR), 0, s,
+                       (const float4*)x, (const float4*)w, (float4*)y, n / 4u, 1.0f / (float)n, eps,
+                       wadd, mult, x_ld / 4u, y_ld / 4u, M);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+// The f32 embedding gather: tokens i32, the table bf16 or f32, the output f32 (the head's token
+// embedding). A row per block; the id is global and `vocab_off` makes it this rank's, an out-of-range
+// id writes a zero row, exactly as the bf16 gather does; `mult` scales with one rounding.
+template <bool WBF>
+__global__ __launch_bounds__(kThreads) void embed_lookup_f32_kernel(
+    const int32_t* __restrict__ tok, const void* __restrict__ wte, float* __restrict__ x,
+    uint32_t n_embd, int32_t n_vocab, int32_t vocab_off, uint32_t x_ld, float mult) {
+    const uint32_t m = blockIdx.x;
+    const int32_t id = tok[m] - vocab_off;
+    float* __restrict__ dst = x + (size_t)m * x_ld;
+    if (id < 0 || id >= n_vocab) {
+        for (uint32_t i = threadIdx.x; i < n_embd; i += kThreads) dst[i] = 0.0f;
+        return;
+    }
+    if (WBF) {
+        const uint16_t* __restrict__ src = (const uint16_t*)wte + (size_t)id * n_embd;
+        for (uint32_t i = threadIdx.x; i < n_embd; i += kThreads) dst[i] = bf16_to_f32(src[i]) * mult;
+    } else {
+        const float* __restrict__ src = (const float*)wte + (size_t)id * n_embd;
+        for (uint32_t i = threadIdx.x; i < n_embd; i += kThreads) dst[i] = src[i] * mult;
+    }
+}
+
 // ---------------------------------------------------------------------------- add / mul
 // ref_add / ref_mul with one broadcast rule: an operand of exactly n elements against an output of
 // rows*n broadcasts along rows; nothing else broadcasts, so shape bugs are not hidden.
@@ -1721,8 +1810,13 @@ extern "C" int halo_rad_embed_lookup(const RadArgs* a, RadStream stream) {
     const RadTensor* x   = halo_opt(a, EL_X);
     if (!tok || !wte || !x) return HALO_NO(RAD_E_INVAL);
     HALO_NEED(dt_i32(tok));
-    HALO_NEED(dt_bf16(wte));
-    HALO_NEED(dt_bf16(x));
+    const bool out_f32 = x->dtype == RAD_F32;   // the f32 leg: a bf16 or f32 table, an f32 output
+    if (out_f32) {
+        if (wte->dtype != RAD_BF16 && wte->dtype != RAD_F32) return HALO_NO(RAD_E_DTYPE);
+    } else {
+        HALO_NEED(dt_bf16(wte));
+        HALO_NEED(dt_bf16(x));
+    }
     if (!halo_contig(tok) || !halo_contig(wte)) return HALO_NO(RAD_E_STRIDE);
 
     const long long n_embd = halo_geti_or(a, "n_embd", halo_dim(wte, (int)wte->rank - 1));
@@ -1737,6 +1831,19 @@ extern "C" int halo_rad_embed_lookup(const RadArgs* a, RadStream stream) {
     if (M <= 0 || halo_numel(tok) < M) return HALO_NO(RAD_E_SHAPE);
 
     const float mult = (float)halo_getf(a, "mult", 1.0);
+    if (out_f32) {
+        if (wte->dtype == RAD_BF16)
+            hipLaunchKernelGGL(embed_lookup_f32_kernel<true>, dim3((uint32_t)M), dim3(kThreads), 0,
+                               (hipStream_t)stream, (const int32_t*)tok->data, wte->data,
+                               (float*)x->data, (uint32_t)n_embd, (int32_t)n_vocab, (int32_t)voff,
+                               (uint32_t)x_ld, mult);
+        else
+            hipLaunchKernelGGL(embed_lookup_f32_kernel<false>, dim3((uint32_t)M), dim3(kThreads), 0,
+                               (hipStream_t)stream, (const int32_t*)tok->data, wte->data,
+                               (float*)x->data, (uint32_t)n_embd, (int32_t)n_vocab, (int32_t)voff,
+                               (uint32_t)x_ld, mult);
+        return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+    }
     /* The chained form at decode heights, where the row resolved with `chain`. */
     const bool ch = halo_geti_or(a, "chain", 0) != 0 && M <= 64;
     return embed_lookup_bf16_emit(halo_addr(tok), halo_addr(wte), halo_addr(x),
@@ -2026,6 +2133,41 @@ extern "C" int halo_rad_rmsnorm(const RadArgs* a, RadStream s) {
     const RadTensor* w = halo_opt(a, RN_W);
     const RadTensor* y = halo_opt(a, RN_Y);
     if (!x || !y) return HALO_NO(RAD_E_INVAL);
+    if (y->dtype == RAD_F32) {
+        /* The f32 leg: f32 row, an f32 gain (one is required), an f32 output. */
+        if (x->dtype != RAD_F32 || !w || w->dtype != RAD_F32) return HALO_NO(RAD_E_DTYPE);
+        if (!halo_contig(w)) return HALO_NO(RAD_E_STRIDE);
+        const long long n = halo_geti_or(a, "n", halo_dim(w, (int)w->rank - 1));
+        if (n <= 0 || halo_numel(w) < n) return HALO_NO(RAD_E_SHAPE);
+        long long M = 0, My = 0;
+        const long long x_ld = halo_rows_pitch(x, n, &M);
+        const long long y_ld = halo_rows_pitch(y, n, &My);
+        if (x_ld < 0 || y_ld < 0) return HALO_NO(RAD_E_STRIDE);
+        if (M <= 0 || My < M) return HALO_NO(RAD_E_SHAPE);
+        const float eps = (float)halo_getf(a, "eps", 1e-6), wadd = (float)halo_getf(a, "wadd", 0.0);
+        const float mult = (float)halo_getf(a, "mult", 1.0);
+        const float* xp = (const float*)x->data;
+        const float* wp = (const float*)w->data;
+        float* yp = (float*)y->data;
+        const uint32_t n4 = (uint32_t)(n / 4);
+        const bool vec = (n % 4 == 0) && (x_ld % 4 == 0) && (y_ld % 4 == 0) &&
+                         (((uintptr_t)xp | (uintptr_t)yp | (uintptr_t)wp) & 15u) == 0 && n4 <= 4u * kThreads;
+        hipStream_t st = (hipStream_t)s;
+        const uint32_t un = (uint32_t)n, ux = (uint32_t)x_ld, uy = (uint32_t)y_ld, uM = (uint32_t)M;
+        int rc;
+        if (vec && n4 <= 32)       rc = launch_rmsnorm_w_f32_vec<32, 1>(xp, wp, yp, un, eps, wadd, mult, ux, uy, uM, st);
+        else if (vec && n4 <= 64)  rc = launch_rmsnorm_w_f32_vec<64, 1>(xp, wp, yp, un, eps, wadd, mult, ux, uy, uM, st);
+        else if (vec && n4 <= 128) rc = launch_rmsnorm_w_f32_vec<128, 1>(xp, wp, yp, un, eps, wadd, mult, ux, uy, uM, st);
+        else if (vec && n4 <= 256) rc = launch_rmsnorm_w_f32_vec<256, 1>(xp, wp, yp, un, eps, wadd, mult, ux, uy, uM, st);
+        else if (vec && n4 <= 512) rc = launch_rmsnorm_w_f32_vec<256, 2>(xp, wp, yp, un, eps, wadd, mult, ux, uy, uM, st);
+        else if (vec)              rc = launch_rmsnorm_w_f32_vec<256, 4>(xp, wp, yp, un, eps, wadd, mult, ux, uy, uM, st);
+        else {
+            hipLaunchKernelGGL(rmsnorm_w_f32_kernel, dim3(halo_cliff_rows(uM, 1, kThreads / kWave)),
+                               dim3(kThreads), 0, st, xp, wp, yp, un, eps, wadd, mult, ux, uy, uM);
+            rc = hipGetLastError() == hipSuccess ? 0 : -4;
+        }
+        return rc == 0 ? RAD_OK : RAD_E_DEVICE;
+    }
     /* The row bf16, or f32 (read as it is); the output bf16. */
     if (x->dtype != RAD_BF16 && x->dtype != RAD_F32) return HALO_NO(RAD_E_DTYPE);
     HALO_NEED(dt_bf16(y));

@@ -4596,6 +4596,8 @@ static const RadConstraint cFp8F32Scale[] = {
     C_GE("M", 1),    C_GE("N", 128),     C_DIV("N", 128),          C_GE("K", 128),
     C_DIV("K", 128), C_EQ("group", 128), C_IN("dtype", "fp8a8f32")
 };
+static const RadConstraint cGemmSkinnyF32[] = { C_GE("M", 1), C_LE("M", 8), C_DIV("K", 4),
+                                                C_IN("dtype", "f32") };
 static const RadConstraint cGemmNtF32[] = { C_GE("M", 1),         C_LE("M", 65535),
                                             C_GE("N", 1),         C_LE("N", 512),
                                             C_GE("K", 1),         C_LE("K", 16384),
@@ -5568,6 +5570,15 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, halo_rad_embed_lookup, nullptr, nullptr, nullptr,
   halo_shape_embed_lookup },
 
+{ "embed_lookup_f32", "embed_lookup", "vocab",
+  "embedding gather into an f32 row, one workgroup a token",
+  "any n_embd and n_vocab; a negative or out-of-range id writes a zero row",
+  "i32 tokens, a bf16 or f32 table, f32 output",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cF32Row), NOTUNE,
+  nullptr, nullptr, halo_rad_embed_lookup, nullptr, nullptr, nullptr,
+  halo_shape_embed_lookup },
+
 { "embed_lookup_q_bf16", "embed_lookup_q", "vocab",
   "quantised embedding gather, four entries a thread",
   "any n_embd and n_vocab; a negative or out-of-range id writes a zero row",
@@ -5874,6 +5885,16 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, halo_rad_rmsnorm_p, nullptr, nullptr, nullptr,
   halo_shape_unary },
 
+{ "rmsnorm_f32", "rmsnorm", "norm",
+  "root-mean-square norm with an f32 gain, f32 in and out: a row up to 4096 elements is read once and "
+  "held in registers across the reduction, on a block as narrow as the row allows",
+  "any n; n % 4 == 0 with aligned rows takes the vector path, anything else two scalar passes",
+  "f32 x / gain / y, f32 accumulation",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cF32Row), NOTUNE,
+  nullptr, nullptr, halo_rad_rmsnorm, nullptr, nullptr, nullptr,
+  halo_shape_rmsnorm },
+
 { "rmsnorm_p_f32", "rmsnorm_p", "norm",
   "weightless root-mean-square norm, f32: a row up to 4096 elements is read once and held in "
   "registers across the reduction, on a block as narrow as the row allows",
@@ -5932,6 +5953,16 @@ static const RadKernelInfo kKernels[] = {
   ROW(cGemmBiasF32), NOTUNE,
   nullptr, nullptr, halo_rad_gemm_f32_nt_bias, nullptr, nullptr, nullptr,
   halo_shape_gemm_nt_bias },
+
+{ "gemm_f32_nt_skinny", "gemm_nt", "gemm",
+  "skinny f32 GEMM Y[M,N] = A[M,K] @ W[N,K]^T, a streaming dot product: a wave owns up to eight "
+  "columns, its lanes stride K in float4s with non-temporal weight loads",
+  "M <= 8; K divisible by 4; weights 16-byte aligned; any N",
+  "f32 A / W / Y, f32 accumulate, a deterministic reduction",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cGemmSkinnyF32), NOTUNE,
+  nullptr, nullptr, halo_rad_gemm_nt_f32_skinny, nullptr, nullptr, nullptr,
+  halo_shape_gemm_nt },
 
 { "add_bf16", "add", "elem",
   "elementwise sum, with the one row-broadcast form; `div` divides the rounded sum",

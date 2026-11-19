@@ -7201,6 +7201,140 @@ static void small_f32_ops_case(const Plugin& pl) {
     ok(what, bad_total == 0, bad_total ? detail : std::string("all paths agree"));
 }
 
+
+/* The f32 skinny GEMM, the weighted f32 rmsnorm and the f32 embedding gather, against f64 host
+ * evaluations. As above the interesting failures are in the paths: every (rows, columns-in-flight)
+ * instantiation of the GEMM, a column count that does not fill the last wave, activations that are
+ * not 16-byte aligned or sit in a pitched buffer, K from 4 to 7680, the norm's vector and scalar
+ * paths with `wadd` and `mult`, and the gather's bf16 and f32 tables, `mult`, `vocab_offset` and
+ * out-of-range ids. */
+static void head_f32_ops_case(const Plugin& pl) {
+    const char* what = "the f32 skinny GEMM, weighted rmsnorm and embedding gather against f64 evaluations";
+    const RadKernelInfo* k_gemm = find(pl, "gemm_f32_nt_skinny");
+    const RadKernelInfo* k_rms  = find(pl, "rmsnorm_f32");
+    const RadKernelInfo* k_emb  = find(pl, "embed_lookup_f32");
+    if (!k_gemm || !k_rms || !k_emb) { ok(what, false, "a row is absent"); return; }
+
+    auto fvals = [](size_t cnt, uint32_t seed) {
+        std::vector<float> v(cnt);
+        uint32_t x = seed * 2654435761u + 777u;
+        for (size_t i = 0; i < cnt; ++i) {
+            x = x * 1664525u + 1013904223u;
+            v[i] = ((float)((x >> 8) & 0xffff) / 65535.0f - 0.5f) * 2.0f;   // [-1, 1]
+        }
+        return v;
+    };
+    auto upload = [&](const void* h, size_t bytes) {
+        void* d = dalloc(bytes ? bytes : 4);
+        if (d && bytes) st_memcpy(d, h, bytes, hipMemcpyHostToDevice);
+        return d;
+    };
+    int bad_total = 0;
+    std::string detail;
+    auto fail = [&](const std::string& m) { ++bad_total; if (detail.size() < 700) detail += m + "; "; };
+
+    // ---- gemm_nt f32: every M in 1..8, columns that do not fill a wave, odd K multiples of 4, pitches,
+    // and an activation row that is not 16-byte aligned (the scalar-load instantiation)
+    struct G { int64_t M, N, K, lda, ldy; int a_off; };
+    for (const G c : { G{1, 2560, 2560, 2560, 2560, 0}, G{1, 7680, 2560, 2560, 7680, 0}, G{1, 64, 2560, 2560, 64, 0},
+                       G{1, 2560, 7680, 7680, 2560, 0}, G{8, 2, 2560, 2560, 2, 0}, G{3, 2560, 256, 256, 2560, 0},
+                       G{2, 1000, 132, 132, 1000, 0}, G{5, 33, 4, 4, 33, 0}, G{4, 5120, 2560, 2560, 5120, 0},
+                       G{1, 300, 260, 260, 300, 1}, G{6, 257, 516, 520, 270, 0}, G{7, 4097, 1028, 1028, 4097, 0},
+                       G{2, 777, 2564, 2564, 777, 3}, G{1, 1, 4, 4, 1, 0} }) {
+        const std::vector<float> ah = fvals((size_t)c.M * c.lda + 8, 3), wh = fvals((size_t)c.N * c.K, 9);
+        void* da = upload(ah.data(), ah.size() * 4);
+        void* dw = upload(wh.data(), wh.size() * 4);
+        void* dy = upload(std::vector<float>((size_t)c.M * c.ldy, 9.0f).data(), (size_t)c.M * c.ldy * 4);
+        if (!da || !dw || !dy) { ok(what, false, "hipMalloc failed"); return; }
+        RadTensor ta = T((char*)da + (size_t)c.a_off * 4, RAD_F32, { c.M, c.K });
+        ta.stride[0] = c.lda;
+        RadTensor tw = T(dw, RAD_F32, { c.N, c.K });
+        RadTensor ty = T(dy, RAD_F32, { c.M, c.N });
+        ty.stride[0] = c.ldy;
+        std::vector<RadTensor> ts = { ta, tw, ty };
+        std::vector<RadParam> ps = { PI("M", c.M), PI("N", c.N), PI("K", c.K), PS("dtype", "f32") };
+        if (!run_row_f32(k_gemm, ts, ps)) { fail(fmt("gemm M=%lld N=%lld K=%lld launch failed", (long long)c.M, (long long)c.N, (long long)c.K)); continue; }
+        std::vector<float> got((size_t)c.M * c.ldy);
+        st_memcpy(got.data(), dy, got.size() * 4, hipMemcpyDeviceToHost);
+        int64_t bad = 0, pad_touched = 0;
+        double worst = 0;
+        for (int64_t m = 0; m < c.M; ++m) {
+            for (int64_t n = 0; n < c.N; ++n) {
+                double want = 0;
+                for (int64_t k = 0; k < c.K; ++k)
+                    want += (double)ah[(size_t)(c.a_off + m * c.lda + k)] * wh[(size_t)(n * c.K + k)];
+                const double e = std::fabs(got[(size_t)(m * c.ldy + n)] - want);
+                worst = std::max(worst, e);
+                if (e > 2e-5 * (std::fabs(want) + 1.0) + 1e-5 * std::sqrt((double)c.K)) ++bad;
+            }
+            for (int64_t n = c.N; n < c.ldy; ++n) if (got[(size_t)(m * c.ldy + n)] != 9.0f) ++pad_touched;
+        }
+        if (bad || pad_touched)
+            fail(fmt("gemm M=%lld N=%lld K=%lld lda=%lld a_off=%d bad=%lld pad=%lld worst=%g", (long long)c.M, (long long)c.N,
+                     (long long)c.K, (long long)c.lda, c.a_off, (long long)bad, (long long)pad_touched, worst));
+    }
+
+    // ---- rmsnorm f32 with a gain: y = x / sqrt(mean(x^2) + eps) * (w + wadd) * mult
+    struct R { int64_t M, n, ld; double eps, wadd, mult; };
+    for (const R c : { R{1, 2560, 2560, 1e-5, 0, 1}, R{1, 2560, 2560, 1e-6, 1, 1}, R{3, 64, 64, 1e-5, 0, 1},
+                       R{2, 130, 130, 1e-6, 1, 0.5}, R{1, 4100, 4100, 1e-5, 0, 1}, R{1, 4096, 4096, 1e-5, 0.25, 2},
+                       R{3, 70, 75, 1e-6, 0, 1}, R{5, 7, 7, 1e-5, 0, 1} }) {
+        const std::vector<float> xh = fvals((size_t)c.M * c.ld, 5), wh = fvals((size_t)c.n, 6);
+        void* dx = upload(xh.data(), xh.size() * 4); void* dw = upload(wh.data(), wh.size() * 4);
+        void* dy = upload(std::vector<float>((size_t)c.M * c.ld, 77.0f).data(), (size_t)c.M * c.ld * 4);
+        if (!dx || !dw || !dy) { ok(what, false, "hipMalloc failed"); return; }
+        RadTensor tx = T(dx, RAD_F32, { c.M, c.n }), ty = T(dy, RAD_F32, { c.M, c.n });
+        tx.stride[0] = c.ld; ty.stride[0] = c.ld;
+        std::vector<RadTensor> ts = { tx, T(dw, RAD_F32, { c.n }), ty };
+        std::vector<RadParam> ps = { PI("M", c.M), PI("n", c.n), PF("eps", c.eps), PF("wadd", c.wadd), PF("mult", c.mult), PS("dtype", "f32") };
+        if (!run_row_f32(k_rms, ts, ps)) { fail(fmt("rmsnorm_f32 M=%lld n=%lld launch failed", (long long)c.M, (long long)c.n)); continue; }
+        std::vector<float> got((size_t)c.M * c.ld);
+        st_memcpy(got.data(), dy, got.size() * 4, hipMemcpyDeviceToHost);
+        int64_t bad = 0, pad = 0;
+        for (int64_t m = 0; m < c.M; ++m) {
+            double ss = 0;
+            for (int64_t i = 0; i < c.n; ++i) { const double v = xh[(size_t)(m * c.ld + i)]; ss += v * v; }
+            const double sc = 1.0 / std::sqrt(ss / (double)c.n + c.eps);
+            for (int64_t i = 0; i < c.n; ++i) {
+                const double want = xh[(size_t)(m * c.ld + i)] * sc * ((double)wh[(size_t)i] + c.wadd) * c.mult;
+                if (std::fabs(got[(size_t)(m * c.ld + i)] - want) > 4e-6 * std::fabs(want) + 2e-7) ++bad;
+            }
+            for (int64_t i = c.n; i < c.ld; ++i) if (got[(size_t)(m * c.ld + i)] != 77.0f) ++pad;
+        }
+        if (bad || pad) fail(fmt("rmsnorm_f32 M=%lld n=%lld ld=%lld bad=%lld pad=%lld", (long long)c.M, (long long)c.n, (long long)c.ld, (long long)bad, (long long)pad));
+    }
+
+    // ---- embed_lookup f32: bf16 and f32 tables, mult, vocab_offset, out-of-range ids -> a zero row
+    for (const bool wbf : { true, false }) {
+        const int64_t V = 37, D = 130, voff = 5, M = 6;
+        const std::vector<float> th = fvals((size_t)V * D, 12);
+        std::vector<uint16_t> tb((size_t)V * D);
+        std::vector<float> tv = th;
+        if (wbf) for (size_t i = 0; i < tb.size(); ++i) { tb[i] = h_to_bf16(th[i]); tv[i] = h_bf16(tb[i]); }
+        void* dt = wbf ? upload(tb.data(), tb.size() * 2) : upload(th.data(), th.size() * 4);
+        const std::vector<int32_t> ids = { 5, 41, 4, 99, 20, -1 };   // 5..41 valid with voff 5
+        void* di = upload(ids.data(), ids.size() * 4);
+        void* dy = upload(std::vector<float>((size_t)M * D, 3.0f).data(), (size_t)M * D * 4);
+        if (!dt || !di || !dy) { ok(what, false, "hipMalloc failed"); return; }
+        std::vector<RadTensor> ts = { T(di, RAD_I32, { M }), T(dt, wbf ? RAD_BF16 : RAD_F32, { V, D }), T(dy, RAD_F32, { M, D }) };
+        std::vector<RadParam> ps = { PI("M", M), PI("n_embd", D), PI("n_vocab", V), PI("vocab_offset", voff), PF("mult", 0.75), PS("dtype", "f32") };
+        if (!run_row_f32(k_emb, ts, ps)) { fail(fmt("embed_lookup_f32 wbf=%d launch failed", (int)wbf)); continue; }
+        std::vector<float> got((size_t)M * D);
+        st_memcpy(got.data(), dy, got.size() * 4, hipMemcpyDeviceToHost);
+        int64_t bad = 0;
+        for (int64_t m = 0; m < M; ++m) {
+            const int64_t id = (int64_t)ids[(size_t)m] - voff;
+            for (int64_t i = 0; i < D; ++i) {
+                const float want = (id < 0 || id >= V) ? 0.0f : (float)((double)tv[(size_t)(id * D + i)] * 0.75);
+                if (std::fabs(got[(size_t)(m * D + i)] - want) > 1e-6f * std::fabs(want)) ++bad;
+            }
+        }
+        if (bad) fail(fmt("embed_lookup_f32 wbf=%d bad=%lld", (int)wbf, (long long)bad));
+    }
+
+    ok(what, bad_total == 0, bad_total ? detail : std::string("all paths agree"));
+}
+
 /* gelu_mul, against an f64 evaluation of the tanh-approximation GELU.
  *
  * Fixed signed magnitudes for the gate and up halves; the f64 oracle
@@ -34439,6 +34573,11 @@ static void device_phase(const Plugin& pl) {
     if (sel("rmsnorm_p_bf16")) {
         if (!g_case) std::printf("\nthe weightless RMS norm, against the formula it implements\n");
         rmsnorm_p_case(pl);
+    }
+
+    if (sel("gemm_f32_nt_skinny") || sel("rmsnorm_f32") || sel("embed_lookup_f32")) {
+        if (!g_case) std::printf("\nthe f32 head ops (skinny GEMM, weighted norm, gather), against host evaluations\n");
+        head_f32_ops_case(pl);
     }
 
     if (sel("rmsnorm_p_f32") || sel("mul_f32") || sel("scale_rows_f32") || sel("fill_i32")) {

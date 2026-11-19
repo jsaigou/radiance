@@ -164,7 +164,7 @@ string(APPEND RAD_PERF_SCRIPT "include([==[${CMAKE_CURRENT_SOURCE_DIR}/perf_entr
 
 # shipped_plugins_test loads the shipped architecture plugins, which bind the plugin-facing C ABI
 # back to the host at dlopen, so like the engine it carries all of rad_core and exports it.
-set(RAD_TESTS_WHOLE_CORE shipped_plugins_test haru_assembly_test)
+set(RAD_TESTS_WHOLE_CORE shipped_plugins_test haru_assembly_test haru_real_parity_test)
 
 file(GLOB RAD_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*_test.cpp)
 if(NOT RAD_HIP_FOUND)
@@ -425,6 +425,13 @@ if(TARGET haru_assembly_test AND TARGET haru)
     RAD_HARU_DATA="${CMAKE_SOURCE_DIR}/tests/data/haru")
   add_dependencies(haru_assembly_test radiance libref haru)
   set_tests_properties(haru_assembly_test PROPERTIES LABELS "e2e" TIMEOUT 600)
+endif()
+
+# The real Haru-4B on the card, teacher-forced against the Python reference's recording. A device test
+# with artifacts that are not in the tree (docs/duplex/tohil-plan.md): it skips unless
+# RAD_HARU_REAL_{RAD,GOLDEN,HOME} are set, and is labelled gpu so the default tiers leave it out.
+if(TARGET haru_real_parity_test)
+  set_tests_properties(haru_real_parity_test PROPERTIES LABELS "gpu" TIMEOUT 1800)
 endif()
 
 # The shared harness' own test: the goldens, compare(), and a real engine and lane against the
