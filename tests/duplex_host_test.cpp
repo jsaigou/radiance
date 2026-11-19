@@ -96,8 +96,8 @@ TEST(reference_noise_is_one_scale_times_the_combined_term) {
     CHECK_EQ(codec[4], 3.75f);
     CHECK_EQ(codec[5], 5.0f);
     /* Head: raw [5, 6], no scale. */
-    CHECK_EQ(head[0], 6.25f);
-    CHECK_EQ(head[1], 7.5f);
+    CHECK_EQ(head[0], 5.0f);
+    CHECK_EQ(head[1], 6.0f);
 }
 
 /* A user frame and its head: scale + a full normal vector, then the head's normal vector. */
@@ -124,10 +124,11 @@ TEST(step_noise_is_entry_indexed_and_advances_each_lane) {
     CHECK_EQ(codec[1], 2.5f);
     CHECK_EQ(codec[2], 18.75f);  /* lane 0, entry 1: 5 * 0.625 * 6 */
     CHECK_EQ(codec[3], 21.875f);
-    CHECK_EQ(head[0], 3.75f);
-    CHECK_EQ(head[1], 5.0f);
-    CHECK_EQ(head[2], 10.0f);
-    CHECK_EQ(head[3], 11.25f);
+    /* The head's normals are raw (no scale): lane 1's [3, 4], then lane 0's [8, 9]. */
+    CHECK_EQ(head[0], 3.0f);
+    CHECK_EQ(head[1], 4.0f);
+    CHECK_EQ(head[2], 8.0f);
+    CHECK_EQ(head[3], 9.0f);
 
     /* The next frame advances both lanes; a frame that skips ahead is refused. */
     const int32_t next_frames[2] = { 1, 1 };
@@ -249,7 +250,7 @@ TEST(tokens_are_lane_indexed_and_text_is_streamed_once) {
 
 /* A missing lane state is refused rather than silently sampled from another lane. */
 TEST(a_missing_lane_is_refused) {
-    HostSampleSource src(options());
+    HostSampleSource src(options(/*latent_dim=*/2, /*n_vocab=*/8, /*max_lanes=*/2));
     const int32_t lanes[1] = { 0 };
     const int32_t ref_frame[1] = { -1 };
     DuplexHostPass p = prompt_pass(lanes, 1, 2, 8, ref_frame);

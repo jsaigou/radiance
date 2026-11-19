@@ -450,6 +450,7 @@ TEST(start_text_false_suppresses_host_text) {
 TEST(engine_audio_is_clamped_and_non_finite_values_are_mapped) {
     FakeDuplex gen;
     gen.token = -1;
+    gen.host_text = true;   /* a host-sampling speech tenant; see EngineDuplexLane::map */
     gen.reply_audio.assign(3200, 0.5f);
     gen.reply_audio[0] = 2.0f;
     gen.reply_audio[1] = -3.0f;
@@ -472,6 +473,27 @@ TEST(engine_audio_is_clamped_and_non_finite_values_are_mapped) {
     CHECK_EQ(audio_at(r.audio, 3), 1.0f);
     CHECK_EQ(audio_at(r.audio, 4), -1.0f);
     CHECK_EQ(audio_at(r.audio, 5), 0.25f);
+    CHECK_EQ(audio_at(r.audio, 100), 0.5f);
+}
+
+/* A tenant that is not a host-sampling speech model (the block test plugins tunnel arbitrary
+ * tensors through the audio channel) comes back unchanged: no clamp, no non-finite mapping. */
+TEST(a_non_host_sampling_tenant_audio_is_not_clamped) {
+    FakeDuplex gen;
+    gen.token = -1;
+    gen.reply_audio.assign(3200, 0.5f);
+    gen.reply_audio[0] = 2.0f;
+    gen.reply_audio[1] = -3.0f;
+    Fixture f(Fixture::Tweak{ [&](ServerOptions&, Deps& d) { d.duplex = &gen; } });
+    Session s(f);
+    s.conn.client(start_json("plugin"));
+    REQUIRE(!s.conn.wait_for("ready").is_null());
+    s.conn.binary(frame(0, samples(0)));
+    Reply r;
+    REQUIRE(decode_reply(s.conn.wait_binary(0), &r));
+    REQUIRE_EQ(r.audio.size(), (size_t)3200 * sizeof(float));
+    CHECK_EQ(audio_at(r.audio, 0), 2.0f);
+    CHECK_EQ(audio_at(r.audio, 1), -3.0f);
     CHECK_EQ(audio_at(r.audio, 100), 0.5f);
 }
 

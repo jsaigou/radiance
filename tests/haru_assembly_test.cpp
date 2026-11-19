@@ -365,7 +365,7 @@ TEST(the_production_host_source_is_deterministic_on_the_tiny_model) {
     if (!drv) return;
 
     const Golden& g = Golden::get();
-    const rad::RadDuplexDecl& dd = engine.program().duplex;
+    const RadDuplexDecl& dd = engine.program().duplex;
     constexpr int64_t kRunSteps = 3;
 
     auto run = [&](uint64_t seed, std::vector<int32_t>* tokens,

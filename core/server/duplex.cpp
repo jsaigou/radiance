@@ -185,7 +185,10 @@ struct EngineDuplexLane final : DuplexLane {
         DuplexReply out;
         if (r.status == 0) {
             out.audio = r.audio;
-            for (float& x : out.audio) {
+            /* Only a host-sampling speech tenant is a model whose audio the contract bounds. The
+             * block test plugins tunnel arbitrary tensors through the audio channel and must
+             * come back unchanged, so they (host_text false) are not clamped. */
+            if (r.host_text) for (float& x : out.audio) {
                 /* The plugin cannot clamp (no constant-bound op); the reference clamps every
                  * decoded frame to [-1, 1] (.haru-ref/session.py:163). One documented rule for
                  * non-finite values as well, so the wire never carries NaN or infinity. */
