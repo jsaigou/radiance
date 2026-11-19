@@ -10,7 +10,9 @@
  *   RAD_HARU_REAL_GOLDEN  a golden_real_<lang>_<dtype>.safetensors from the Python reference
  *   RAD_HARU_REAL_HOME    a radiance home (kernels/ with libhalo and libref, architectures/haru.so)
  * are set. Optional: RAD_HARU_REAL_OUT (a JSON file receiving per-frame metrics and step times),
- * RAD_HARU_REAL_FRAMES (steps to run, default every recorded frame).
+ * RAD_HARU_REAL_FRAMES (steps to run, default every recorded frame), RAD_HARU_REAL_AUDIO (a path prefix:
+ * writes <prefix>.engine.f32 and <prefix>.reference.f32), RAD_HARU_REAL_LANES=2, RAD_HARU_REAL_KERNELS,
+ * RAD_HARU_REAL_PROFILE.
  *
  * The comparison is by cosine similarity, top-1 token agreement and spectral distance, not by
  * element: a bf16 engine on a GPU cannot match an f32 CPU reference bit for bit, and the
@@ -346,6 +348,12 @@ TEST(the_real_haru_on_the_gpu_matches_the_reference_teacher_forced) {
                  100.0 * (double)top1 / (double)rows.size(), mel_n ? mel_sum / (double)mel_n : -1.0, open_ms,
                  pct(0.50), pct(0.95), pct(0.99), sorted.empty() ? 0.0 : sorted.back());
 
+    if (const char* pre = env("RAD_HARU_REAL_AUDIO")) {   // raw f32le, 24 kHz mono, for listening
+        std::ofstream(std::string(pre) + ".engine.f32", std::ios::binary)
+            .write(reinterpret_cast<const char*>(all_got.data()), (std::streamsize)(all_got.size() * 4));
+        std::ofstream(std::string(pre) + ".reference.f32", std::ios::binary)
+            .write(reinterpret_cast<const char*>(all_want.data()), (std::streamsize)(all_want.size() * 4));
+    }
     if (const char* out = env("RAD_HARU_REAL_OUT")) {
         std::ofstream f(out);
         f << "{\"frames\":" << rows.size() << ",\"open_ms\":" << open_ms << ",\"rows\":[";
