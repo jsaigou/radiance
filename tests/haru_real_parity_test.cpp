@@ -12,7 +12,8 @@
  * are set. Optional: RAD_HARU_REAL_OUT (a JSON file receiving per-frame metrics and step times),
  * RAD_HARU_REAL_FRAMES (steps to run, default every recorded frame), RAD_HARU_REAL_AUDIO (a path prefix:
  * writes <prefix>.engine.f32 and <prefix>.reference.f32), RAD_HARU_REAL_LANES=2, RAD_HARU_REAL_KERNELS,
- * RAD_HARU_REAL_PROFILE.
+ * RAD_HARU_REAL_PROFILE, RAD_HARU_REAL_FLOOR (the noise_floor_own_<lang>.json that the Python reference's own bf16 replay writes for
+ * the same recording; with it the test gates against that floor, without it only sanity is checked).
  *
  * The comparison is by cosine similarity, top-1 token agreement and spectral distance, not by
  * element: a bf16 engine on a GPU cannot match an f32 CPU reference bit for bit, and the
@@ -34,6 +35,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <vector>
@@ -166,6 +168,35 @@ std::vector<double> logmel(const std::vector<float>& x) {
     return out;
 }
 
+
+/* The numbers after "key": in a flat JSON text: one scalar, or every element of an array. No general parser; the floor file is ours. */
+std::vector<double> json_numbers(const std::string& text, const std::string& key) {
+    std::vector<double> out;
+    const size_t k = text.find("\"" + key + "\":");
+    if (k == std::string::npos) return out;
+    size_t p = text.find(':', k) + 1;
+    while (p < text.size() && text[p] == ' ') ++p;
+    const bool arr = p < text.size() && text[p] == '[';
+    if (arr) ++p;
+    for (;;) {
+        char* end = nullptr;
+        const double v = std::strtod(text.c_str() + p, &end);
+        if (end == text.c_str() + p) break;
+        out.push_back(v);
+        p = (size_t)(end - text.c_str());
+        while (p < text.size() && (text[p] == ',' || text[p] == ' ' || text[p] == '\n')) ++p;
+        if (!arr || p >= text.size() || text[p] == ']') break;
+    }
+    return out;
+}
+
+/* Host address of a declared buffer by name (null when the buffer is not host-addressable). Same lookup as haru_assembly_test. */
+const float* buffer_ptr(const rad::Program& p, const char* name, int64_t* n) {
+    for (const rad::BufferInfo& b : p.buffers)
+        if (b.name == name) { if (n) *n = b.bytes / 4; return static_cast<const float*>(b.ptr); }
+    return nullptr;
+}
+
 struct Workers {
     rad::Engine* e = nullptr;
     ~Workers() { if (e) e->stop_workers(); }
@@ -283,7 +314,7 @@ TEST(the_real_haru_on_the_gpu_matches_the_reference_teacher_forced) {
         lane_b = ob->lane();
     }
 
-    struct Row { double cos_logits, cos_pad, mel; int top1; double ms; };
+    struct Row { double cos_logits, cos_pad, mel; int top1; double ms; double cos_latent = -2; };
     std::vector<Row> rows;
     std::vector<float> all_got, all_want;
     {   /* frame 0 comes from the prompt; its audio is decoded and dropped, so only logits compare */
@@ -294,6 +325,11 @@ TEST(the_real_haru_on_the_gpu_matches_the_reference_teacher_forced) {
         r.mel = 0; r.ms = open_ms;
         rows.push_back(r);
     }
+    /* RAD_HARU_REAL_LATENT=1: also compare the latent the flow head produced each frame (duplex.prev_latent, lane 0) with the
+     * golden's latent_out, which localises a difference to before or after the head. Needs a host-addressable buffer. */
+    int64_t latent_n = 0;
+    const float* latent_buf = env("RAD_HARU_REAL_LATENT") ? buffer_ptr(engine.program(), "duplex.prev_latent", &latent_n) : nullptr;
+    if (env("RAD_HARU_REAL_LATENT")) std::fprintf(stderr, "    latent readback: %s (%lld floats)\n", latent_buf ? "host-addressable" : "NOT available", (long long)latent_n);
     std::vector<double> step_ms;
     for (int64_t s = 0; s < frames; ++s) {
         const std::string pre = "frame" + std::to_string(s + 1);
@@ -314,6 +350,10 @@ TEST(the_real_haru_on_the_gpu_matches_the_reference_teacher_forced) {
         r.cos_pad = cosine(src.pad, g.f32(pre + ".logits_fp32_pad_eop"));
         r.top1 = argmax(src.logits) == argmax(g.f32(pre + ".logits"));
         r.ms = ms;
+        if (latent_buf) {
+            const std::vector<float> got_l(latent_buf, latent_buf + 64), want_l = g.f32(pre + ".latent_out");
+            r.cos_latent = cosine(got_l, want_l);
+        }
         const std::vector<double> a = logmel(rep.audio), b = logmel(want_audio);
         double d = 0;
         if (a.size() == b.size() && !a.empty()) { for (size_t i = 0; i < a.size(); ++i) d += std::fabs(a[i] - b[i]); d /= (double)a.size(); }
@@ -359,14 +399,34 @@ TEST(the_real_haru_on_the_gpu_matches_the_reference_teacher_forced) {
         f << "{\"frames\":" << rows.size() << ",\"open_ms\":" << open_ms << ",\"rows\":[";
         for (size_t i = 0; i < rows.size(); ++i)
             f << (i ? "," : "") << "{\"cos_logits\":" << rows[i].cos_logits << ",\"cos_pad\":" << rows[i].cos_pad
-              << ",\"top1\":" << rows[i].top1 << ",\"mel\":" << rows[i].mel << ",\"ms\":" << rows[i].ms << "}";
+              << ",\"top1\":" << rows[i].top1 << ",\"mel\":" << rows[i].mel << ",\"ms\":" << rows[i].ms << ",\"cos_latent\":" << rows[i].cos_latent << "}";
         f << "]}\n";
     }
 
-    /* Sanity only: the thresholds are set from the measured noise floor in the plan, not here. */
+    /* Gate. Always: the numbers are finite and most tokens agree. With RAD_HARU_REAL_FLOOR (the reference's own bf16 replay on this same
+     * recording, measured by the Python harness) the engine must be no worse than that floor by a margin, because the recording's
+     * chaotic sensitivity sets how well *any* bf16 implementation can follow the f32 golden, so a fixed absolute threshold is wrong
+     * for one recording or the other. The margins come from the measured engine-versus-floor gaps in docs/duplex/tohil-plan.md
+     * section 4.0 (largest observed: cosine mean -0.0 / +0.006, top-1 -0.008, cosine min -0.056, early log-mel +0.12). */
     CHECK(std::isfinite(cos_sum));
-    CHECK(cos_min > 0.5);
     CHECK(top1 * 2 > (int64_t)rows.size());
+    if (const char* fl = env("RAD_HARU_REAL_FLOOR")) {
+        std::ifstream in(fl);
+        const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        const auto f_mean = json_numbers(text, "logits_cos_mean"), f_min = json_numbers(text, "logits_cos_min"),
+                   f_top1 = json_numbers(text, "top1"), f_mel = json_numbers(text, "mel_series");
+        REQUIRE(f_mean.size() == 1 && f_min.size() == 1 && f_top1.size() == 1 && f_mel.size() >= 10);
+        const double e_mean = cos_sum / (double)rows.size(), e_top1 = (double)top1 / (double)rows.size();
+        double e_early = 0, f_early = 0;   /* log-mel of frames 1..9, where the first speech burst is decoded */
+        for (size_t i = 1; i < 10 && i < rows.size(); ++i) { e_early += rows[i].mel; f_early += f_mel[i]; }
+        e_early /= 9; f_early /= 9;
+        std::fprintf(stderr, "    gate vs floor: cosine mean %.4f (floor %.4f) min %.4f (%.4f) top-1 %.3f (%.3f) early log-mel %.3f (%.3f)\n",
+                     e_mean, f_mean[0], cos_min, f_min[0], e_top1, f_top1[0], e_early, f_early);
+        CHECK(e_mean >= f_mean[0] - 0.02);
+        CHECK(e_top1 >= f_top1[0] - 0.02);
+        CHECK(cos_min >= f_min[0] - 0.15);
+        CHECK(e_early <= f_early + 0.3);
+    }
 }
 
 RAD_TEST_MAIN()
