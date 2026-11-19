@@ -428,9 +428,13 @@ says so with `RAD_ARCH_SERVES_IMPORTS(0)` (`qwen35_w8a8` does), and imports keep
   `RAD_GEN_PASS_DUPLEX_STEP`; `RadDuplexBatch` carries the lanes, prompt rows, reference frames and
   step flags. A program declares exactly one of this, the other generators, logits or pooled
   vectors. ABI 39 adds host-side text sampling: `host_sampling`, `n_vocab`, the PAD/EOP/EOS ids,
-  `logits_out`, `pad_eop_out` and `text_in` in the declaration, and host-provided `codec_noise` and
-  `head_noise` in the batch. The plugin writes the row's logits; the host samples and feeds the
-  token back.
+  `logits_out`, `pad_eop_out`, `text_in` and `codec_noise_scale` (`latent_std / 0.8`, the
+  coefficient the host multiplies its normal draws by) in the declaration, and host-provided
+  `codec_noise` and `head_noise` in the batch. The plugin writes the row's logits; the host samples
+  and feeds the token back. The assembled Haru tenant's production host source is
+  `core/server/duplex_host.{h,cpp}`; the driver calls it through `DuplexHostSource`
+  (`core/gen/duplex_driver.h`) and attaches it in `Engine::run_server` only for a tenant that sets
+  `host_sampling = 1`.
 
 ### Running the test-only duplex plugin
 

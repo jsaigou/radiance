@@ -795,6 +795,7 @@ int32_t pad_id, eop_id, eos_id;   /* -1 when unused */
 rad_buf logits_out;     /* f32 [max_lanes, n_vocab] device */
 rad_buf pad_eop_out;    /* f32 [max_lanes, 2] device */
 rad_buf text_in;        /* i32 [max_lanes] device */
+double codec_noise_scale; /* latent_std / 0.8; > 0 and finite with host_sampling */
 ```
 
 `RadDuplexBatch`, after `flags_h`:
@@ -810,9 +811,21 @@ The plugin writes the current model row's raw f32 logits and the f32 PAD/EOP pai
 DRY, replaces the PAD/EOP entries, adds `eop_bias`, samples, and writes the chosen token to
 `text_in[lane]`; the next STEP's embedding reads it. `text_out` is unused when
 `host_sampling = 1`. `codec_noise` is the combined term added to the codec's latent means
-(`scale * (latent_std / 0.8) * raw`), one row per reference row on PROMPT and one row a lane on
-STEP; `head_noise` is the raw vector the MeanFlow head starts from. Both are host inputs in
-production (seed-derived) and in teacher-forced tests (recorded values); no RNG lives in a block.
+(`scale * codec_noise_scale * raw`), one row per reference row on PROMPT and one row a lane on
+STEP; `head_noise` is the raw vector the MeanFlow head starts from. The plugin declares
+`codec_noise_scale` because it reads the checkpoint's `latent_std`; the host does not. Both noise
+buffers are host inputs in production (seed-derived) and in teacher-forced tests (recorded values);
+no RNG lives in a block.
+
+A host-sampling tenant's production source (`core/server/duplex_host.{h,cpp}`) owns one
+`LaneSampler`, one noise PRNG and one `StreamDetokenizer` per lane. The driver tells it when a lane
+opens and closes (`DuplexHostSource::lane_opened`/`lane_closed`), and the source returns the text
+delta through `reply_text`; the server maps it to the wire and sets `flags` bit 1 when it is
+non-empty. The server clamps every engine reply's audio to `[-1, 1]` (NaN to 0, infinities to the
+endpoints) because the plugin has no constant-bound clamp op; the echo test tenants do not go
+through that path and stay bit-exact. A lane's seed is `duplex_seed(session_id)`, a pinned FNV-1a
+64-bit hash (`core/server/duplex.h`), not `std::hash`, so a replay does not depend on the standard
+library.
 
 `RadDuplexBatch::seed` is now documented as two 32-bit words a lane: `seed[2*i]` low,
 `seed[2*i+1]` high. ABI 39 regenerates the layout table and moves `RAD_ABI_VERSION` to 39; see
