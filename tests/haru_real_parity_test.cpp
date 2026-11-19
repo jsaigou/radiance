@@ -217,7 +217,17 @@ TEST(the_real_haru_on_the_gpu_matches_the_reference_teacher_forced) {
     rad::Config cfg;
     cfg.model = rad_path;
     cfg.radiance_home = home;
-    cfg.kernel_hierarchy = { "libhalo", "libref" };
+    cfg.kernel_hierarchy = { "libhalo" };   // every op resolves on the device: libref is not needed
+    if (const char* k = env("RAD_HARU_REAL_KERNELS")) {   // e.g. "libhalo,libref" to include the host oracle
+        cfg.kernel_hierarchy.clear();
+        std::string v = k;
+        for (size_t at = 0; at <= v.size();) {
+            size_t e = v.find(',', at);
+            if (e == std::string::npos) e = v.size();
+            if (e > at) cfg.kernel_hierarchy.push_back(v.substr(at, e - at));
+            at = e + 1;
+        }
+    }
     cfg.accept_reference_kernels = false;
     cfg.max_tok = 4096;
     cfg.max_seqs = 2;
@@ -253,6 +263,24 @@ TEST(the_real_haru_on_the_gpu_matches_the_reference_teacher_forced) {
     const double open_ms = std::chrono::duration<double, std::milli>(clock::now() - t_open).count();
     const int32_t lane = open->lane();
 
+    /* RAD_HARU_REAL_LANES=2: a second lane runs the same recording alongside, stepped together, so the
+     * step time is that of a pass carrying two lanes. Its outputs are not compared. */
+    const bool two = env("RAD_HARU_REAL_LANES") && std::atoi(env("RAD_HARU_REAL_LANES")) >= 2;
+    int32_t lane_b = -1;
+    if (two) {
+        auto reqb = std::make_unique<rad::gen::DuplexRequest>();
+        for (int64_t v : prompt_tokens) reqb->tokens.push_back((int32_t)v);
+        reqb->ref_audio = ref_audio;
+        reqb->ref_cu = { 0, (int32_t)ref_audio.size() };
+        reqb->ref_frame.assign((size_t)T, -1);
+        for (int64_t f = 0; f < n_ref; ++f) reqb->ref_frame[(size_t)(n_card + f)] = (int32_t)f;
+        reqb->seed = 4321;
+        std::shared_ptr<rad::gen::DuplexTicket> ob;
+        REQUIRE(drv->open(std::move(reqb), &ob, &why) >= 0);
+        REQUIRE(ob->wait(600000, &to) && ob->status() == RAD_OK);
+        lane_b = ob->lane();
+    }
+
     struct Row { double cos_logits, cos_pad, mel; int top1; double ms; };
     std::vector<Row> rows;
     std::vector<float> all_got, all_want;
@@ -271,8 +299,11 @@ TEST(the_real_haru_on_the_gpu_matches_the_reference_teacher_forced) {
         std::shared_ptr<rad::gen::DuplexTicket> t;
         const auto t0 = clock::now();
         REQUIRE(drv->step(lane, in.data(), (int64_t)in.size(), (uint64_t)s, &t, &why) >= 0);
-        rad::gen::DuplexReply rep;
+        std::shared_ptr<rad::gen::DuplexTicket> tb;
+        if (two) REQUIRE(drv->step(lane_b, in.data(), (int64_t)in.size(), (uint64_t)s, &tb, &why) >= 0);
+        rad::gen::DuplexReply rep, repb;
         REQUIRE(t->next(&rep, 600000, &to));
+        if (two) REQUIRE(tb->next(&repb, 600000, &to));
         const double ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
         step_ms.push_back(ms);
         const std::vector<float> want_audio = g.f32(pre + ".audio_out");
@@ -291,6 +322,7 @@ TEST(the_real_haru_on_the_gpu_matches_the_reference_teacher_forced) {
         all_want.insert(all_want.end(), want_audio.begin(), want_audio.end());
     }
     drv->close(lane);
+    if (two) drv->close(lane_b);
     engine.stop_workers();
     guard.e = nullptr;
 
