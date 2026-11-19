@@ -4541,6 +4541,9 @@ static const RadConstraint cLoraShrinkWmmaQ[] = {
 static const RadConstraint cScaleRows[] = {
     C_GE("M", 1), C_GE("n", 1), C_IN("dtype", "bf16"),
 };
+static const RadConstraint cScaleRowsF32[] = {
+    C_GE("M", 1), C_GE("n", 1), C_IN("dtype", "f32"),
+};
 /* The gated residual. `n <= 7552` and `hc <= 4` bound hc*n at 30208, inside the 30576 bf16
  * elements kernel A can hold the normed row in after its 4384 bytes of static planes in 64 KiB
  * (kHcLdsMaxHN); no device fallback exists for a wider stream (libref is host domain). 7552 is the
@@ -5394,6 +5397,7 @@ static const RadTunable tRmsQ8[] = {
  * power-of-two padding. */
 static const RadConstraint cBf16Row[]   = { C_IN("dtype", "bf16") };
 static const RadConstraint cF32Row[]    = { C_IN("dtype", "f32") };
+static const RadConstraint cI32Row[]    = { C_IN("dtype", "i32") };
 /* bf16 rows over the byte copy, which moves four bytes a thread: an even width. */
 static const RadConstraint cBf16Row2[]  = { C_IN("dtype", "bf16"), C_DIV("n", 2) };
 /* Opaque byte rows, four at a time: the vectorised copy's alignment, stated so the selector
@@ -5870,6 +5874,16 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, halo_rad_rmsnorm_p, nullptr, nullptr, nullptr,
   halo_shape_unary },
 
+{ "rmsnorm_p_f32", "rmsnorm_p", "norm",
+  "weightless root-mean-square norm, f32: a row up to 4096 elements is read once and held in "
+  "registers across the reduction, on a block as narrow as the row allows",
+  "any n; n % 4 == 0 with aligned rows takes the vector path, anything else two scalar passes",
+  "f32 x / y, f32 accumulation",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cF32Row), NOTUNE,
+  nullptr, nullptr, halo_rad_rmsnorm_p, nullptr, nullptr, nullptr,
+  halo_shape_unary },
+
 { "layernorm_bf16", "layernorm", "norm",
   "layer norm with a gain and an optional bias, two passes over the row",
   "any n; mean and variance accumulate in f32 and only the store narrows",
@@ -5947,6 +5961,16 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, halo_rad_mul, nullptr, nullptr, nullptr,
   halo_shape_binary },
 
+{ "mul_f32", "mul", "elem",
+  "elementwise f32 product, the same broadcast rule; one row (M = 1) is a flat, division-free "
+  "launch with float4 loads when aligned",
+  "any M and n; `y` may be `a`",
+  "f32 in and out",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cF32Row), NOTUNE,
+  nullptr, nullptr, halo_rad_mul, nullptr, nullptr, nullptr,
+  halo_shape_binary },
+
 { "mul_weight_bf16", "mul_weight", "elem",
   "activation times a learned scalar or one-row gain",
   "any n; the weight is one element or exactly n",
@@ -5981,6 +6005,15 @@ static const RadKernelInfo kKernels[] = {
   "f32 out, the value exactly",
   RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
   ROW(cF32Row), NOTUNE,
+  nullptr, nullptr, halo_rad_fill, nullptr, nullptr, nullptr,
+  halo_shape_fill },
+
+{ "fill_i32", "fill", "elem",
+  "constant integer fill (token-id constants, a status word)",
+  "any M, n; a row pitch is honoured; `value` must be an exact int32",
+  "i32 out, the value exactly",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cI32Row), NOTUNE,
   nullptr, nullptr, halo_rad_fill, nullptr, nullptr, nullptr,
   halo_shape_fill },
 
@@ -8130,6 +8163,16 @@ HALO_WIN_PAIR(512, 1) HALO_WIN_PAIR(512, 2) HALO_WIN_PAIR(512, 4) HALO_WIN_PAIR(
   "bf16 in and out, fp32 arithmetic",
   RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
   ROW(cScaleRows), NOTUNE,
+  nullptr, nullptr, halo_rad_scale_rows, nullptr, nullptr, nullptr,
+  halo_shape_scale_rows },
+
+{ "scale_rows_f32", "scale_rows", "elem",
+  "one scalar a row, optionally through a sigmoid, broadcast across the row, f32 (float4 when "
+  "aligned, a block as narrow as the row)",
+  "any M and n; the scalar stream is [M] or [M, 1], f32 or bf16",
+  "f32 in and out, the fused-add form multiplies then adds without an fma",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cScaleRowsF32), NOTUNE,
   nullptr, nullptr, halo_rad_scale_rows, nullptr, nullptr, nullptr,
   halo_shape_scale_rows },
 

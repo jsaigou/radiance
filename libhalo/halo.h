@@ -1009,6 +1009,7 @@ int halo_binary_bf16(long a, long b, long y, int M, int n, int op,
 int halo_sigmoid_bf16(long x, long y, int M, int n, int x_ld, int y_ld, long stream);
 int halo_fill_bf16(long y, int M, int n, int y_ld, float value, long stream);
 int halo_fill_f32(long y, int M, int n, int y_ld, float value, long stream);
+int halo_fill_i32(long y, int M, int n, int y_ld, int value, long stream);
 // y[.., i] = silu(gu[.., i]) * gu[.., n + i]. The gate is the first half, the order rad-convert
 // fuses gate_proj and up_proj in.
 int halo_silu_mul_bf16(long gu, long y, int M, int n, int gu_ld, int y_ld, long stream);

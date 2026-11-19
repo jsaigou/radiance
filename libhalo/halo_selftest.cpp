@@ -7010,6 +7010,197 @@ static void rmsnorm_p_case(const Plugin& pl) {
     }
 }
 
+
+/* The f32 / i32 small ops the Haru head and projectors issue (mul_f32, scale_rows_f32, rmsnorm_p_f32,
+ * fill_i32), against f64 / exact host evaluations. They are launch-latency ops, so the interesting
+ * failures are in the paths, not the arithmetic: the float4 path and the scalar fallback, the
+ * single-row kernel and the pitched multi-row one, a row longer than the register cache, a
+ * broadcast operand, a bf16 scalar, the fused add, and refusing a value that is not an int32. */
+static bool run_row_f32(const RadKernelInfo* r, std::vector<RadTensor>& ts, std::vector<RadParam>& ps,
+                        int* rc_out = nullptr) {
+    RadArgs a;
+    std::memset(&a, 0, sizeof(a));
+    a.t = ts.data(); a.n_t = (int)ts.size();
+    a.p = ps.data(); a.n_p = (int)ps.size();
+    const int rc = r->launch(&a, nullptr);
+    st_stream_sync(nullptr);
+    if (rc_out) *rc_out = rc;
+    return rc == RAD_OK;
+}
+
+static void small_f32_ops_case(const Plugin& pl) {
+    const char* what = "the f32/i32 small ops (mul, add, scale_rows, rmsnorm_p, fill) against host evaluations";
+    const RadKernelInfo* k_rms = find(pl, "rmsnorm_p_f32");
+    const RadKernelInfo* k_sc  = find(pl, "scale_rows_f32");
+    const RadKernelInfo* k_mul = find(pl, "mul_f32");
+    const RadKernelInfo* k_add = find(pl, "add_f32");
+    const RadKernelInfo* k_fil = find(pl, "fill_i32");
+    if (!k_rms || !k_sc || !k_mul || !k_add || !k_fil) { ok(what, false, "a row is absent"); return; }
+
+    auto fvals = [](size_t cnt, uint32_t seed) {
+        std::vector<float> v(cnt);
+        uint32_t x = seed * 2654435761u + 12345u;
+        for (size_t i = 0; i < cnt; ++i) {
+            x = x * 1664525u + 1013904223u;
+            v[i] = ((float)((x >> 8) & 0xffff) / 65535.0f - 0.5f) * 6.0f;   // [-3, 3]
+        }
+        return v;
+    };
+    auto upload = [&](const std::vector<float>& h) {
+        void* d = dalloc(h.size() * 4 ? h.size() * 4 : 4);
+        if (d) st_memcpy(d, h.data(), h.size() * 4, hipMemcpyHostToDevice);
+        return d;
+    };
+    auto download = [&](void* d, size_t cnt) {
+        std::vector<float> h(cnt);
+        st_memcpy(h.data(), d, cnt * 4, hipMemcpyDeviceToHost);
+        return h;
+    };
+
+    int bad_total = 0;
+    std::string detail;
+    auto fail = [&](const std::string& m) { ++bad_total; if (detail.size() < 600) detail += m + "; "; };
+
+    // ---- rmsnorm_p_f32: y = x / sqrt(mean(x^2) + eps), vector path, scalar path, pitched rows
+    struct Rms { int64_t M, n, ld; };
+    for (const Rms c : { Rms{1, 2560, 2560}, Rms{3, 64, 64}, Rms{1, 4096, 4096}, Rms{1, 4100, 4100},
+                         Rms{2, 130, 130}, Rms{5, 7, 7}, Rms{3, 64, 72}, Rms{3, 70, 75},
+                         Rms{1, 16, 16}, Rms{1, 512, 512}, Rms{2, 1024, 1024} }) {
+        const std::vector<float> xh = fvals((size_t)c.M * c.ld, (uint32_t)(c.n * 7 + c.M));
+        void* dx = upload(xh);
+        void* dy = upload(std::vector<float>((size_t)c.M * c.ld, 77.0f));
+        if (!dx || !dy) { ok(what, false, "hipMalloc failed"); return; }
+        RadTensor tx = T(dx, RAD_F32, { c.M, c.n }), ty = T(dy, RAD_F32, { c.M, c.n });
+        tx.stride[0] = c.ld; ty.stride[0] = c.ld;
+        std::vector<RadTensor> ts = { tx, ty };
+        std::vector<RadParam> ps = { PI("M", c.M), PI("n", c.n), PF("eps", 1e-5), PS("dtype", "f32") };
+        if (!run_row_f32(k_rms, ts, ps)) { fail(fmt("rmsnorm_p M=%lld n=%lld launch failed", (long long)c.M, (long long)c.n)); continue; }
+        const std::vector<float> got = download(dy, (size_t)c.M * c.ld);
+        double worst = 0; int64_t bad = 0, pad_touched = 0;
+        for (int64_t m = 0; m < c.M; ++m) {
+            double ss = 0;
+            for (int64_t i = 0; i < c.n; ++i) { const double v = xh[(size_t)(m * c.ld + i)]; ss += v * v; }
+            const double sc = 1.0 / std::sqrt(ss / (double)c.n + 1e-5);
+            for (int64_t i = 0; i < c.n; ++i) {
+                const double want = xh[(size_t)(m * c.ld + i)] * sc;
+                const double e = std::fabs(got[(size_t)(m * c.ld + i)] - want);
+                worst = std::max(worst, e);
+                if (e > 3e-6 * std::fabs(want) + 1e-7) ++bad;
+            }
+            for (int64_t i = c.n; i < c.ld; ++i) if (got[(size_t)(m * c.ld + i)] != 77.0f) ++pad_touched;
+        }
+        if (bad || pad_touched) fail(fmt("rmsnorm_p M=%lld n=%lld ld=%lld bad=%lld pad_touched=%lld worst=%g",
+                                         (long long)c.M, (long long)c.n, (long long)c.ld, (long long)bad,
+                                         (long long)pad_touched, worst));
+    }
+
+    // ---- scale_rows_f32: y = x * act(s) [+ ad], f32 or bf16 scalar
+    struct Sc { int64_t M, n; bool bf16_s, sig, ad; };
+    for (const Sc c : { Sc{1, 2560, false, false, false}, Sc{4, 64, true, true, false},
+                        Sc{3, 131, false, true, true}, Sc{2, 256, true, false, true},
+                        Sc{1, 64, false, false, false}, Sc{2, 4100, false, true, false} }) {
+        const std::vector<float> xh = fvals((size_t)c.M * c.n, 11), ah = fvals((size_t)c.M * c.n, 29);
+        std::vector<float> sh = fvals((size_t)c.M, 5);
+        std::vector<uint16_t> sb((size_t)c.M);
+        if (c.bf16_s) for (int64_t m = 0; m < c.M; ++m) { sb[(size_t)m] = h_to_bf16(sh[(size_t)m]); sh[(size_t)m] = h_bf16(sb[(size_t)m]); }
+        void* dx = upload(xh);
+        void* dy = upload(std::vector<float>((size_t)c.M * c.n, 0.0f));
+        void* da = c.ad ? upload(ah) : nullptr;
+        void* ds = nullptr;
+        if (c.bf16_s) { ds = dalloc((size_t)c.M * 2); if (ds) st_memcpy(ds, sb.data(), (size_t)c.M * 2, hipMemcpyHostToDevice); }
+        else ds = upload(sh);
+        if (!dx || !dy || !ds || (c.ad && !da)) { ok(what, false, "hipMalloc failed"); return; }
+        RadTensor none;
+        std::memset(&none, 0, sizeof none);
+        std::vector<RadTensor> ts = { T(dx, RAD_F32, { c.M, c.n }), T(ds, c.bf16_s ? RAD_BF16 : RAD_F32, { c.M }),
+                                      c.ad ? T(da, RAD_F32, { c.M, c.n }) : none, T(dy, RAD_F32, { c.M, c.n }) };
+        std::vector<RadParam> ps = { PI("M", c.M), PI("n", c.n), PS("act", c.sig ? "sigmoid" : "none"), PS("dtype", "f32") };
+        if (!run_row_f32(k_sc, ts, ps)) { fail(fmt("scale_rows M=%lld n=%lld launch failed", (long long)c.M, (long long)c.n)); continue; }
+        const std::vector<float> got = download(dy, (size_t)c.M * c.n);
+        int64_t bad = 0; double worst = 0;
+        for (int64_t m = 0; m < c.M; ++m) {
+            const double v0 = sh[(size_t)m];
+            const double v = c.sig ? 1.0 / (1.0 + std::exp(-v0)) : v0;
+            for (int64_t i = 0; i < c.n; ++i) {
+                double want = (double)xh[(size_t)(m * c.n + i)] * v;
+                if (c.ad) want += ah[(size_t)(m * c.n + i)];
+                const double e = std::fabs(got[(size_t)(m * c.n + i)] - want);
+                worst = std::max(worst, e);
+                if (e > (c.sig ? 2e-5 : 2e-6) * (std::fabs(want) + 1.0)) ++bad;
+            }
+        }
+        if (bad) fail(fmt("scale_rows M=%lld n=%lld bf16_s=%d sig=%d ad=%d bad=%lld worst=%g", (long long)c.M,
+                          (long long)c.n, (int)c.bf16_s, (int)c.sig, (int)c.ad, (long long)bad, worst));
+    }
+
+    // ---- mul_f32 / add_f32: one row (flat, vector or scalar) and the row-broadcast form; exact
+    struct Bn { int64_t M, n; bool bcast; double div; };
+    for (const bool mul : { true, false }) {
+        const RadKernelInfo* r = mul ? k_mul : k_add;
+        for (const Bn c : { Bn{1, 1, false, 1}, Bn{1, 3, false, 1}, Bn{1, 64, false, 1}, Bn{1, 2560, false, 1},
+                            Bn{1, 7680, false, 1}, Bn{1, 7681, false, 1}, Bn{4, 33, true, 1},
+                            Bn{3, 130, false, 1}, Bn{1, 256, false, 3}, Bn{2, 64, true, 3} }) {
+            if (mul && c.div != 1) continue;   // mul has no `div`
+            const std::vector<float> ah = fvals((size_t)c.M * c.n, 3), bh = fvals((size_t)(c.bcast ? c.n : c.M * c.n), 8);
+            void* da = upload(ah); void* db = upload(bh);
+            void* dy = upload(std::vector<float>((size_t)c.M * c.n, 0.0f));
+            if (!da || !db || !dy) { ok(what, false, "hipMalloc failed"); return; }
+            std::vector<RadTensor> ts = { T(da, RAD_F32, { c.M, c.n }),
+                                          T(db, RAD_F32, c.bcast ? std::vector<int64_t>{ c.n } : std::vector<int64_t>{ c.M, c.n }),
+                                          T(dy, RAD_F32, { c.M, c.n }) };
+            std::vector<RadParam> ps = { PI("M", c.M), PI("n", c.n), PS("dtype", "f32") };
+            if (!mul && c.div != 1) ps.push_back(PF("div", c.div));
+            if (!run_row_f32(r, ts, ps)) { fail(fmt("%s M=%lld n=%lld launch failed", mul ? "mul" : "add", (long long)c.M, (long long)c.n)); continue; }
+            const std::vector<float> got = download(dy, (size_t)c.M * c.n);
+            int64_t bad = 0;
+            for (int64_t m = 0; m < c.M; ++m)
+                for (int64_t i = 0; i < c.n; ++i) {
+                    const float u = ah[(size_t)(m * c.n + i)], v = bh[(size_t)((c.bcast ? 0 : m * c.n) + i)];
+                    float want = mul ? u * v : u + v;
+                    if (c.div != 1) want = want / (float)c.div;
+                    if (got[(size_t)(m * c.n + i)] != want) ++bad;
+                }
+            if (bad) fail(fmt("%s M=%lld n=%lld bcast=%d div=%g bad=%lld", mul ? "mul" : "add", (long long)c.M,
+                              (long long)c.n, (int)c.bcast, c.div, (long long)bad));
+        }
+    }
+
+    // ---- fill_i32: exact values, a pitch left alone, and a refusal for a non-int32
+    for (const double val : { 0.0, -1.0, 248076.0, 2147483647.0, -2147483648.0 }) {
+        for (const int64_t ld : { (int64_t)130, (int64_t)140 }) {
+            const int64_t M = 3, n = 130;
+            std::vector<int32_t> init((size_t)(M * ld), 0x55555555);
+            void* dy = dalloc(init.size() * 4);
+            if (!dy) { ok(what, false, "hipMalloc failed"); return; }
+            st_memcpy(dy, init.data(), init.size() * 4, hipMemcpyHostToDevice);
+            RadTensor ty = T(dy, RAD_I32, { M, n });
+            ty.stride[0] = ld;
+            std::vector<RadTensor> ts = { ty };
+            std::vector<RadParam> ps = { PI("M", M), PI("n", n), PS("dtype", "i32"), PF("value", val) };
+            if (!run_row_f32(k_fil, ts, ps)) { fail(fmt("fill_i32 value=%g launch failed", val)); continue; }
+            std::vector<int32_t> got(init.size());
+            st_memcpy(got.data(), dy, got.size() * 4, hipMemcpyDeviceToHost);
+            int64_t bad = 0;
+            for (int64_t m = 0; m < M; ++m)
+                for (int64_t i = 0; i < ld; ++i) {
+                    const int32_t want = i < n ? (int32_t)val : 0x55555555;
+                    if (got[(size_t)(m * ld + i)] != want) ++bad;
+                }
+            if (bad) fail(fmt("fill_i32 value=%g ld=%lld bad=%lld", val, (long long)ld, (long long)bad));
+        }
+    }
+    for (const double val : { 1.5, 3e9, -3e9, std::nan("") }) {
+        void* dy = dalloc(16);
+        if (!dy) { ok(what, false, "hipMalloc failed"); return; }
+        std::vector<RadTensor> ts = { T(dy, RAD_I32, { 1, 4 }) };
+        std::vector<RadParam> ps = { PI("M", 1), PI("n", 4), PS("dtype", "i32"), PF("value", val) };
+        int rc = 0;
+        if (run_row_f32(k_fil, ts, ps, &rc)) fail(fmt("fill_i32 accepted the non-int32 value %g", val));
+    }
+
+    ok(what, bad_total == 0, bad_total ? detail : std::string("all paths agree"));
+}
+
 /* gelu_mul, against an f64 evaluation of the tanh-approximation GELU.
  *
  * Fixed signed magnitudes for the gate and up halves; the f64 oracle
@@ -34248,6 +34439,11 @@ static void device_phase(const Plugin& pl) {
     if (sel("rmsnorm_p_bf16")) {
         if (!g_case) std::printf("\nthe weightless RMS norm, against the formula it implements\n");
         rmsnorm_p_case(pl);
+    }
+
+    if (sel("rmsnorm_p_f32") || sel("mul_f32") || sel("scale_rows_f32") || sel("fill_i32")) {
+        if (!g_case) std::printf("\nthe f32/i32 small ops, against host evaluations\n");
+        small_f32_ops_case(pl);
     }
 
     if (sel("hc_project_bf16")) {

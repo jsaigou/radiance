@@ -465,6 +465,68 @@ __global__ __launch_bounds__(kThreads) void rmsnorm_p_kernel(
         yr[i] = f32_to_bf16(bf16_to_f32(xr[i]) * s);
 }
 
+// The f32 weightless norm (Haru's head: the last unweighted norm of the MeanFlow head, n = 2560 at
+// M = 1). f32 in and out, f32 accumulation. A row of n % 4 == 0, 16-byte aligned, n <= 4096 is read
+// ONCE: each thread keeps its float4s in registers across the reduction and writes from them, so
+// the second pass is registers to memory, not a second read. The block is as narrow as the row
+// allows (a 64-element row is one wave: no LDS round trip across eight waves for sixteen float4s).
+// 1/sqrt, not rsqrtf: the result is an input to a GEMM whose f32 parity is gated at 1e-6.
+template <uint32_t THR, uint32_t CACHE>
+__global__ __launch_bounds__(THR) void rmsnorm_p_f32_vec_kernel(
+    const float4* __restrict__ x, float4* __restrict__ y, uint32_t n4, float inv_n, float eps,
+    uint32_t x_ld4, uint32_t y_ld4, uint32_t M) {
+    __shared__ float lds[THR / kWave];
+    const uint32_t m = blockIdx.x;
+    if (m >= M) return;
+    const float4* __restrict__ xr = x + (size_t)m * x_ld4;
+    float4* __restrict__ yr = y + (size_t)m * y_ld4;
+    float4 r[CACHE];
+    float ss = 0.0f;
+#pragma unroll
+    for (uint32_t k = 0; k < CACHE; ++k) {
+        const uint32_t i = threadIdx.x + k * THR;
+        if (i < n4) {
+            const float4 v = xr[i];
+            r[k] = v;
+            ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+        } else {
+            r[k] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+    }
+    ss = block_sum<THR / kWave>(ss, lds);
+    const float sc = 1.0f / sqrtf(ss * inv_n + eps);
+#pragma unroll
+    for (uint32_t k = 0; k < CACHE; ++k) {
+        const uint32_t i = threadIdx.x + k * THR;
+        if (i < n4) yr[i] = make_float4(r[k].x * sc, r[k].y * sc, r[k].z * sc, r[k].w * sc);
+    }
+}
+
+// Any n, any pitch, any alignment: two passes over the row, as the bf16 kernel does.
+__global__ __launch_bounds__(kThreads) void rmsnorm_p_f32_kernel(
+    const float* __restrict__ x, float* __restrict__ y, uint32_t n, float eps, uint32_t x_ld,
+    uint32_t y_ld, uint32_t M) {
+    __shared__ float lds[kThreads / kWave];
+    const uint32_t m = blockIdx.x;
+    if (m >= M) return;
+    const float* __restrict__ xr = x + (size_t)m * x_ld;
+    float* __restrict__ yr = y + (size_t)m * y_ld;
+    float ss = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n; i += kThreads) { const float v = xr[i]; ss += v * v; }
+    ss = block_sum<kThreads / kWave>(ss, lds);
+    const float sc = 1.0f / sqrtf(ss / (float)n + eps);
+    for (uint32_t i = threadIdx.x; i < n; i += kThreads) yr[i] = xr[i] * sc;
+}
+
+template <uint32_t THR, uint32_t CACHE>
+static int launch_rmsnorm_p_f32_vec(const float* x, float* y, uint32_t n, float eps,
+                                    uint32_t x_ld, uint32_t y_ld, uint32_t M, hipStream_t s) {
+    hipLaunchKernelGGL((rmsnorm_p_f32_vec_kernel<THR, CACHE>), dim3(M), dim3(THR), 0, s,
+                       (const float4*)x, (float4*)y, n / 4u, 1.0f / (float)n, eps, x_ld / 4u,
+                       y_ld / 4u, M);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
 // ---------------------------------------------------------------------------- add / mul
 // ref_add / ref_mul with one broadcast rule: an operand of exactly n elements against an output of
 // rows*n broadcasts along rows; nothing else broadcasts, so shape bugs are not hidden.
@@ -503,6 +565,31 @@ __global__ __launch_bounds__(kThreads) void binary_f32_kernel(
         float r = mul ? u * v : u + v;
         if (div != 1.0f) r = r / div;
         y[m * y_ld + i] = r;
+    }
+}
+
+// The one-row f32 form (M = 1: a head's scalar and vector arithmetic, n from 1 to a few thousand).
+// No row index, so no 64-bit division per element; float4 when every operand is 16-byte aligned
+// and n % 4 == 0. `div` is add's alone (1 for mul).
+template <bool VEC>
+__global__ __launch_bounds__(kThreads) void binary_f32_row_kernel(
+    const float* __restrict__ a, const float* __restrict__ b, float* y, uint32_t n, int mul,
+    float div) {
+    if (VEC) {
+        const uint32_t n4 = n / 4u;
+        for (uint32_t i = blockIdx.x * kThreads + threadIdx.x; i < n4; i += gridDim.x * kThreads) {
+            const float4 u = ((const float4*)a)[i], v = ((const float4*)b)[i];
+            float4 r = mul ? make_float4(u.x * v.x, u.y * v.y, u.z * v.z, u.w * v.w)
+                           : make_float4(u.x + v.x, u.y + v.y, u.z + v.z, u.w + v.w);
+            if (div != 1.0f) { r.x /= div; r.y /= div; r.z /= div; r.w /= div; }
+            ((float4*)y)[i] = r;
+        }
+    } else {
+        for (uint32_t i = blockIdx.x * kThreads + threadIdx.x; i < n; i += gridDim.x * kThreads) {
+            float r = mul ? a[i] * b[i] : a[i] + b[i];
+            if (div != 1.0f) r /= div;
+            y[i] = r;
+        }
     }
 }
 
@@ -1224,6 +1311,18 @@ extern "C" int halo_fill_f32(long y, int M, int n, int y_ld, float value, long s
     uint32_t bits;
     std::memcpy(&bits, &value, sizeof bits);
     hipLaunchKernelGGL(fill_kernel<uint32_t>, dim3((uint32_t)M), dim3(kThreads), 0,
+                       (hipStream_t)stream, (uint32_t*)y, (uint32_t)n, (uint32_t)y_ld, bits);
+    return hipGetLastError() == hipSuccess ? 0 : -4;
+}
+
+// The i32 fill (token-id constants, a status word): the same 32-bit kernel with the integer's bits.
+extern "C" int halo_fill_i32(long y, int M, int n, int y_ld, int value, long stream) {
+    if (!y) return -1;
+    if (M <= 0 || n <= 0) return -2;
+    if (!y_ld) y_ld = n;
+    const uint32_t bits = (uint32_t)value;
+    const uint32_t threads = n <= 32 ? 32u : n <= 64 ? 64u : n <= 128 ? 128u : kThreads;
+    hipLaunchKernelGGL(fill_kernel<uint32_t>, dim3((uint32_t)M), dim3(threads), 0,
                        (hipStream_t)stream, (uint32_t*)y, (uint32_t)n, (uint32_t)y_ld, bits);
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
@@ -2036,8 +2135,11 @@ extern "C" int halo_rad_rmsnorm_p(const RadArgs* a, RadStream s) {
     const RadTensor* x = halo_opt(a, 0);
     const RadTensor* y = halo_opt(a, 1);
     if (!x || !y) return HALO_NO(RAD_E_INVAL);
-    HALO_NEED(dt_bf16(x));
-    HALO_NEED(dt_bf16(y));
+    const bool f32 = x->dtype == RAD_F32 && y->dtype == RAD_F32;   // the second leg: all f32
+    if (!f32) {
+        HALO_NEED(dt_bf16(x));
+        HALO_NEED(dt_bf16(y));
+    }
 
     const long long n = halo_geti_or(a, "n", halo_dim(x, (int)x->rank - 1));
     if (n <= 0) return HALO_NO(RAD_E_SHAPE);
@@ -2048,6 +2150,28 @@ extern "C" int halo_rad_rmsnorm_p(const RadArgs* a, RadStream s) {
     if (M <= 0 || My < M) return HALO_NO(RAD_E_SHAPE);
 
     const float eps = (float)halo_getf(a, "eps", 1e-6);
+    if (f32) {
+        const float* xp = (const float*)x->data;
+        float* yp = (float*)y->data;
+        const uint32_t n4 = (uint32_t)(n / 4);
+        const bool vec = (n % 4 == 0) && (x_ld % 4 == 0) && (y_ld % 4 == 0) &&
+                         (((uintptr_t)xp | (uintptr_t)yp) & 15u) == 0 && n4 <= 4u * kThreads;
+        hipStream_t st = (hipStream_t)s;
+        int rc;
+        if (vec && n4 <= 32)        rc = launch_rmsnorm_p_f32_vec<32, 1>(xp, yp, (uint32_t)n, eps, (uint32_t)x_ld, (uint32_t)y_ld, (uint32_t)M, st);
+        else if (vec && n4 <= 64)   rc = launch_rmsnorm_p_f32_vec<64, 1>(xp, yp, (uint32_t)n, eps, (uint32_t)x_ld, (uint32_t)y_ld, (uint32_t)M, st);
+        else if (vec && n4 <= 128)  rc = launch_rmsnorm_p_f32_vec<128, 1>(xp, yp, (uint32_t)n, eps, (uint32_t)x_ld, (uint32_t)y_ld, (uint32_t)M, st);
+        else if (vec && n4 <= 256)  rc = launch_rmsnorm_p_f32_vec<256, 1>(xp, yp, (uint32_t)n, eps, (uint32_t)x_ld, (uint32_t)y_ld, (uint32_t)M, st);
+        else if (vec && n4 <= 512)  rc = launch_rmsnorm_p_f32_vec<256, 2>(xp, yp, (uint32_t)n, eps, (uint32_t)x_ld, (uint32_t)y_ld, (uint32_t)M, st);
+        else if (vec)               rc = launch_rmsnorm_p_f32_vec<256, 4>(xp, yp, (uint32_t)n, eps, (uint32_t)x_ld, (uint32_t)y_ld, (uint32_t)M, st);
+        else {
+            hipLaunchKernelGGL(rmsnorm_p_f32_kernel, dim3(halo_cliff_rows((uint32_t)M, 1, kThreads / kWave)),
+                               dim3(kThreads), 0, st, xp, yp, (uint32_t)n, eps, (uint32_t)x_ld,
+                               (uint32_t)y_ld, (uint32_t)M);
+            rc = hipGetLastError() == hipSuccess ? 0 : -4;
+        }
+        return rc == 0 ? RAD_OK : RAD_E_DEVICE;
+    }
     const int rc = halo_rmsnorm_p_bf16(halo_addr(x), halo_addr(y), (int)M, (int)n, eps,
                                       (int)x_ld, (int)y_ld, (long)(uintptr_t)s);
     return rc == 0 ? RAD_OK : RAD_E_DEVICE;
@@ -2092,6 +2216,21 @@ static int binary(const RadArgs* a, int mul, RadStream s) {
         if (b_ld == 0) return HALO_NO(RAD_E_STRIDE);   /* 0 means broadcast; a real pitch cannot be 0 */
     }
 
+    if (f32 && M == 1) {
+        const bool vec = (n % 4 == 0) && (((uintptr_t)A->data | (uintptr_t)B->data |
+                                           (uintptr_t)Y->data) & 15u) == 0;
+        const uint32_t units = vec ? (uint32_t)(n / 4) : (uint32_t)n;
+        const uint32_t blocks = std::max<uint32_t>(1u, std::min<uint32_t>((units + kThreads - 1) / kThreads, 64u));
+        if (vec)
+            hipLaunchKernelGGL(binary_f32_row_kernel<true>, dim3(blocks), dim3(kThreads), 0,
+                               (hipStream_t)s, (const float*)A->data, (const float*)B->data,
+                               (float*)Y->data, (uint32_t)n, mul, (float)div);
+        else
+            hipLaunchKernelGGL(binary_f32_row_kernel<false>, dim3(blocks), dim3(kThreads), 0,
+                               (hipStream_t)s, (const float*)A->data, (const float*)B->data,
+                               (float*)Y->data, (uint32_t)n, mul, (float)div);
+        return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+    }
     if (f32) {
         const uint64_t total = (uint64_t)M * (uint64_t)n;
         const uint64_t blocks = std::min<uint64_t>((total + kThreads - 1) / kThreads, 65536u);
@@ -2197,7 +2336,7 @@ extern "C" int halo_rad_sigmoid(const RadArgs* a, RadStream s) {
 extern "C" int halo_rad_fill(const RadArgs* a, RadStream s) {
     const RadTensor* y = halo_opt(a, 0);
     if (!y) return HALO_NO(RAD_E_INVAL);
-    if (y->dtype != RAD_BF16 && y->dtype != RAD_F32) return HALO_NO(RAD_E_DTYPE);
+    if (y->dtype != RAD_BF16 && y->dtype != RAD_F32 && y->dtype != RAD_I32) return HALO_NO(RAD_E_DTYPE);
     const long long n = halo_geti_or(a, "n", halo_dim(y, (int)y->rank - 1));
     if (n <= 0) return HALO_NO(RAD_E_SHAPE);
     long long M = 0;
@@ -2205,6 +2344,13 @@ extern "C" int halo_rad_fill(const RadArgs* a, RadStream s) {
     if (y_ld < 0) return HALO_NO(RAD_E_STRIDE);
     if (M <= 0) return HALO_NO(RAD_E_SHAPE);
     const double v = halo_getf(a, "value", 0.0);
+    if (y->dtype == RAD_I32) {
+        // An integer constant: exact, and refused (not truncated) when it is not one.
+        if (!(v >= -2147483648.0 && v <= 2147483647.0) || v != std::floor(v))
+            return HALO_NO(RAD_E_INVAL);
+        return halo_fill_i32(halo_addr(y), (int)M, (int)n, (int)y_ld, (int)v,
+                             (long)(uintptr_t)s) == 0 ? RAD_OK : RAD_E_DEVICE;
+    }
     const int e = (y->dtype == RAD_F32 ? halo_fill_f32 : halo_fill_bf16)(
         halo_addr(y), (int)M, (int)n, (int)y_ld, (float)v, (long)(uintptr_t)s);
     return e == 0 ? RAD_OK : RAD_E_DEVICE;
