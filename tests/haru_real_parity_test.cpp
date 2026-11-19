@@ -325,11 +325,13 @@ TEST(the_real_haru_on_the_gpu_matches_the_reference_teacher_forced) {
         r.mel = 0; r.ms = open_ms;
         rows.push_back(r);
     }
-    /* RAD_HARU_REAL_LATENT=1: also compare the latent the flow head produced each frame (duplex.prev_latent, lane 0) with the
+    /* RAD_HARU_REAL_LATENT=1 (implied by RAD_HARU_REAL_LATENTS_OUT=<file>, which also dumps every latent): also compare the latent the flow head produced each frame (duplex.prev_latent, lane 0) with the
      * golden's latent_out, which localises a difference to before or after the head. Needs a host-addressable buffer. */
     int64_t latent_n = 0;
-    const float* latent_buf = env("RAD_HARU_REAL_LATENT") ? buffer_ptr(engine.program(), "duplex.prev_latent", &latent_n) : nullptr;
+    const float* latent_buf = (env("RAD_HARU_REAL_LATENT") || env("RAD_HARU_REAL_LATENTS_OUT")) ? buffer_ptr(engine.program(), "duplex.prev_latent", &latent_n) : nullptr;
     if (env("RAD_HARU_REAL_LATENT")) std::fprintf(stderr, "    latent readback: %s (%lld floats)\n", latent_buf ? "host-addressable" : "NOT available", (long long)latent_n);
+    std::vector<float> latents_all;   /* RAD_HARU_REAL_LATENTS_OUT: [frame 0..N][64] raw f32, the latents the engine fed its decoder */
+    if (latent_buf) latents_all.insert(latents_all.end(), latent_buf, latent_buf + kLatent);
     std::vector<double> step_ms;
     for (int64_t s = 0; s < frames; ++s) {
         const std::string pre = "frame" + std::to_string(s + 1);
@@ -353,6 +355,7 @@ TEST(the_real_haru_on_the_gpu_matches_the_reference_teacher_forced) {
         if (latent_buf) {
             const std::vector<float> got_l(latent_buf, latent_buf + 64), want_l = g.f32(pre + ".latent_out");
             r.cos_latent = cosine(got_l, want_l);
+            latents_all.insert(latents_all.end(), got_l.begin(), got_l.end());
         }
         const std::vector<double> a = logmel(rep.audio), b = logmel(want_audio);
         double d = 0;
@@ -394,6 +397,8 @@ TEST(the_real_haru_on_the_gpu_matches_the_reference_teacher_forced) {
         std::ofstream(std::string(pre) + ".reference.f32", std::ios::binary)
             .write(reinterpret_cast<const char*>(all_want.data()), (std::streamsize)(all_want.size() * 4));
     }
+    if (const char* lo = env("RAD_HARU_REAL_LATENTS_OUT"))
+        std::ofstream(lo, std::ios::binary).write(reinterpret_cast<const char*>(latents_all.data()), (std::streamsize)(latents_all.size() * 4));
     if (const char* out = env("RAD_HARU_REAL_OUT")) {
         std::ofstream f(out);
         f << "{\"frames\":" << rows.size() << ",\"open_ms\":" << open_ms << ",\"rows\":[";
