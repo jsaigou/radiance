@@ -656,8 +656,12 @@ def build_proj(cfg: dict, src: str, manifest: Manifest, log: list[str]):
     expected = 2 + 5 * len(prefixes)
     if len(names) != expected:
         raise ParseError(f"proj: {len(names)} declarations, expected {expected}")
+    # The projector weights serve the checkpoint's own dtype (bf16 real / f32 tiny), while
+    # latent_scale and latent_bias stay f32 (the unscale Newton reciprocal needs f32 exactness).
+    dtype = config_dtype(cfg)
     for name in names:
-        manifest.identity("proj", name, shape(name), "f32")
+        manifest.identity("proj", name, shape(name),
+                          "f32" if name in ("latent_scale", "latent_bias") else dtype)
     log.append(f"proj: {len(names)} declarations (2 scalars + {len(prefixes)} x {len(templates)} "
                "projector tensors)")
 

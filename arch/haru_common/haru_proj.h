@@ -12,6 +12,12 @@
  * embedding table is the LM's (`lm.embed_tokens.weight`), so it is not declared here: the plugin
  * that assembles the LM declares it once and passes the handle in, and this block only reads it.
  *
+ * The projectors serve the checkpoint's own dtype (read from the container at declare): bf16 in
+ * the real model, where the reference runs them in bf16, and f32 in the tiny test model. The
+ * embedding sum and the two projector GEMMs are that dtype, and the result lands directly in the
+ * LM's input row in the same dtype. `latent_scale`/`latent_bias` and the unscale path stay f32
+ * (the Newton reciprocal needs f32 exactness), so the scaled latent is cast once before fc1.
+ *
  * One call is one position: one token id, one row of each latent, one row of each mask.
  */
 #ifndef HARU_PROJ_H
@@ -41,6 +47,9 @@ struct HaruAudioProjW {
 struct HaruProj {
     HaruProjGeom g;
 
+    uint32_t    wd = RAD_F32;   /* the checkpoint's own dtype: the projector weights and rows */
+    const char* dt = "f32";     /* the operand-combination string: "bf16" or "f32" */
+
     rad_weight latent_scale = 0, latent_bias = 0;
     HaruAudioProjW model{}, user{};
     /* The LM's table: passed in at declare, not owned by this block. */
@@ -51,6 +60,7 @@ struct HaruProj {
     rad_op op_gemm1_m = 0, op_gemm2_m = 0, op_norm_m = 0;
     rad_op op_gemm1_u = 0, op_gemm2_u = 0, op_norm_u = 0;
     rad_op op_mask = 0, op_add_h = 0;
+    rad_op op_cast_lat = 0;
 
     /* unscale: raw = z / latent_scale - latent_bias. The reciprocal is Newton's iteration on
      * the device (no host read of a weight). From r0 = 0.75 and kUnscaleSteps = 12 steps the
@@ -68,14 +78,15 @@ struct HaruProj {
     rad_buf b_x = 0, b_x2 = 0, b_y = 0, b_mask = 0;
     rad_buf b_fc1 = 0, b_norm = 0;
     rad_buf b_bias = 0, b_scaled = 0, b_scaled2 = 0, b_ones = 0;
+    rad_buf b_scaled_bf16 = 0;
 
     /* Declares the projectors' weights and name maps, the latent scale/bias, the workspace and
      * the ops. `tokens` is the LM's `lm.embed_tokens.weight`, which must already be declared. */
     int declare(RadBuilder* b, rad_weight tokens);
 
-    /* Issues one position's embedding. `token` is an i32 view of [1]; `model_latent` and
-     * `user_latent` are [1, latent]; `model_mask` and `user_mask` are [1] float views holding
-     * 0 or 1; `out` is [1, hidden]. */
+    /* Issues one position's embedding in the serving dtype. `token` is an i32 view of [1];
+     * `model_latent` and `user_latent` are [1, latent] f32; `model_mask` and `user_mask` are [1]
+     * float views holding 0 or 1; `out` is [1, hidden] in the serving dtype. */
     void issue(RadCtx* c, RadOperand token, RadOperand model_latent, RadOperand user_latent,
                RadOperand model_mask, RadOperand user_mask, RadOperand out) const;
 
