@@ -600,8 +600,11 @@ def build_head(cfg: dict, src: str, manifest: Manifest, log: list[str]):
     expected = 12 + 5 * layers
     if len(names) != expected:
         raise ParseError(f"head: {len(names)} declarations, expected {expected}")
+    # The head serves the checkpoint's own dtype (weight_codes_dtype): bf16 in the real model,
+    # f32 in the tiny one, so its declared dtype is the config's.
+    dtype = config_dtype(cfg)
     for name in names:
-        manifest.identity("head", name, shape(name), "f32")
+        manifest.identity("head", name, shape(name), dtype)
     log.append(f"head: {len(names)} declarations ({len(names) - 5 * layers} literals + "
                f"5 x {layers} layers)")
 

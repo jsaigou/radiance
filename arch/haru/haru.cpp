@@ -45,11 +45,12 @@ struct Model {
     rad_op op_copy_ref = 0, op_copy_mean = 0, op_copy_noise = 0, op_copy_prev = 0;
     rad_op op_copy_logits = 0, op_copy_pad = 0;
     /* The LM's activations are its checkpoint's dtype (bf16 in the real model, f32 in the tiny one);
-     * the projectors and the head compute in f32. These two scratch rows and casts are the boundary:
-     * the projector writes f32 and a cast lands it in the LM's input row, and the LM's hidden row is
-     * cast to f32 for the head. In the tiny f32 model both casts are copies. */
-    rad_buf x_f32 = 0, h_f32 = 0;
-    rad_op op_cast_x = 0, op_cast_h = 0;
+     * the projectors compute in f32 and the head serves the checkpoint's dtype. The one scratch row
+     * and cast is the projector boundary: the projector writes f32 and a cast lands it in the LM's
+     * input row; the LM's hidden row feeds the head directly in its serving dtype. In the tiny f32
+     * model the cast is a copy. */
+    rad_buf x_f32 = 0;
+    rad_op op_cast_x = 0;
     rad_op op_fill_mask_one = 0, op_fill_mask_zero = 0, op_fill_zero_latent = 0;
     rad_op op_fill_guidance = 0, op_fill_pad = 0, op_fill_eop = 0;
     rad_op op_fill_status = 0, op_fill_text = 0;
@@ -203,10 +204,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
         const char* act = rad_dtype_name(m.lm.g.act_dtype);
         const int64_t E = m.lm.g.n_embd;
         m.x_f32 = decl_b(b, nm.f("duplex.x_f32"), RAD_F32, { 1, E }, RAD_BUF_PERSIST);
-        m.h_f32 = decl_b(b, nm.f("duplex.h_f32"), RAD_F32, { 1, E }, RAD_BUF_PERSIST);
-        if (!m.x_f32 || !m.h_f32) return RAD_E_INVAL;
+        if (!m.x_f32) return RAD_E_INVAL;
         m.op_cast_x = cast_rows(b, 1, E, "f32", act, m.x_f32, m.lm.b_x);
-        m.op_cast_h = cast_rows(b, 1, E, act, "f32", m.lm.b_h, m.h_f32);
     }
     m.op_copy_prev = copy_f32(b, 1, D, m.prev_latent, m.audio_in);
     m.op_copy_logits = copy_f32(b, 1, V, m.lm.b_logits, m.logits_out);
@@ -220,7 +219,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.op_fill_eop = fill_op(b, 1, "i32", (double)m.eop_id, m.eop_tok);
     m.op_fill_status = fill_op(b, max_lanes, "i32", 0.0, m.status);
     m.op_fill_text = fill_op(b, max_lanes, "i32", -1.0, m.text_out);
-    if (!m.op_cast_x || !m.op_cast_h) return RAD_E_NOKERNEL;
+    if (!m.op_cast_x) return RAD_E_NOKERNEL;
     if (!m.op_copy_ref || !m.op_copy_mean || !m.op_copy_noise || !m.op_copy_prev ||
         !m.op_copy_logits || !m.op_copy_pad || !m.op_fill_mask_one || !m.op_fill_mask_zero ||
         !m.op_fill_zero_latent || !m.op_fill_guidance || !m.op_fill_pad || !m.op_fill_eop ||
@@ -333,8 +332,7 @@ static void prompt_pass(RadCtx* c, const RadBatch* batch) {
     RAD_ISSUE_N(c, m.op_copy_pad, 1,
                 brow_slice(m.lm.b_pad_eop, 0, 1, 2),
                 bcol_at(m.pad_eop_out, lane, 2, 0, 2, 1));
-    RAD_ISSUE_N(c, m.op_cast_h, 1, brow_slice(m.lm.b_h, T - 1, 1, m.lm.g.n_embd), RAD_B(m.h_f32));
-    m.head.issue(c, RAD_B(m.h_f32),
+    m.head.issue(c, brow_slice(m.lm.b_h, T - 1, 1, m.lm.g.n_embd),
                  praw(d->head_noise, RAD_F32, m.latent_dim), RAD_B(m.guidance),
                  bcol_at(m.head_norm, lane, m.latent_dim, 0, m.latent_dim, 1));
     m.proj.unscale(c, bcol_at(m.head_norm, lane, m.latent_dim, 0, m.latent_dim, 1),
@@ -389,8 +387,7 @@ static void step_pass(RadCtx* c, const RadBatch* batch) {
         RAD_ISSUE_N(c, m.op_copy_pad, 1,
                     brow_slice(m.lm.b_pad_eop, i, 1, 2),
                     bcol_at(m.pad_eop_out, lane, 2, 0, 2, 1));
-        RAD_ISSUE_N(c, m.op_cast_h, 1, brow_slice(m.lm.b_h, i, 1, m.lm.g.n_embd), RAD_B(m.h_f32));
-        m.head.issue(c, RAD_B(m.h_f32),
+        m.head.issue(c, brow_slice(m.lm.b_h, i, 1, m.lm.g.n_embd),
                      praw(d->head_noise + i * m.latent_dim, RAD_F32, m.latent_dim),
                      RAD_B(m.guidance),
                      bcol_at(m.head_norm, lane, m.latent_dim, 0, m.latent_dim, 1));

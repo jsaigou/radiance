@@ -18,6 +18,11 @@
  *
  * One call is one lane-step: one row of `hidden`, `noise` and `guidance`, one row of output. The
  * caller owns the buffers and passes buffer views, so this header holds no global state.
+ *
+ * The head serves the checkpoint's own dtype (read from the container at declare): bf16 in the
+ * real model, where the reference runs the head in bf16, and f32 in the tiny test model. Every
+ * weight and the activation workspace is the serving dtype. The noise arrives f32 and the
+ * normalized latent leaves f32, so the head casts at its two boundary rows.
  */
 #ifndef HARU_HEAD_H
 #define HARU_HEAD_H
@@ -63,6 +68,9 @@ struct HaruHeadLayerOp {
 struct HaruHead {
     HaruHeadGeom g;
 
+    uint32_t    wd = RAD_F32;   /* the checkpoint's own dtype: the linears and workspace */
+    const char* dt = "f32";     /* the operand-combination string: "bf16" or "f32" */
+
     rad_weight cond_proj = 0, latent_proj = 0;
     rad_weight t_fc1 = 0, t_fc2 = 0;
     rad_weight dt_fc1 = 0, dt_fc2 = 0;
@@ -87,6 +95,7 @@ struct HaruHead {
     rad_op op_fill_zero = 0, op_fill_interval = 0, op_fill_one = 0;
     rad_op op_fill_two = 0, op_fill_minus1 = 0, op_fill_r0 = 0;
     rad_op op_fill_one_h = 0;
+    rad_op op_cast_noise = 0, op_cast_out = 0;
 
     rad_buf b_cond = 0, b_c = 0, b_emb = 0, b_emb2 = 0;
     rad_buf b_x0 = 0, b_x1 = 0;
@@ -97,13 +106,15 @@ struct HaruHead {
     rad_buf b_scalar = 0, b_one = 0, b_two = 0, b_minus1 = 0;
     rad_buf b_r0 = 0, b_r1 = 0, b_u = 0, b_v = 0, b_s = 0;
     rad_buf b_oneh = 0;
+    rad_buf b_noise = 0, b_z = 0;
 
     /* Declares the head's weights (and their checkpoint name maps, each entry before its weight),
      * its ops and its workspace. Returns a negative RAD_E_* on the first refusal. */
     int declare(RadBuilder* b);
 
-    /* Issues one head step. `hidden` is [1, hidden], `noise` [1, latent], `guidance` [1] and
-     * `out` [1, latent]; all are buffer views the caller built with RAD_B_N. */
+    /* Issues one head step. `hidden` is [1, hidden] in the serving dtype, `noise` [1, latent] f32,
+     * `guidance` [1] f32 and `out` [1, latent] f32; all are buffer views the caller built with
+     * RAD_B_N. */
     void issue(RadCtx* c, RadOperand hidden, RadOperand noise, RadOperand guidance,
                RadOperand out) const;
 };
