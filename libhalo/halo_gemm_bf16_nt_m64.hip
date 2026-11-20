@@ -228,11 +228,17 @@ int halo_gemm_bf16_nt_m64_max_m(void) { return HALO_GEMM64_MAX_M; }
 // ============================================================== the plugin ABI entry points
 //
 // The operand reader and the split law are in halo_gemm_args.h; see libhalo/halo_args.h.
+extern "C" int halo_rad_gemm_bf16_tiled(const RadArgs*, RadStream);
 extern "C" int halo_rad_gemm_bf16_m64(const RadArgs* a, RadStream s) {
     GemmOps g;
     int rc = gemm_ops(a, &g, 0);
     if (rc != RAD_OK) return rc;
-    if (g.M > halo_gemm_bf16_nt_m64_max_m()) return HALO_NO(RAD_E_SHAPE);
+    /* Past 64 rows (a folded rank-3 operand the picker sized by its outer dimension) the tiled prefill row serves
+     * what its own limits allow: N >= 128 and K a multiple of 64. */
+    if (g.M > halo_gemm_bf16_nt_m64_max_m()) {
+        if (g.N >= 128 && g.K % 64 == 0) return halo_rad_gemm_bf16_tiled(a, s);
+        return HALO_NO(RAD_E_SHAPE);
+    }
     Cfg c;
     rc = cfg_for(a, g.K, g.M, 16, BR_FLAT, &c, (g.N + 15) / 16);  /* "K divisible by SK*16" */
     if (rc != RAD_OK) return rc;
