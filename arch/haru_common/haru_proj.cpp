@@ -1,11 +1,10 @@
 /* haru_proj.cpp -- declare and issue the audio-input projectors (haru_proj.h has the arithmetic).
  *
- * The projectors serve the checkpoint's own dtype (bf16 in the real model, f32 in the tiny one);
- * `latent_scale` and `latent_bias` stay f32 (they are buffers, not parameters, and the unscale
- * Newton reciprocal needs f32 exactness), so they load as ordinary f32 weights and the scaled
- * latent is cast once before fc1.
+ * The fc1/fc2 GEMM weights are read at the checkpoint's own dtype -- bf16 in the real model, f32
+ * in the tiny one -- through the bf16-weight/f32-activation biased GEMM; the biases, the rmsnorm
+ * gains, `latent_scale`/`latent_bias` and every activation stay f32, so the arithmetic is
+ * bit-identical to the f32 control while the weight stream is halved.
  */
-#include <cstring>
 #include "haru_proj.h"
 
 #include <cstdio>
@@ -32,14 +31,7 @@ int plain_weight(RadBuilder* b, const char* name, std::initializer_list<int64_t>
         if (!(field)) return RAD_E_NOKERNEL; \
     } while (0)
 
-/* The embedding rows are the serving dtype; the latent scalars and the unscale workspace are f32. */
 #define PROJ_BUF(field, name, n)                                                   \
-    do {                                                                           \
-        (field) = decl_b(b, name, wd, { (n) }, RAD_BUF_PERSIST);                   \
-        if (!(field)) return RAD_E_INVAL;                                          \
-    } while (0)
-
-#define PROJ_BUF_F32(field, name, n)                                               \
     do {                                                                           \
         (field) = decl_b(b, name, RAD_F32, { (n) }, RAD_BUF_PERSIST);              \
         if (!(field)) return RAD_E_INVAL;                                          \
@@ -55,9 +47,9 @@ int HaruProj::declare(RadBuilder* b, rad_weight tokens) {
     if (H <= 0 || D <= 0 || V <= 0) return RAD_E_INVAL;
     embed_tokens = tokens;
 
-    /* The serving dtype, from the checkpoint's own encoding (bf16 real / f32 tiny). latent_scale
-     * stays f32 itself, but the container holds every tensor at the checkpoint's dtype, so it is
-     * a reliable probe. */
+    /* The checkpoint's own dtype decides how the fc1/fc2 GEMM weights are declared and which
+     * biased-GEMM row runs. latent_scale is a reliable probe: it is f32 in the tiny model and
+     * bf16 in the real one. */
     RAD_ARCH_TRY(map_weight(b, "latent_scale"));
     wd = weight_codes_dtype(b, "latent_scale", RAD_F32);
     if (wd != RAD_F32 && wd != RAD_BF16) {
@@ -65,7 +57,7 @@ int HaruProj::declare(RadBuilder* b, rad_weight tokens) {
                         "weights\n", rad_dtype_name(wd));
         return RAD_E_UNSUPPORTED;
     }
-    dt = rad_dtype_name(wd);
+    dt = (wd == RAD_BF16) ? "bf16w_f32a" : "f32";
 
     PROJ_BUF(b_x, "proj.x", H);
     PROJ_BUF(b_x2, "proj.x2", H);
@@ -73,24 +65,21 @@ int HaruProj::declare(RadBuilder* b, rad_weight tokens) {
     PROJ_BUF(b_mask, "proj.mask", H);
     PROJ_BUF(b_fc1, "proj.fc1", H);
     PROJ_BUF(b_norm, "proj.norm", H);
-    PROJ_BUF_F32(b_bias, "proj.bias", D);
-    PROJ_BUF_F32(b_scaled, "proj.scaled", D);
-    PROJ_BUF_F32(b_scaled2, "proj.scaled2", D);
-    PROJ_BUF_F32(b_ones, "proj.ones", D);
-    PROJ_BUF_F32(b_r0, "proj.r0", 1);
-    PROJ_BUF_F32(b_r1, "proj.r1", 1);
-    PROJ_BUF_F32(b_u, "proj.u", 1);
-    PROJ_BUF_F32(b_v, "proj.v", 1);
-    PROJ_BUF_F32(b_s, "proj.s", 1);
-    PROJ_BUF_F32(b_two, "proj.two", 1);
-    PROJ_BUF_F32(b_minus1, "proj.minus1", 1);
-    PROJ_BUF_F32(b_bias_d, "proj.bias_d", D);
-    PROJ_BUF_F32(b_neg_bias_d, "proj.neg_bias_d", D);
-    PROJ_BUF_F32(b_recip_d, "proj.recip_d", D);
-    PROJ_BUF_F32(b_unscaled, "proj.unscaled", D);
-    PROJ_BUF(b_scaled_bf16, "proj.scaled_bf16", D);
-    PROJ_BUF(b_mask_s, "proj.mask_s", 1);
-    mask_needs_cast = std::strcmp(dt, "f32") != 0;
+    PROJ_BUF(b_bias, "proj.bias", D);
+    PROJ_BUF(b_scaled, "proj.scaled", D);
+    PROJ_BUF(b_scaled2, "proj.scaled2", D);
+    PROJ_BUF(b_ones, "proj.ones", D);
+    PROJ_BUF(b_r0, "proj.r0", 1);
+    PROJ_BUF(b_r1, "proj.r1", 1);
+    PROJ_BUF(b_u, "proj.u", 1);
+    PROJ_BUF(b_v, "proj.v", 1);
+    PROJ_BUF(b_s, "proj.s", 1);
+    PROJ_BUF(b_two, "proj.two", 1);
+    PROJ_BUF(b_minus1, "proj.minus1", 1);
+    PROJ_BUF(b_bias_d, "proj.bias_d", D);
+    PROJ_BUF(b_neg_bias_d, "proj.neg_bias_d", D);
+    PROJ_BUF(b_recip_d, "proj.recip_d", D);
+    PROJ_BUF(b_unscaled, "proj.unscaled", D);
 
     /* latent_scale is already mapped; declare it f32, then latent_bias. */
     RAD_ARCH_TRY(plain_weight(b, "latent_scale", { 1 }, RAD_F32, &latent_scale));
@@ -104,16 +93,16 @@ int HaruProj::declare(RadBuilder* b, rad_weight tokens) {
         RAD_ARCH_TRY(plain_weight(b, n, { H, D }, wd, &w->fc1));
         std::snprintf(n, sizeof n, "%s.fc1.bias", prefix);
         RAD_ARCH_TRY(map_weight(b, n));
-        RAD_ARCH_TRY(plain_weight(b, n, { H }, wd, &w->fc1_b));
+        RAD_ARCH_TRY(plain_weight(b, n, { H }, RAD_F32, &w->fc1_b));
         std::snprintf(n, sizeof n, "%s.norm.weight", prefix);
         RAD_ARCH_TRY(map_weight(b, n));
-        RAD_ARCH_TRY(plain_weight(b, n, { H }, wd, &w->norm));
+        RAD_ARCH_TRY(plain_weight(b, n, { H }, RAD_F32, &w->norm));
         std::snprintf(n, sizeof n, "%s.fc2.weight", prefix);
         RAD_ARCH_TRY(map_weight(b, n));
         RAD_ARCH_TRY(plain_weight(b, n, { H, H }, wd, &w->fc2));
         std::snprintf(n, sizeof n, "%s.fc2.bias", prefix);
         RAD_ARCH_TRY(map_weight(b, n));
-        RAD_ARCH_TRY(plain_weight(b, n, { H }, wd, &w->fc2_b));
+        RAD_ARCH_TRY(plain_weight(b, n, { H }, RAD_F32, &w->fc2_b));
         return RAD_OK;
     };
     RAD_ARCH_TRY(audio("model_audio_proj", &model));
@@ -128,14 +117,14 @@ int HaruProj::declare(RadBuilder* b, rad_weight tokens) {
     auto norm = [&](rad_weight w) {
         return RAD_OP(b, "rmsnorm",
                       RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", H),
-                                 RAD_F64("eps", g.norm_eps), RAD_STR("dtype", dt)),
+                                 RAD_F64("eps", g.norm_eps), RAD_STR("dtype", "f32")),
                       RAD_WEIGHTS(w));
     };
 
     PROJ_OP(op_embed,
             RAD_OP(b, "embed_lookup",
                    RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n_embd", H), RAD_INT("n_vocab", V),
-                              RAD_STR("dtype", dt), RAD_INT("vocab_offset", 0),
+                              RAD_STR("dtype", "f32"), RAD_INT("vocab_offset", 0),
                               RAD_F64("mult", 1.0)),
                    RAD_WEIGHTS(embed_tokens)));
     PROJ_OP(op_fill_d,
@@ -169,23 +158,11 @@ int HaruProj::declare(RadBuilder* b, rad_weight tokens) {
     PROJ_OP(op_mask,
             RAD_OP(b, "scale_rows",
                    RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", H), RAD_STR("act", "none"),
-                              RAD_STR("dtype", dt)),
+                              RAD_STR("dtype", "f32")),
                    RAD_NOWEIGHTS));
     PROJ_OP(op_add_h,
             RAD_OP(b, "add",
-                   RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", H), RAD_STR("dtype", dt)),
-                   RAD_NOWEIGHTS));
-    if (mask_needs_cast) {
-        PROJ_OP(op_cast_mask,
-                RAD_OP(b, "cast",
-                       RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", 1),
-                                  RAD_STR("from", "f32"), RAD_STR("to", dt)),
-                       RAD_NOWEIGHTS));
-    }
-    PROJ_OP(op_cast_lat,
-            RAD_OP(b, "cast",
-                   RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", D),
-                              RAD_STR("from", "f32"), RAD_STR("to", dt)),
+                   RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", H), RAD_STR("dtype", "f32")),
                    RAD_NOWEIGHTS));
 
     PROJ_OP(op_mul_1,
@@ -239,29 +216,22 @@ void HaruProj::issue(RadCtx* c, RadOperand token, RadOperand model_latent, RadOp
 
     auto projector = [&](const HaruAudioProjW& w, rad_op g1, rad_op nr, rad_op g2,
                          RadOperand lat, RadOperand mask, RadOperand src, RadOperand dst) {
-        /* scale_latents: (raw + bias) * scale, in f32 (latent_bias is a one-element weight, so a
-         * filled row broadcasts it to the latent width before the add; doing it in this order
-         * keeps the reference's two roundings). The scaled latent is then cast to the serving
-         * dtype once, for fc1. */
+        /* scale_latents: (raw + bias) * scale. latent_bias is a one-element weight, so a filled
+         * row broadcasts it to the latent width before the add; doing it in this order keeps the
+         * reference's two roundings (add first, then multiply). */
         RAD_ISSUE_N(c, op_fill_d, 1, RAD_B(b_ones));
         RAD_ISSUE_N(c, op_mulw_bias, 1, RAD_B(b_ones), RAD_W(latent_bias), RAD_B(b_bias));
         RAD_ISSUE_N(c, op_add_d, 1, lat, RAD_B(b_bias), RAD_B(b_scaled));
         RAD_ISSUE_N(c, op_mulw_scale, 1, RAD_B(b_scaled), RAD_W(latent_scale), RAD_B(b_scaled2));
-        RAD_ISSUE_N(c, op_cast_lat, 1, RAD_B(b_scaled2), RAD_B(b_scaled_bf16));
 
-        RAD_ISSUE_N(c, g1, 1, RAD_B(b_scaled_bf16), RAD_W(w.fc1), RAD_W(w.fc1_b), RAD_NONE,
+        RAD_ISSUE_N(c, g1, 1, RAD_B(b_scaled2), RAD_W(w.fc1), RAD_W(w.fc1_b), RAD_NONE,
                     RAD_B(b_fc1));
         RAD_ISSUE_N(c, nr, 1, RAD_B(b_fc1), RAD_W(w.norm), RAD_B(b_norm));
         RAD_ISSUE_N(c, g2, 1, RAD_B(b_norm), RAD_W(w.fc2), RAD_W(w.fc2_b), RAD_NONE,
                     RAD_B(b_y));
 
         /* y * mask, the mask a row scalar: scale_rows reads one scalar per row. */
-        if (mask_needs_cast) {
-            RAD_ISSUE_N(c, op_cast_mask, 1, mask, RAD_B(b_mask_s));
-            RAD_ISSUE_N(c, op_mask, 1, RAD_B(b_y), RAD_B(b_mask_s), RAD_NONE, RAD_B(b_mask));
-        } else {
-            RAD_ISSUE_N(c, op_mask, 1, RAD_B(b_y), mask, RAD_NONE, RAD_B(b_mask));
-        }
+        RAD_ISSUE_N(c, op_mask, 1, RAD_B(b_y), mask, RAD_NONE, RAD_B(b_mask));
         RAD_ISSUE_N(c, op_add_h, 1, src, RAD_B(b_mask), dst);
     };
 
@@ -304,7 +274,6 @@ void HaruProj::unscale(RadCtx* c, RadOperand normalized, RadOperand out) const {
 
 #undef PROJ_OP
 #undef PROJ_BUF
-#undef PROJ_BUF_F32
 
 }  /* namespace arch */
 }  /* namespace rad */

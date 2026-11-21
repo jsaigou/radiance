@@ -26,6 +26,7 @@ namespace {
 constexpr uint32_t kWaves = 8;
 constexpr uint32_t kThr = kWaves * 32;
 
+typedef unsigned int u32x2 __attribute__((ext_vector_type(2)));
 typedef unsigned int u32x4 __attribute__((ext_vector_type(4)));
 typedef float f32x4 __attribute__((ext_vector_type(4)));
 
@@ -212,6 +213,70 @@ int parse_act(const RadArgs* a, int* act) {
     return RAD_OK;
 }
 
+// ---- bf16 W, f32 A; C f32; the bias f32 or bf16 ------------------------------------------------
+// The f32 activation/accumulation/output of gemv_bias_f32_kernel, reading the bf16 weights directly
+// and widening them in registers. Bit-identical to gemv_bias_f32_kernel over a widened checkpoint:
+// the element-to-lane mapping, the nested FMA tree, the wave reduction and the f32 epilogue are all
+// exactly the f32 row's; the only change is that a weight chunk is four bf16 loaded as eight bytes
+// (u32x2) and widened, where the f32 row loaded four f32 as sixteen bytes. bf16->f32 is exact.
+template <uint32_t MR, uint32_t RPW, bool VECA, bool BIAS_F32>
+__global__ __launch_bounds__(kThr) void gemv_bias_bf16w_f32a_kernel(
+    const float* __restrict__ a, uint32_t lda, const uint16_t* __restrict__ w, uint32_t K,
+    const void* __restrict__ bias, const float* __restrict__ res, uint32_t ldr,
+    float* __restrict__ y, uint32_t ldy, uint32_t N, uint32_t M, int act) {
+    const uint32_t lane = threadIdx.x & 31u, wave = threadIdx.x >> 5;
+    const uint32_t n0 = (blockIdx.x * kWaves + wave) * RPW;
+    if (n0 >= N) return;
+    const uint32_t K4 = K >> 2;
+
+    const u32x2* wr[RPW];
+#pragma unroll
+    for (uint32_t r = 0; r < RPW; ++r) {
+        const uint32_t n = n0 + r < N ? n0 + r : N - 1;
+        wr[r] = (const u32x2*)(w + (size_t)n * K);
+    }
+    const float* ar[MR];
+#pragma unroll
+    for (uint32_t m = 0; m < MR; ++m) ar[m] = a + (size_t)(m < M ? m : M - 1) * lda;
+
+    float acc[RPW][MR];
+#pragma unroll
+    for (uint32_t r = 0; r < RPW; ++r)
+#pragma unroll
+        for (uint32_t m = 0; m < MR; ++m) acc[r][m] = 0.0f;
+
+    for (uint32_t k4 = lane; k4 < K4; k4 += 32) {
+        u32x2 wv[RPW];
+#pragma unroll
+        for (uint32_t r = 0; r < RPW; ++r) wv[r] = __builtin_nontemporal_load(wr[r] + k4);
+#pragma unroll
+        for (uint32_t m = 0; m < MR; ++m) {
+            f32x4 xv;
+            if (VECA) xv = *(const f32x4*)(ar[m] + 4u * k4);
+            else      xv = f32x4{ ar[m][4u * k4], ar[m][4u * k4 + 1], ar[m][4u * k4 + 2], ar[m][4u * k4 + 3] };
+#pragma unroll
+            for (uint32_t r = 0; r < RPW; ++r)
+                acc[r][m] = fmaf(bf_lo(wv[r].x), xv.x, fmaf(bf_hi(wv[r].x), xv.y,
+                                 fmaf(bf_lo(wv[r].y), xv.z, fmaf(bf_hi(wv[r].y), xv.w, acc[r][m]))));
+        }
+    }
+
+#pragma unroll
+    for (uint32_t r = 0; r < RPW; ++r)
+#pragma unroll
+        for (uint32_t m = 0; m < MR; ++m) {
+            const float s = halo_wave_sum(acc[r][m]);
+            const uint32_t n = n0 + r;
+            if (lane == 0 && n < N && m < M) {
+                const float b = BIAS_F32 ? ((const float*)bias)[n] : bf16_to_f32(((const uint16_t*)bias)[n]);
+                float t = s + b;
+                if (act) t = act_apply(act, t);
+                if (res) t = res[(size_t)m * ldr + n] + t;
+                y[(size_t)m * ldy + n] = t;
+            }
+        }
+}
+
 }  // namespace
 
 enum { SB_A = 0, SB_W, SB_BIAS, SB_RES, SB_Y };
@@ -339,4 +404,67 @@ extern "C" int halo_rad_gemm_nt_bias_skinny_f32(const RadArgs* a, RadStream stre
     if (p.mr == 4) { if (p.rpw >= 2) SBF(4, 2); SBF(4, 1); }
     SBF(8, 1);
 #undef SBF
+}
+
+extern "C" int halo_rad_gemm_nt_bias_skinny_bf16w_f32a(const RadArgs* a, RadStream stream) {
+    const RadTensor* A = halo_opt(a, SB_A);
+    const RadTensor* W = halo_opt(a, SB_W);
+    const RadTensor* B = halo_opt(a, SB_BIAS);
+    const RadTensor* R = halo_opt(a, SB_RES);
+    const RadTensor* Y = halo_opt(a, SB_Y);
+    if (!A || !W || !B || !Y) return HALO_NO(RAD_E_INVAL);
+    if (A->dtype != RAD_F32 || W->dtype != RAD_BF16 || Y->dtype != RAD_F32) return HALO_NO(RAD_E_DTYPE);
+    if (B->dtype != RAD_F32 && B->dtype != RAD_BF16) return HALO_NO(RAD_E_DTYPE);
+    const bool has_res = R && R->data;
+    if (has_res && R->dtype != RAD_F32) return HALO_NO(RAD_E_DTYPE);
+    if (!halo_contig(W) || !halo_contig(B)) return HALO_NO(RAD_E_STRIDE);
+    int act = 0;
+    if (parse_act(a, &act) != RAD_OK) return HALO_NO(RAD_E_SCHEMA);
+
+    const long long K = halo_geti_or(a, "K", halo_dim(W, (int)W->rank - 1));
+    const long long N = halo_geti_or(a, "N", K > 0 ? halo_numel(W) / K : 0);
+    if (K <= 0 || N <= 0 || halo_numel(W) < N * K || halo_numel(B) < N) return HALO_NO(RAD_E_SHAPE);
+    if (K % 4 != 0 || !halo_aligned(W->data, 16)) return HALO_NO(RAD_E_ALIGN);
+    long long M = 0, Ma = 0, Mr = 0;
+    const long long ldy = halo_rows_pitch(Y, N, &M);
+    const long long lda = halo_rows_pitch(A, K, &Ma);
+    const long long ldr = has_res ? halo_rows_pitch(R, N, &Mr) : 0;
+    if (ldy < 0 || lda < 0 || ldr < 0) return HALO_NO(RAD_E_STRIDE);
+    if (M <= 0 || M > 8 || Ma < M || (has_res && Mr < M)) return HALO_NO(RAD_E_SHAPE);
+    if (N * K >= (1ll << 40) || lda > 0x7fffffffll || ldy > 0x7fffffffll || ldr > 0x7fffffffll)
+        return HALO_NO(RAD_E_SHAPE);
+
+    const bool veca = (lda % 4 == 0) && halo_aligned(A->data, 16);
+    const bool bf32 = B->dtype == RAD_F32;
+    Plan p = plan(M, N);
+    if (p.mr == 16) p.mr = 8;
+    const dim3 block(kThr);
+    const float* resp = has_res ? (const float*)R->data : nullptr;
+#define SBFB(MR_, RPW_)                                                                             \
+    do {                                                                                            \
+        const float* rr_ = resp;                                                                    \
+        if (veca && bf32)                                                                           \
+            return HALO_EMIT(stream, (gemv_bias_bf16w_f32a_kernel<MR_, RPW_, true, true>), p.grid, block, 0, \
+                (const float*)A->data, (uint32_t)lda, (const uint16_t*)W->data, (uint32_t)K,       \
+                B->data, rr_, (uint32_t)ldr, (float*)Y->data, (uint32_t)ldy, (uint32_t)N,          \
+                (uint32_t)M, act);                                                                  \
+        if (veca)                                                                                   \
+            return HALO_EMIT(stream, (gemv_bias_bf16w_f32a_kernel<MR_, RPW_, true, false>), p.grid, block, 0, \
+                (const float*)A->data, (uint32_t)lda, (const uint16_t*)W->data, (uint32_t)K,       \
+                B->data, rr_, (uint32_t)ldr, (float*)Y->data, (uint32_t)ldy, (uint32_t)N,          \
+                (uint32_t)M, act);                                                                  \
+        if (bf32)                                                                                   \
+            return HALO_EMIT(stream, (gemv_bias_bf16w_f32a_kernel<MR_, RPW_, false, true>), p.grid, block, 0, \
+                (const float*)A->data, (uint32_t)lda, (const uint16_t*)W->data, (uint32_t)K,       \
+                B->data, rr_, (uint32_t)ldr, (float*)Y->data, (uint32_t)ldy, (uint32_t)N,          \
+                (uint32_t)M, act);                                                                  \
+        return HALO_EMIT(stream, (gemv_bias_bf16w_f32a_kernel<MR_, RPW_, false, false>), p.grid, block, 0, \
+            (const float*)A->data, (uint32_t)lda, (const uint16_t*)W->data, (uint32_t)K,           \
+            B->data, rr_, (uint32_t)ldr, (float*)Y->data, (uint32_t)ldy, (uint32_t)N, (uint32_t)M, act); \
+    } while (0)
+    if (p.mr == 1) { if (p.rpw == 8) SBFB(1, 8); if (p.rpw == 4) SBFB(1, 4); if (p.rpw == 2) SBFB(1, 2); SBFB(1, 1); }
+    if (p.mr == 2) { if (p.rpw >= 4) SBFB(2, 4); if (p.rpw == 2) SBFB(2, 2); SBFB(2, 1); }
+    if (p.mr == 4) { if (p.rpw >= 2) SBFB(4, 2); SBFB(4, 1); }
+    SBFB(8, 1);
+#undef SBFB
 }

@@ -77,6 +77,7 @@ set(HALO_UNITS
   "halo_gemm_bf16_nt_m16|"
   "halo_gemm_bf16_nt_m64|"
   "halo_gemm_bf16_nt_tiled|"
+  "halo_gemm_bf16w_f32a_nt_skinny|"
   "halo_gemm_f32_nt_bias|"
   "halo_gemm_f32_nt_skinny|"
   "halo_gemm_nt_bias_skinny|"

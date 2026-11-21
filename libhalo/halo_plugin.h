@@ -812,6 +812,8 @@ int halo_rad_gemm_f32_nt_bias(const RadArgs*, RadStream);
 int halo_rad_gemm_nt_f32_skinny(const RadArgs*, RadStream);
 int halo_rad_gemm_nt_bias_skinny_bf16(const RadArgs*, RadStream);
 int halo_rad_gemm_nt_bias_skinny_f32(const RadArgs*, RadStream);
+int halo_rad_gemm_bf16w_f32a_nt_skinny(const RadArgs*, RadStream);
+int halo_rad_gemm_nt_bias_skinny_bf16w_f32a(const RadArgs*, RadStream);
 int halo_rad_kv_store        (const RadArgs*, RadStream);
 int halo_rad_kv_store_fp8    (const RadArgs*, RadStream);
 int halo_rad_kv_store_fp8v4  (const RadArgs*, RadStream);
@@ -877,6 +879,7 @@ int halo_shape_scatter_rows_bf16(const RadParam*, int, int operand, RadOpdDesc*)
 int halo_shape_layernorm      (const RadParam*, int, int operand, RadOpdDesc*);
 int halo_shape_grid_embed     (const RadParam*, int, int operand, RadOpdDesc*);
 int halo_shape_gemm_nt_bias   (const RadParam*, int, int operand, RadOpdDesc*);
+int halo_shape_gemm_nt_bias_bf16w_f32a(const RadParam*, int, int operand, RadOpdDesc*);
 int halo_shape_unary          (const RadParam*, int, int operand, RadOpdDesc*);
 int halo_shape_fill           (const RadParam*, int, int operand, RadOpdDesc*);
 int halo_shape_silu_mul       (const RadParam*, int, int operand, RadOpdDesc*);
@@ -917,6 +920,7 @@ int halo_shape_ar_hc_write          (const RadParam*, int, int operand, RadOpdDe
 int halo_shape_ar_gather_hc_write   (const RadParam*, int, int operand, RadOpdDesc*);
 
 int halo_shape_gemm_nt        (const RadParam*, int, int operand, RadOpdDesc*);
+int halo_shape_gemm_nt_bf16w_f32a(const RadParam*, int, int operand, RadOpdDesc*);
 int halo_shape_gemm_nt_q      (const RadParam*, int, int operand, RadOpdDesc*);
 int halo_shape_gemm_nt_q_bias (const RadParam*, int, int operand, RadOpdDesc*);
 int halo_shape_gemm_nt_q_gated(const RadParam*, int, int operand, RadOpdDesc*);

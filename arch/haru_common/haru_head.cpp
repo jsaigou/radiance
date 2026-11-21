@@ -2,9 +2,10 @@
  *
  * The reference stores every head linear without a bias (nn.Linear(..., bias=False)) and applies
  * two weight-free norms: HeadLayer takes the learned `norm.weight` gain, FinalLayer takes none.
- * The head serves the checkpoint's own dtype, read from the container: bf16 in the real model
- * (whose reference runs the head in bf16) and f32 in the tiny model. The norm gains stay f32
- * either way; the linears and the activation workspace are the serving dtype.
+ * The GEMM weights are read at the checkpoint's own dtype -- bf16 in the real model, f32 in the
+ * tiny one -- through the bf16-weight/f32-activation skinny GEMM; the activation workspace, the
+ * rmsnorm gains and every other op are f32, so the arithmetic is bit-identical to the f32 control
+ * while the weight stream is halved.
  */
 #include "haru_head.h"
 
@@ -33,15 +34,7 @@ int plain_weight(RadBuilder* b, const char* name, std::initializer_list<int64_t>
         if (!(field)) return RAD_E_NOKERNEL; \
     } while (0)
 
-/* The activation workspace is the serving dtype; the scalars stay f32 (timestep_embed reads its
- * input t as f32 and the Newton scalars are one element). */
 #define HEAD_BUF(field, name, n)                                                    \
-    do {                                                                            \
-        (field) = decl_b(b, name, wd, { (n) }, RAD_BUF_PERSIST);                    \
-        if (!(field)) return RAD_E_INVAL;                                           \
-    } while (0)
-
-#define HEAD_BUF_F32(field, name, n)                                                \
     do {                                                                            \
         (field) = decl_b(b, name, RAD_F32, { (n) }, RAD_BUF_PERSIST);               \
         if (!(field)) return RAD_E_INVAL;                                           \
@@ -56,7 +49,8 @@ int HaruHead::declare(RadBuilder* b) {
     const int64_t F = g.ffn;
     if (H <= 0 || D <= 0 || F <= 0 || g.layers < 0) return RAD_E_INVAL;
 
-    /* The serving dtype, from the checkpoint's own encoding (bf16 real / f32 tiny). The map must
+    /* The checkpoint's own dtype decides how the GEMM weights are declared and which GEMM row
+     * runs: bf16 in the real model ("bf16w_f32a") and f32 in the tiny one ("f32"). The map must
      * precede the weight, so cond_proj's map comes first and every later weight is mapped right
      * before its declaration. */
     RAD_ARCH_TRY(map_weight(b, "head.cond_proj.weight"));
@@ -66,7 +60,7 @@ int HaruHead::declare(RadBuilder* b) {
                         "weights\n", rad_dtype_name(wd));
         return RAD_E_UNSUPPORTED;
     }
-    dt = rad_dtype_name(wd);
+    dt = (wd == RAD_BF16) ? "bf16w_f32a" : "f32";
 
     /* Workspace. All persistent: the head runs once a lane-step and a transient plan would not
      * gain anything a few tens of KiB could not. */
@@ -89,22 +83,20 @@ int HaruHead::declare(RadBuilder* b) {
     HEAD_BUF(b_gated, "head.gated", H);
     HEAD_BUF(b_vel, "head.vel", D);
     HEAD_BUF(b_feat, "head.feat", kHaruScalarFreqs);
-    HEAD_BUF_F32(b_scalar, "head.scalar", 1);
-    HEAD_BUF_F32(b_one, "head.one", 1);
-    HEAD_BUF_F32(b_two, "head.two", 1);
-    HEAD_BUF_F32(b_minus1, "head.minus1", 1);
-    HEAD_BUF_F32(b_r0, "head.r0", 1);
-    HEAD_BUF_F32(b_r1, "head.r1", 1);
-    HEAD_BUF_F32(b_u, "head.u", 1);
-    HEAD_BUF_F32(b_v, "head.v", 1);
-    HEAD_BUF_F32(b_s, "head.s", 1);
+    HEAD_BUF(b_scalar, "head.scalar", 1);
+    HEAD_BUF(b_one, "head.one", 1);
+    HEAD_BUF(b_two, "head.two", 1);
+    HEAD_BUF(b_minus1, "head.minus1", 1);
+    HEAD_BUF(b_r0, "head.r0", 1);
+    HEAD_BUF(b_r1, "head.r1", 1);
+    HEAD_BUF(b_u, "head.u", 1);
+    HEAD_BUF(b_v, "head.v", 1);
+    HEAD_BUF(b_s, "head.s", 1);
     HEAD_BUF(b_oneh, "head.oneh", H);
-    HEAD_BUF(b_noise, "head.noise", D);
-    HEAD_BUF(b_z, "head.z", D);
 
-    /* Weights. Every weight -- linears and the rmsnorm gains -- is the checkpoint's own dtype, as
-     * the reference runs the head. cond_proj's map already exists; each other weight is mapped
-     * right before its declaration. */
+    /* Weights. The checkpoint names are also the declared names, so the map is the identity but
+     * still has to exist. Each entry comes before the weight it names. The GEMM linears are the
+     * checkpoint's own dtype; the rmsnorm gains are f32. */
     RAD_ARCH_TRY(plain_weight(b, "head.cond_proj.weight", { H, H }, wd, &cond_proj));
     RAD_ARCH_TRY(map_weight(b, "head.latent_proj.weight"));
     RAD_ARCH_TRY(plain_weight(b, "head.latent_proj.weight", { H, D }, wd, &latent_proj));
@@ -132,7 +124,7 @@ int HaruHead::declare(RadBuilder* b) {
         char n[128];
         std::snprintf(n, sizeof n, "head.layers.%lld.norm.weight", (long long)l);
         RAD_ARCH_TRY(map_weight(b, n));
-        RAD_ARCH_TRY(plain_weight(b, n, { H }, wd, &w.norm));
+        RAD_ARCH_TRY(plain_weight(b, n, { H }, RAD_F32, &w.norm));
         std::snprintf(n, sizeof n, "head.layers.%lld.ada.weight", (long long)l);
         RAD_ARCH_TRY(map_weight(b, n));
         RAD_ARCH_TRY(plain_weight(b, n, { 3 * H, H }, wd, &w.ada));
@@ -160,29 +152,18 @@ int HaruHead::declare(RadBuilder* b) {
     };
     auto unary = [&](const char* name, int64_t n) {
         return RAD_OP(b, name,
-                      RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", n), RAD_STR("dtype", dt)),
+                      RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", n), RAD_STR("dtype", "f32")),
                       RAD_NOWEIGHTS);
     };
     auto binary = [&](const char* name, int64_t n) {
         return RAD_OP(b, name,
-                      RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", n), RAD_STR("dtype", dt)),
+                      RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", n), RAD_STR("dtype", "f32")),
                       RAD_NOWEIGHTS);
     };
     auto fill = [&](int64_t n, double value) {
         return RAD_OP(b, "fill",
-                      RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", n), RAD_STR("dtype", dt),
-                                 RAD_F64("value", value)),
-                      RAD_NOWEIGHTS);
-    };
-    auto fill_f32 = [&](int64_t n, double value) {
-        return RAD_OP(b, "fill",
                       RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", n), RAD_STR("dtype", "f32"),
                                  RAD_F64("value", value)),
-                      RAD_NOWEIGHTS);
-    };
-    auto scalar = [&](const char* name, int64_t n) {
-        return RAD_OP(b, name,
-                      RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", n), RAD_STR("dtype", "f32")),
                       RAD_NOWEIGHTS);
     };
 
@@ -203,7 +184,7 @@ int HaruHead::declare(RadBuilder* b) {
         HEAD_OP(o.norm,
                 RAD_OP(b, "rmsnorm",
                        RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", H),
-                                  RAD_F64("eps", g.norm_eps), RAD_STR("dtype", dt)),
+                                  RAD_F64("eps", g.norm_eps), RAD_STR("dtype", "f32")),
                        RAD_WEIGHTS(w.norm)));
         HEAD_OP(o.ada, gemm(3 * H, H, w.ada));
         HEAD_OP(o.gate, gemm(F, H, w.gate));
@@ -217,7 +198,7 @@ int HaruHead::declare(RadBuilder* b) {
             RAD_OP(b, "timestep_embed",
                    RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", kHaruScalarFreqs),
                               RAD_F64("scale", 1.0), RAD_F64("max_period", 10000.0),
-                              RAD_STR("dtype", dt)),
+                              RAD_STR("dtype", "f32")),
                    RAD_NOWEIGHTS));
 
     HEAD_OP(op_silu_h, unary("silu", H));
@@ -226,36 +207,23 @@ int HaruHead::declare(RadBuilder* b) {
     HEAD_OP(op_mul_h, binary("mul", H));
     HEAD_OP(op_mul_f, binary("mul", F));
     HEAD_OP(op_add_lat, binary("add", D));
-    HEAD_OP(op_add_1, scalar("add", 1));
-    HEAD_OP(op_mul_1, scalar("mul", 1));
+    HEAD_OP(op_add_1, binary("add", 1));
+    HEAD_OP(op_mul_1, binary("mul", 1));
     HEAD_OP(op_rmsnorm_p,
             RAD_OP(b, "rmsnorm_p",
                    RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", H),
-                              RAD_F64("eps", g.norm_eps), RAD_STR("dtype", dt)),
+                              RAD_F64("eps", g.norm_eps), RAD_STR("dtype", "f32")),
                    RAD_NOWEIGHTS));
 
     /* The three checkpoint scalars and the Newton constants. `interval_embed` is the checkpoint's
      * own value, so a different release gets its scalar without a source change. */
-    HEAD_OP(op_fill_zero, fill_f32(1, 0.0));
-    HEAD_OP(op_fill_interval, fill_f32(1, g.interval_embed));
-    HEAD_OP(op_fill_one, fill_f32(1, 1.0));
-    HEAD_OP(op_fill_two, fill_f32(1, 2.0));
-    HEAD_OP(op_fill_minus1, fill_f32(1, -1.0));
-    HEAD_OP(op_fill_r0, fill_f32(1, 0.75));
+    HEAD_OP(op_fill_zero, fill(1, 0.0));
+    HEAD_OP(op_fill_interval, fill(1, g.interval_embed));
+    HEAD_OP(op_fill_one, fill(1, 1.0));
+    HEAD_OP(op_fill_two, fill(1, 2.0));
+    HEAD_OP(op_fill_minus1, fill(1, -1.0));
+    HEAD_OP(op_fill_r0, fill(1, 0.75));
     HEAD_OP(op_fill_one_h, fill(H, 1.0));
-
-    /* The two boundary casts: the host's f32 noise into the serving dtype, and the normalized
-     * latent back to f32 for the caller's unscale. In the f32 tiny model both are copies. */
-    HEAD_OP(op_cast_noise,
-            RAD_OP(b, "cast",
-                   RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", D),
-                              RAD_STR("from", "f32"), RAD_STR("to", dt)),
-                   RAD_NOWEIGHTS));
-    HEAD_OP(op_cast_out,
-            RAD_OP(b, "cast",
-                   RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", D),
-                              RAD_STR("from", dt), RAD_STR("to", "f32")),
-                   RAD_NOWEIGHTS));
     return RAD_OK;
 }
 
@@ -270,10 +238,6 @@ void HaruHead::issue(RadCtx* c, RadOperand hidden, RadOperand noise, RadOperand 
     RAD_ISSUE_N(c, op_fill_minus1, 1, RAD_B(b_minus1));
     RAD_ISSUE_N(c, op_fill_one, 1, RAD_B(b_one));
     RAD_ISSUE_N(c, op_fill_r0, 1, RAD_B(b_r0));
-
-    /* The noise enters f32; land it in the serving dtype once, for the latent projection and the
-     * final velocity sum. */
-    RAD_ISSUE_N(c, op_cast_noise, 1, noise, RAD_B(b_noise));
 
     RAD_ISSUE_N(c, op_cond, 1, hidden, RAD_W(cond_proj), RAD_B(b_cond));
 
@@ -321,7 +285,7 @@ void HaruHead::issue(RadCtx* c, RadOperand hidden, RadOperand noise, RadOperand 
     /* c = silu(c); b_emb becomes the condition every layer and the final block read. */
     RAD_ISSUE_N(c, op_silu_h, 1, RAD_B(b_cond), RAD_B(b_emb));
 
-    RAD_ISSUE_N(c, op_latent, 1, RAD_B(b_noise), RAD_W(latent_proj), RAD_B(b_x0));
+    RAD_ISSUE_N(c, op_latent, 1, noise, RAD_W(latent_proj), RAD_B(b_x0));
     rad_buf cur = b_x0, nxt = b_x1;
     for (int64_t l = 0; l < g.layers; ++l) {
         const HaruHeadLayerW& w = lw[(size_t)l];
@@ -350,14 +314,12 @@ void HaruHead::issue(RadCtx* c, RadOperand hidden, RadOperand noise, RadOperand 
     RAD_ISSUE_N(c, op_add_h, 1, RAD_B(b_t2), RAD_B_N(b_fada, 0, H), RAD_B(b_t1));
     RAD_ISSUE_N(c, op_final_proj, 1, RAD_B(b_t1), RAD_W(final_proj), RAD_B(b_vel));
 
-    /* One MeanFlow step from t = 0 at h = 1: z = noise + velocity, then back to f32. */
-    RAD_ISSUE_N(c, op_add_lat, 1, RAD_B(b_noise), RAD_B(b_vel), RAD_B(b_z));
-    RAD_ISSUE_N(c, op_cast_out, 1, RAD_B(b_z), out);
+    /* One MeanFlow step from t = 0 at h = 1: z = noise + velocity. */
+    RAD_ISSUE_N(c, op_add_lat, 1, noise, RAD_B(b_vel), out);
 }
 
 #undef HEAD_OP
 #undef HEAD_BUF
-#undef HEAD_BUF_F32
 
 }  /* namespace arch */
 }  /* namespace rad */
