@@ -600,11 +600,12 @@ def build_head(cfg: dict, src: str, manifest: Manifest, log: list[str]):
     expected = 12 + 5 * layers
     if len(names) != expected:
         raise ParseError(f"head: {len(names)} declarations, expected {expected}")
-    # The head serves the checkpoint's own dtype (weight_codes_dtype): bf16 in the real model,
-    # f32 in the tiny one, so its declared dtype is the config's.
+    # The head's GEMM weights are the checkpoint's own dtype (bf16 real / f32 tiny); the per-layer
+    # rmsnorm gains stay f32, so declaring them widens the checkpoint's bf16 exactly.
     dtype = config_dtype(cfg)
     for name in names:
-        manifest.identity("head", name, shape(name), dtype)
+        f32 = re.fullmatch(r"head\.layers\.\d+\.norm\.weight", name) is not None
+        manifest.identity("head", name, shape(name), "f32" if f32 else dtype)
     log.append(f"head: {len(names)} declarations ({len(names) - 5 * layers} literals + "
                f"5 x {layers} layers)")
 
@@ -656,12 +657,15 @@ def build_proj(cfg: dict, src: str, manifest: Manifest, log: list[str]):
     expected = 2 + 5 * len(prefixes)
     if len(names) != expected:
         raise ParseError(f"proj: {len(names)} declarations, expected {expected}")
-    # The projector weights serve the checkpoint's own dtype (bf16 real / f32 tiny), while
-    # latent_scale and latent_bias stay f32 (the unscale Newton reciprocal needs f32 exactness).
+    # The fc1/fc2 GEMM weights serve the checkpoint's own dtype (bf16 real / f32 tiny); the biases,
+    # the rmsnorm gains and latent_scale/latent_bias are f32 (the unscale Newton reciprocal needs
+    # f32 exactness), so declaring them widens the checkpoint's bf16 exactly.
     dtype = config_dtype(cfg)
+    f32_names = {"latent_scale", "latent_bias"}
     for name in names:
-        manifest.identity("proj", name, shape(name),
-                          "f32" if name in ("latent_scale", "latent_bias") else dtype)
+        f32 = name in f32_names or re.fullmatch(
+            r"(model|user)_audio_proj\.(fc1\.bias|fc2\.bias|norm\.weight)", name) is not None
+        manifest.identity("proj", name, shape(name), "f32" if f32 else dtype)
     log.append(f"proj: {len(names)} declarations (2 scalars + {len(prefixes)} x {len(templates)} "
                "projector tensors)")
 
