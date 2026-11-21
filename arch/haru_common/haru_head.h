@@ -18,6 +18,10 @@
  *
  * One call is one lane-step: one row of `hidden`, `noise` and `guidance`, one row of output. The
  * caller owns the buffers and passes buffer views, so this header holds no global state.
+ *
+ * The GEMM weights are read at the checkpoint's own dtype (bf16 in the real model, f32 in the
+ * tiny one) through the bf16-weight/f32-activation skinny GEMM; every activation and the rmsnorm
+ * gains are f32, so the head is bit-identical to the f32 control.
  */
 #ifndef HARU_HEAD_H
 #define HARU_HEAD_H
@@ -62,6 +66,9 @@ struct HaruHeadLayerOp {
  * the workspace they write. A plugin keeps one of these per rank (declare runs once a rank). */
 struct HaruHead {
     HaruHeadGeom g;
+
+    uint32_t    wd = RAD_F32;   /* the checkpoint's own dtype: the GEMM weights */
+    const char* dt = "f32";     /* the GEMM operand-combination string: "bf16w_f32a" or "f32" */
 
     rad_weight cond_proj = 0, latent_proj = 0;
     rad_weight t_fc1 = 0, t_fc2 = 0;

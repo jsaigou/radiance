@@ -45,9 +45,10 @@ struct Model {
     rad_op op_copy_ref = 0, op_copy_mean = 0, op_copy_noise = 0, op_copy_prev = 0;
     rad_op op_copy_logits = 0, op_copy_pad = 0;
     /* The LM's activations are its checkpoint's dtype (bf16 in the real model, f32 in the tiny one);
-     * the projectors and the head compute in f32. These two scratch rows and casts are the boundary:
-     * the projector writes f32 and a cast lands it in the LM's input row, and the LM's hidden row is
-     * cast to f32 for the head. In the tiny f32 model both casts are copies. */
+     * the projectors and the head read the checkpoint's bf16 weights but compute in f32. These two
+     * scratch rows and casts are the boundary: the projector writes f32 and a cast lands it in the
+     * LM's input row, and the LM's hidden row is cast to f32 for the head. In the tiny f32 model
+     * both casts are copies. */
     rad_buf x_f32 = 0, h_f32 = 0;
     rad_op op_cast_x = 0, op_cast_h = 0;
     rad_op op_fill_mask_one = 0, op_fill_mask_zero = 0, op_fill_zero_latent = 0;
@@ -320,7 +321,8 @@ static void prompt_pass(RadCtx* c, const RadBatch* batch) {
             token = (frame == n_frames - 1) ? RAD_B(m.eop_tok) : RAD_B(m.pad_tok);
         }
         m.proj.issue(c, token, model_lat, user_lat, model_mask, user_mask, RAD_B(m.x_f32));
-        RAD_ISSUE_N(c, m.op_cast_x, 1, RAD_B(m.x_f32), brow_slice(m.lm.b_x, t, 1, m.lm.g.n_embd));
+        RAD_ISSUE_N(c, m.op_cast_x, 1, RAD_B(m.x_f32),
+                    brow_slice(m.lm.b_x, t, 1, m.lm.g.n_embd));
     }
 
     m.lm.step_layers(c, batch);
@@ -333,7 +335,8 @@ static void prompt_pass(RadCtx* c, const RadBatch* batch) {
     RAD_ISSUE_N(c, m.op_copy_pad, 1,
                 brow_slice(m.lm.b_pad_eop, 0, 1, 2),
                 bcol_at(m.pad_eop_out, lane, 2, 0, 2, 1));
-    RAD_ISSUE_N(c, m.op_cast_h, 1, brow_slice(m.lm.b_h, T - 1, 1, m.lm.g.n_embd), RAD_B(m.h_f32));
+    RAD_ISSUE_N(c, m.op_cast_h, 1, brow_slice(m.lm.b_h, T - 1, 1, m.lm.g.n_embd),
+                RAD_B(m.h_f32));
     m.head.issue(c, RAD_B(m.h_f32),
                  praw(d->head_noise, RAD_F32, m.latent_dim), RAD_B(m.guidance),
                  bcol_at(m.head_norm, lane, m.latent_dim, 0, m.latent_dim, 1));
@@ -374,8 +377,10 @@ static void step_pass(RadCtx* c, const RadBatch* batch) {
         m.proj.issue(c, RAD_B_N(m.text_in, lane, 1),
                      bcol_at(m.prev_latent, lane, m.latent_dim, 0, m.latent_dim, 1),
                      bcol_at(m.audio_out, lane, m.frame_samples, 0, m.latent_dim, 1),
-                     RAD_B_N(m.mask_one, lane, 1), RAD_B_N(m.mask_one, lane, 1), RAD_B(m.x_f32));
-        RAD_ISSUE_N(c, m.op_cast_x, 1, RAD_B(m.x_f32), brow_slice(m.lm.b_x, i, 1, m.lm.g.n_embd));
+                     RAD_B_N(m.mask_one, lane, 1), RAD_B_N(m.mask_one, lane, 1),
+                     RAD_B(m.x_f32));
+        RAD_ISSUE_N(c, m.op_cast_x, 1, RAD_B(m.x_f32),
+                    brow_slice(m.lm.b_x, i, 1, m.lm.g.n_embd));
     }
 
     m.lm.step_layers(c, batch);
@@ -389,7 +394,8 @@ static void step_pass(RadCtx* c, const RadBatch* batch) {
         RAD_ISSUE_N(c, m.op_copy_pad, 1,
                     brow_slice(m.lm.b_pad_eop, i, 1, 2),
                     bcol_at(m.pad_eop_out, lane, 2, 0, 2, 1));
-        RAD_ISSUE_N(c, m.op_cast_h, 1, brow_slice(m.lm.b_h, i, 1, m.lm.g.n_embd), RAD_B(m.h_f32));
+        RAD_ISSUE_N(c, m.op_cast_h, 1, brow_slice(m.lm.b_h, i, 1, m.lm.g.n_embd),
+                    RAD_B(m.h_f32));
         m.head.issue(c, RAD_B(m.h_f32),
                      praw(d->head_noise + i * m.latent_dim, RAD_F32, m.latent_dim),
                      RAD_B(m.guidance),

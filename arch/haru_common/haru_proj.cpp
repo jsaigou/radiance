@@ -1,7 +1,9 @@
 /* haru_proj.cpp -- declare and issue the audio-input projectors (haru_proj.h has the arithmetic).
  *
- * The checkpoint's projector tensors are float32 in the tiny model. `latent_scale` and
- * `latent_bias` are buffers, not parameters, so they load as ordinary weights.
+ * The fc1/fc2 GEMM weights are read at the checkpoint's own dtype -- bf16 in the real model, f32
+ * in the tiny one -- through the bf16-weight/f32-activation biased GEMM; the biases, the rmsnorm
+ * gains, `latent_scale`/`latent_bias` and every activation stay f32, so the arithmetic is
+ * bit-identical to the f32 control while the weight stream is halved.
  */
 #include "haru_proj.h"
 
@@ -13,11 +15,13 @@ namespace arch {
 
 namespace {
 
+/* The identity name map that finds a weight; the entry must precede the weight. */
+int map_weight(RadBuilder* b, const char* name) { return map_copy(b, name, name); }
+
+/* A weight over its already-mapped name, at the given dtype. */
 int plain_weight(RadBuilder* b, const char* name, std::initializer_list<int64_t> shape,
-                 rad_weight* out) {
-    const int st = map_copy(b, name, name);
-    if (st < 0) return st;
-    *out = decl_w(b, name, RAD_F32, shape, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
+                 uint32_t dtype, rad_weight* out) {
+    *out = decl_w(b, name, dtype, shape, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
     return *out ? RAD_OK : RAD_E_INVAL;
 }
 
@@ -43,6 +47,18 @@ int HaruProj::declare(RadBuilder* b, rad_weight tokens) {
     if (H <= 0 || D <= 0 || V <= 0) return RAD_E_INVAL;
     embed_tokens = tokens;
 
+    /* The checkpoint's own dtype decides how the fc1/fc2 GEMM weights are declared and which
+     * biased-GEMM row runs. latent_scale is a reliable probe: it is f32 in the tiny model and
+     * bf16 in the real one. */
+    RAD_ARCH_TRY(map_weight(b, "latent_scale"));
+    wd = weight_codes_dtype(b, "latent_scale", RAD_F32);
+    if (wd != RAD_F32 && wd != RAD_BF16) {
+        fprintf(stderr, "radiance: haru_proj: latent_scale is %s; this block serves f32 or bf16 "
+                        "weights\n", rad_dtype_name(wd));
+        return RAD_E_UNSUPPORTED;
+    }
+    dt = (wd == RAD_BF16) ? "bf16w_f32a" : "f32";
+
     PROJ_BUF(b_x, "proj.x", H);
     PROJ_BUF(b_x2, "proj.x2", H);
     PROJ_BUF(b_y, "proj.y", H);
@@ -65,21 +81,28 @@ int HaruProj::declare(RadBuilder* b, rad_weight tokens) {
     PROJ_BUF(b_recip_d, "proj.recip_d", D);
     PROJ_BUF(b_unscaled, "proj.unscaled", D);
 
-    RAD_ARCH_TRY(plain_weight(b, "latent_scale", { 1 }, &latent_scale));
-    RAD_ARCH_TRY(plain_weight(b, "latent_bias", { 1 }, &latent_bias));
+    /* latent_scale is already mapped; declare it f32, then latent_bias. */
+    RAD_ARCH_TRY(plain_weight(b, "latent_scale", { 1 }, RAD_F32, &latent_scale));
+    RAD_ARCH_TRY(map_weight(b, "latent_bias"));
+    RAD_ARCH_TRY(plain_weight(b, "latent_bias", { 1 }, RAD_F32, &latent_bias));
 
     auto audio = [&](const char* prefix, HaruAudioProjW* w) -> int {
         char n[128];
         std::snprintf(n, sizeof n, "%s.fc1.weight", prefix);
-        RAD_ARCH_TRY(plain_weight(b, n, { H, D }, &w->fc1));
+        RAD_ARCH_TRY(map_weight(b, n));
+        RAD_ARCH_TRY(plain_weight(b, n, { H, D }, wd, &w->fc1));
         std::snprintf(n, sizeof n, "%s.fc1.bias", prefix);
-        RAD_ARCH_TRY(plain_weight(b, n, { H }, &w->fc1_b));
+        RAD_ARCH_TRY(map_weight(b, n));
+        RAD_ARCH_TRY(plain_weight(b, n, { H }, RAD_F32, &w->fc1_b));
         std::snprintf(n, sizeof n, "%s.norm.weight", prefix);
-        RAD_ARCH_TRY(plain_weight(b, n, { H }, &w->norm));
+        RAD_ARCH_TRY(map_weight(b, n));
+        RAD_ARCH_TRY(plain_weight(b, n, { H }, RAD_F32, &w->norm));
         std::snprintf(n, sizeof n, "%s.fc2.weight", prefix);
-        RAD_ARCH_TRY(plain_weight(b, n, { H, H }, &w->fc2));
+        RAD_ARCH_TRY(map_weight(b, n));
+        RAD_ARCH_TRY(plain_weight(b, n, { H, H }, wd, &w->fc2));
         std::snprintf(n, sizeof n, "%s.fc2.bias", prefix);
-        RAD_ARCH_TRY(plain_weight(b, n, { H }, &w->fc2_b));
+        RAD_ARCH_TRY(map_weight(b, n));
+        RAD_ARCH_TRY(plain_weight(b, n, { H }, RAD_F32, &w->fc2_b));
         return RAD_OK;
     };
     RAD_ARCH_TRY(audio("model_audio_proj", &model));
@@ -88,7 +111,7 @@ int HaruProj::declare(RadBuilder* b, rad_weight tokens) {
     auto gemm_bias = [&](int64_t N, int64_t K, rad_weight w, rad_weight bias) {
         return RAD_OP(b, "gemm_nt_bias",
                       RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("N", N), RAD_INT("K", K),
-                                 RAD_STR("dtype", "f32")),
+                                 RAD_STR("dtype", dt)),
                       RAD_WEIGHTS(w, bias));
     };
     auto norm = [&](rad_weight w) {

@@ -12,6 +12,10 @@
  * embedding table is the LM's (`lm.embed_tokens.weight`), so it is not declared here: the plugin
  * that assembles the LM declares it once and passes the handle in, and this block only reads it.
  *
+ * The fc1/fc2 GEMM weights are read at the checkpoint's own dtype (bf16 in the real model, f32 in
+ * the tiny one) through the bf16-weight/f32-activation biased GEMM; the biases, the rmsnorm gains
+ * and every activation stay f32, so the block is bit-identical to the f32 control.
+ *
  * One call is one position: one token id, one row of each latent, one row of each mask.
  */
 #ifndef HARU_PROJ_H
@@ -40,6 +44,9 @@ struct HaruAudioProjW {
 /* Everything the two projectors, the latent scalars and the embedding sum own. */
 struct HaruProj {
     HaruProjGeom g;
+
+    uint32_t    wd = RAD_F32;   /* the checkpoint's own dtype: the fc1/fc2 GEMM weights */
+    const char* dt = "f32";     /* the GEMM operand-combination string: "bf16w_f32a" or "f32" */
 
     rad_weight latent_scale = 0, latent_bias = 0;
     HaruAudioProjW model{}, user{};

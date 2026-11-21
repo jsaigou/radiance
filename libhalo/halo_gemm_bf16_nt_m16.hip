@@ -148,7 +148,11 @@ extern "C" int halo_rad_gemm_bf16_m16(const RadArgs* a, RadStream s) {
     GemmOps g;
     int rc = gemm_ops(a, &g, 0);
     if (rc != RAD_OK) return rc;
-    if (g.M < 1 || g.M > HALO_GEMM16_MAX_M) return HALO_NO(RAD_E_SHAPE);
+    if (g.M < 1) return HALO_NO(RAD_E_SHAPE);
+    /* The band is chosen from the op's own M, but the operand folds rank-3 activations to M = rows * positions
+     * (gemm_ops), so a call the picker sized as M <= 8 can arrive here with 32 rows (Breeze-TTS's depth decoder).
+     * That is a shape the m64 row serves, not one to refuse. */
+    if (g.M > HALO_GEMM16_MAX_M) return halo_rad_gemm_bf16_m64(a, s);
     HaloGemmCfg cv;
     halo_cfg_gemm(a, &cv);
     const int wv = cv.wv > 0 ? cv.wv : 1;

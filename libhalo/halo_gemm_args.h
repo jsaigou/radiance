@@ -314,7 +314,18 @@ int halo_mxfp4a8_tiled_split(const RadArgs* a, RadStream s, const GemmOps& g, co
 /* Folds a contiguous rank-3+ operand to rank 2 (rows x the product of the rest), held by value in
  * `flat` because the operand array is the core's; a rank-2 operand is left as it is. */
 static inline int fold_rows(const RadTensor** t, RadTensor* flat) {
-    if ((*t)->rank < 2) return HALO_NO(RAD_E_SHAPE);
+    if ((*t)->rank < 1) return HALO_NO(RAD_E_SHAPE);
+    if ((*t)->rank == 1) {
+        /* A single row declared rank 1 ([n]), as a plugin declares a one-row workspace: the skinny f32 rows read it as [1, n]
+         * and the bf16 rows now do too. Slicing such a buffer by element offset is why a plugin cannot simply declare [1, n]. */
+        if ((*t)->stride[0] != 1) return HALO_NO(RAD_E_STRIDE);
+        *flat = **t;
+        flat->rank = 2;
+        flat->shape[0] = 1;  flat->shape[1] = (*t)->shape[0];
+        flat->stride[0] = (*t)->shape[0];  flat->stride[1] = 1;
+        *t = flat;
+        return RAD_OK;
+    }
     if ((*t)->rank == 2) return RAD_OK;
     if (!halo_contig(*t)) return HALO_NO(RAD_E_STRIDE);
     *flat = **t;

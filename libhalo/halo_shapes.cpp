@@ -418,6 +418,14 @@ extern "C" int halo_shape_gemm_nt_bias(const RadParam* p, int n_p, int operand, 
     HALO_PICK(l);
 }
 
+extern "C" int halo_shape_gemm_nt_bias_bf16w_f32a(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), K = pi(p, n_p, "K");
+    const RadOpdDesc l[] = { opd((uint32_t)RAD_F32, M, K), opd((uint32_t)RAD_BF16, N, K),
+                             opd((uint32_t)RAD_F32, N), opd((uint32_t)RAD_F32, M, N),
+                             opd((uint32_t)RAD_F32, M, N) };
+    HALO_PICK(l);
+}
+
 extern "C" int halo_shape_moe_mxfp4(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M = pi(p, n_p, "M"), N = pi(p, n_p, "N"), K = pi(p, n_p, "K");
     const int64_t N1 = rad_param_geti(p, n_p, "N_odd", N), K1 = rad_param_geti(p, n_p, "K_odd", K);
@@ -1376,6 +1384,16 @@ extern "C" int halo_shape_gemm_nt(const RadParam* p, int n_p, int operand,
     const int64_t K = pi(p, n_p, "K");
     const uint32_t D = dt_act(p, n_p, "dtype");
     const RadOpdDesc l[] = { opd(D, M, K), opd(D, N, K), opd(D, M, N) };
+    HALO_PICK(l);
+}
+
+extern "C" int halo_shape_gemm_nt_bf16w_f32a(const RadParam* p, int n_p, int operand,
+                                             RadOpdDesc* out) {
+    const int64_t M = pi(p, n_p, "M");
+    const int64_t N = pi(p, n_p, "N");
+    const int64_t K = pi(p, n_p, "K");
+    const RadOpdDesc l[] = { opd((uint32_t)RAD_F32, M, K), opd((uint32_t)RAD_BF16, N, K),
+                             opd((uint32_t)RAD_F32, M, N) };
     HALO_PICK(l);
 }
 

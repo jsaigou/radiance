@@ -2,7 +2,10 @@
  *
  * The reference stores every head linear without a bias (nn.Linear(..., bias=False)) and applies
  * two weight-free norms: HeadLayer takes the learned `norm.weight` gain, FinalLayer takes none.
- * The checkpoint is float32 in the tiny model, so every weight is declared RAD_F32.
+ * The GEMM weights are read at the checkpoint's own dtype -- bf16 in the real model, f32 in the
+ * tiny one -- through the bf16-weight/f32-activation skinny GEMM; the activation workspace, the
+ * rmsnorm gains and every other op are f32, so the arithmetic is bit-identical to the f32 control
+ * while the weight stream is halved.
  */
 #include "haru_head.h"
 
@@ -14,13 +17,14 @@ namespace arch {
 
 namespace {
 
-/* A plain float32 weight and the name map that finds it. The map entry must precede the weight:
- * a weight declared before its map is read as "absent from the container". */
+/* The identity name map that finds a weight. The map entry must precede the weight: a weight
+ * declared before its map is read as "absent from the container". */
+int map_weight(RadBuilder* b, const char* name) { return map_copy(b, name, name); }
+
+/* A weight over its already-mapped name, at the given dtype. */
 int plain_weight(RadBuilder* b, const char* name, std::initializer_list<int64_t> shape,
-                 rad_weight* out) {
-    const int st = map_copy(b, name, name);
-    if (st < 0) return st;
-    *out = decl_w(b, name, RAD_F32, shape, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
+                 uint32_t dtype, rad_weight* out) {
+    *out = decl_w(b, name, dtype, shape, RAD_ACCESS_PER_TOKEN, RAD_SHARD_NONE, grp_model());
     return *out ? RAD_OK : RAD_E_INVAL;
 }
 
@@ -44,6 +48,19 @@ int HaruHead::declare(RadBuilder* b) {
     const int64_t D = g.latent;
     const int64_t F = g.ffn;
     if (H <= 0 || D <= 0 || F <= 0 || g.layers < 0) return RAD_E_INVAL;
+
+    /* The checkpoint's own dtype decides how the GEMM weights are declared and which GEMM row
+     * runs: bf16 in the real model ("bf16w_f32a") and f32 in the tiny one ("f32"). The map must
+     * precede the weight, so cond_proj's map comes first and every later weight is mapped right
+     * before its declaration. */
+    RAD_ARCH_TRY(map_weight(b, "head.cond_proj.weight"));
+    wd = weight_codes_dtype(b, "head.cond_proj.weight", RAD_F32);
+    if (wd != RAD_F32 && wd != RAD_BF16) {
+        fprintf(stderr, "radiance: haru_head: cond_proj is %s; this block serves f32 or bf16 "
+                        "weights\n", rad_dtype_name(wd));
+        return RAD_E_UNSUPPORTED;
+    }
+    dt = (wd == RAD_BF16) ? "bf16w_f32a" : "f32";
 
     /* Workspace. All persistent: the head runs once a lane-step and a transient plan would not
      * gain anything a few tens of KiB could not. */
@@ -78,17 +95,27 @@ int HaruHead::declare(RadBuilder* b) {
     HEAD_BUF(b_oneh, "head.oneh", H);
 
     /* Weights. The checkpoint names are also the declared names, so the map is the identity but
-     * still has to exist. Each entry comes before the weight it names. */
-    RAD_ARCH_TRY(plain_weight(b, "head.cond_proj.weight", { H, H }, &cond_proj));
-    RAD_ARCH_TRY(plain_weight(b, "head.latent_proj.weight", { H, D }, &latent_proj));
-    RAD_ARCH_TRY(plain_weight(b, "head.t_embed.fc1.weight", { H, kHaruScalarFreqs }, &t_fc1));
-    RAD_ARCH_TRY(plain_weight(b, "head.t_embed.fc2.weight", { H, H }, &t_fc2));
-    RAD_ARCH_TRY(plain_weight(b, "head.dt_embed.fc1.weight", { H, kHaruScalarFreqs }, &dt_fc1));
-    RAD_ARCH_TRY(plain_weight(b, "head.dt_embed.fc2.weight", { H, H }, &dt_fc2));
-    RAD_ARCH_TRY(plain_weight(b, "head.h_embed.fc1.weight", { H, kHaruScalarFreqs }, &h_fc1));
-    RAD_ARCH_TRY(plain_weight(b, "head.h_embed.fc2.weight", { H, H }, &h_fc2));
-    RAD_ARCH_TRY(plain_weight(b, "head.omega_embed.fc1.weight", { H, kHaruScalarFreqs }, &omega_fc1));
-    RAD_ARCH_TRY(plain_weight(b, "head.omega_embed.fc2.weight", { H, H }, &omega_fc2));
+     * still has to exist. Each entry comes before the weight it names. The GEMM linears are the
+     * checkpoint's own dtype; the rmsnorm gains are f32. */
+    RAD_ARCH_TRY(plain_weight(b, "head.cond_proj.weight", { H, H }, wd, &cond_proj));
+    RAD_ARCH_TRY(map_weight(b, "head.latent_proj.weight"));
+    RAD_ARCH_TRY(plain_weight(b, "head.latent_proj.weight", { H, D }, wd, &latent_proj));
+    RAD_ARCH_TRY(map_weight(b, "head.t_embed.fc1.weight"));
+    RAD_ARCH_TRY(plain_weight(b, "head.t_embed.fc1.weight", { H, kHaruScalarFreqs }, wd, &t_fc1));
+    RAD_ARCH_TRY(map_weight(b, "head.t_embed.fc2.weight"));
+    RAD_ARCH_TRY(plain_weight(b, "head.t_embed.fc2.weight", { H, H }, wd, &t_fc2));
+    RAD_ARCH_TRY(map_weight(b, "head.dt_embed.fc1.weight"));
+    RAD_ARCH_TRY(plain_weight(b, "head.dt_embed.fc1.weight", { H, kHaruScalarFreqs }, wd, &dt_fc1));
+    RAD_ARCH_TRY(map_weight(b, "head.dt_embed.fc2.weight"));
+    RAD_ARCH_TRY(plain_weight(b, "head.dt_embed.fc2.weight", { H, H }, wd, &dt_fc2));
+    RAD_ARCH_TRY(map_weight(b, "head.h_embed.fc1.weight"));
+    RAD_ARCH_TRY(plain_weight(b, "head.h_embed.fc1.weight", { H, kHaruScalarFreqs }, wd, &h_fc1));
+    RAD_ARCH_TRY(map_weight(b, "head.h_embed.fc2.weight"));
+    RAD_ARCH_TRY(plain_weight(b, "head.h_embed.fc2.weight", { H, H }, wd, &h_fc2));
+    RAD_ARCH_TRY(map_weight(b, "head.omega_embed.fc1.weight"));
+    RAD_ARCH_TRY(plain_weight(b, "head.omega_embed.fc1.weight", { H, kHaruScalarFreqs }, wd, &omega_fc1));
+    RAD_ARCH_TRY(map_weight(b, "head.omega_embed.fc2.weight"));
+    RAD_ARCH_TRY(plain_weight(b, "head.omega_embed.fc2.weight", { H, H }, wd, &omega_fc2));
 
     lw.assign((size_t)g.layers, HaruHeadLayerW{});
     lop.assign((size_t)g.layers, HaruHeadLayerOp{});
@@ -96,24 +123,31 @@ int HaruHead::declare(RadBuilder* b) {
         HaruHeadLayerW& w = lw[(size_t)l];
         char n[128];
         std::snprintf(n, sizeof n, "head.layers.%lld.norm.weight", (long long)l);
-        RAD_ARCH_TRY(plain_weight(b, n, { H }, &w.norm));
+        RAD_ARCH_TRY(map_weight(b, n));
+        RAD_ARCH_TRY(plain_weight(b, n, { H }, RAD_F32, &w.norm));
         std::snprintf(n, sizeof n, "head.layers.%lld.ada.weight", (long long)l);
-        RAD_ARCH_TRY(plain_weight(b, n, { 3 * H, H }, &w.ada));
+        RAD_ARCH_TRY(map_weight(b, n));
+        RAD_ARCH_TRY(plain_weight(b, n, { 3 * H, H }, wd, &w.ada));
         std::snprintf(n, sizeof n, "head.layers.%lld.ffn.gate_proj.weight", (long long)l);
-        RAD_ARCH_TRY(plain_weight(b, n, { F, H }, &w.gate));
+        RAD_ARCH_TRY(map_weight(b, n));
+        RAD_ARCH_TRY(plain_weight(b, n, { F, H }, wd, &w.gate));
         std::snprintf(n, sizeof n, "head.layers.%lld.ffn.up_proj.weight", (long long)l);
-        RAD_ARCH_TRY(plain_weight(b, n, { F, H }, &w.up));
+        RAD_ARCH_TRY(map_weight(b, n));
+        RAD_ARCH_TRY(plain_weight(b, n, { F, H }, wd, &w.up));
         std::snprintf(n, sizeof n, "head.layers.%lld.ffn.down_proj.weight", (long long)l);
-        RAD_ARCH_TRY(plain_weight(b, n, { H, F }, &w.down));
+        RAD_ARCH_TRY(map_weight(b, n));
+        RAD_ARCH_TRY(plain_weight(b, n, { H, F }, wd, &w.down));
     }
-    RAD_ARCH_TRY(plain_weight(b, "head.final.ada.weight", { 2 * H, H }, &final_ada));
-    RAD_ARCH_TRY(plain_weight(b, "head.final.proj.weight", { D, H }, &final_proj));
+    RAD_ARCH_TRY(map_weight(b, "head.final.ada.weight"));
+    RAD_ARCH_TRY(plain_weight(b, "head.final.ada.weight", { 2 * H, H }, wd, &final_ada));
+    RAD_ARCH_TRY(map_weight(b, "head.final.proj.weight"));
+    RAD_ARCH_TRY(plain_weight(b, "head.final.proj.weight", { D, H }, wd, &final_proj));
 
     /* Linear layers. Every GEMM is one row: a lane-step. */
     auto gemm = [&](int64_t N, int64_t K, rad_weight w) {
         return RAD_OP(b, "gemm_nt",
                       RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("N", N), RAD_INT("K", K),
-                                 RAD_STR("dtype", "f32")),
+                                 RAD_STR("dtype", dt)),
                       RAD_WEIGHTS(w));
     };
     auto unary = [&](const char* name, int64_t n) {

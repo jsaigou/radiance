@@ -4600,6 +4600,8 @@ static const RadConstraint cGemmSkinnyF32[] = { C_GE("M", 1), C_LE("M", 8), C_DI
                                                 C_IN("dtype", "f32") };
 static const RadConstraint cGemmBiasSkinnyBf16[] = { C_GE("M", 1), C_LE("M", 16), C_DIV("K", 8), C_IN("dtype", "bf16") };
 static const RadConstraint cGemmBiasSkinnyF32[]  = { C_GE("M", 1), C_LE("M", 8),  C_DIV("K", 4), C_IN("dtype", "f32") };
+static const RadConstraint cGemmSkinnyBf16wF32a[] = { C_GE("M", 1), C_LE("M", 8), C_DIV("K", 4), C_IN("dtype", "bf16w_f32a") };
+static const RadConstraint cGemmBiasSkinnyBf16wF32a[] = { C_GE("M", 1), C_LE("M", 8), C_DIV("K", 4), C_IN("dtype", "bf16w_f32a") };
 static const RadConstraint cGemmNtF32[] = { C_GE("M", 1),         C_LE("M", 65535),
                                             C_GE("N", 1),         C_LE("N", 512),
                                             C_GE("K", 1),         C_LE("K", 16384),
@@ -5966,6 +5968,17 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, halo_rad_gemm_nt_f32_skinny, nullptr, nullptr, nullptr,
   halo_shape_gemm_nt },
 
+{ "gemm_bf16w_f32a_nt_skinny", "gemm_nt", "gemm",
+  "skinny GEMM Y[M,N] = A[M,K] @ W[N,K]^T with bf16 weights read directly and f32 activations: a "
+  "streaming dot product, a wave owns up to eight columns, its lanes stride K in four-weight chunks "
+  "with non-temporal loads and widen the weights in registers",
+  "M <= 8; K divisible by 4; weights 16-byte aligned; any N",
+  "bf16 W, f32 A / Y, f32 accumulate, bit-identical to the f32 row over a widened checkpoint",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_ONLY,
+  ROW(cGemmSkinnyBf16wF32a), NOTUNE,
+  nullptr, nullptr, halo_rad_gemm_bf16w_f32a_nt_skinny, nullptr, nullptr, nullptr,
+  halo_shape_gemm_nt_bf16w_f32a },
+
 { "gemm_bf16_nt_bias_skinny", "gemm_nt_bias", "gemm",
   "skinny biased GEMM C = res + act(A @ W^T + bias) for up to 16 rows: a streaming dot product, a wave "
   "owns up to eight columns, lanes stride K in 16-byte chunks with non-temporal weight loads",
@@ -5985,6 +5998,16 @@ static const RadKernelInfo kKernels[] = {
   ROW(cGemmBiasSkinnyF32), NOTUNE,
   nullptr, nullptr, halo_rad_gemm_nt_bias_skinny_f32, nullptr, nullptr, nullptr,
   halo_shape_gemm_nt_bias },
+
+{ "gemm_bf16w_f32a_nt_bias_skinny", "gemm_nt_bias", "gemm",
+  "skinny biased GEMM C = res + act(A @ W^T + bias) with bf16 weights read directly and f32 "
+  "activations, a streaming dot product with non-temporal weight loads",
+  "M <= 8; K divisible by 4; weights 16-byte aligned; any N; `res` may be the output itself",
+  "bf16 W, f32 A / C / res, f32 bias, f32 accumulate",
+  RAD_DOMAIN_DEVICE, HALO_PRIO_GEMM_M16,
+  ROW(cGemmBiasSkinnyBf16wF32a), NOTUNE,
+  nullptr, nullptr, halo_rad_gemm_nt_bias_skinny_bf16w_f32a, nullptr, nullptr, nullptr,
+  halo_shape_gemm_nt_bias_bf16w_f32a },
 
 { "add_bf16", "add", "elem",
   "elementwise sum, with the one row-broadcast form; `div` divides the rounded sum",
