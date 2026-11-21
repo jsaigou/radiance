@@ -6003,7 +6003,7 @@ static const RadKernelInfo kKernels[] = {
   "skinny biased GEMM C = res + act(A @ W^T + bias) with bf16 weights read directly and f32 "
   "activations, a streaming dot product with non-temporal weight loads",
   "M <= 8; K divisible by 4; weights 16-byte aligned; any N; `res` may be the output itself",
-  "bf16 W, f32 A / C / res, f32 or bf16 bias, f32 accumulate",
+  "bf16 W, f32 A / C / res, f32 bias, f32 accumulate",
   RAD_DOMAIN_DEVICE, HALO_PRIO_GEMM_M16,
   ROW(cGemmBiasSkinnyBf16wF32a), NOTUNE,
   nullptr, nullptr, halo_rad_gemm_nt_bias_skinny_bf16w_f32a, nullptr, nullptr, nullptr,
