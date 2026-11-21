@@ -61,6 +61,7 @@ struct HaruProj {
     rad_op op_gemm1_u = 0, op_gemm2_u = 0, op_norm_u = 0;
     rad_op op_mask = 0, op_add_h = 0;
     rad_op op_cast_lat = 0;
+    rad_op op_cast_mask = 0;   /* the f32 row mask to the serving dtype: scale_rows serves an all-bf16 leg or an f32 leg, not bf16 rows with an f32 scalar */
 
     /* unscale: raw = z / latent_scale - latent_bias. The reciprocal is Newton's iteration on
      * the device (no host read of a weight). From r0 = 0.75 and kUnscaleSteps = 12 steps the
@@ -79,6 +80,8 @@ struct HaruProj {
     rad_buf b_fc1 = 0, b_norm = 0;
     rad_buf b_bias = 0, b_scaled = 0, b_scaled2 = 0, b_ones = 0;
     rad_buf b_scaled_bf16 = 0;
+    rad_buf b_mask_s = 0;      /* the mask scalar in the serving dtype */
+    bool mask_needs_cast = false;
 
     /* Declares the projectors' weights and name maps, the latent scale/bias, the workspace and
      * the ops. `tokens` is the LM's `lm.embed_tokens.weight`, which must already be declared. */

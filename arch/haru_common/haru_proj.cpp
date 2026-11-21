@@ -5,6 +5,7 @@
  * Newton reciprocal needs f32 exactness), so they load as ordinary f32 weights and the scaled
  * latent is cast once before fc1.
  */
+#include <cstring>
 #include "haru_proj.h"
 
 #include <cstdio>
@@ -88,6 +89,8 @@ int HaruProj::declare(RadBuilder* b, rad_weight tokens) {
     PROJ_BUF_F32(b_recip_d, "proj.recip_d", D);
     PROJ_BUF_F32(b_unscaled, "proj.unscaled", D);
     PROJ_BUF(b_scaled_bf16, "proj.scaled_bf16", D);
+    PROJ_BUF(b_mask_s, "proj.mask_s", 1);
+    mask_needs_cast = std::strcmp(dt, "f32") != 0;
 
     /* latent_scale is already mapped; declare it f32, then latent_bias. */
     RAD_ARCH_TRY(plain_weight(b, "latent_scale", { 1 }, RAD_F32, &latent_scale));
@@ -172,6 +175,13 @@ int HaruProj::declare(RadBuilder* b, rad_weight tokens) {
             RAD_OP(b, "add",
                    RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", H), RAD_STR("dtype", dt)),
                    RAD_NOWEIGHTS));
+    if (mask_needs_cast) {
+        PROJ_OP(op_cast_mask,
+                RAD_OP(b, "cast",
+                       RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", 1),
+                                  RAD_STR("from", "f32"), RAD_STR("to", dt)),
+                       RAD_NOWEIGHTS));
+    }
     PROJ_OP(op_cast_lat,
             RAD_OP(b, "cast",
                    RAD_PARAMS(RAD_RANGE("M", 1, 1), RAD_INT("n", D),
@@ -246,7 +256,12 @@ void HaruProj::issue(RadCtx* c, RadOperand token, RadOperand model_latent, RadOp
                     RAD_B(b_y));
 
         /* y * mask, the mask a row scalar: scale_rows reads one scalar per row. */
-        RAD_ISSUE_N(c, op_mask, 1, RAD_B(b_y), mask, RAD_NONE, RAD_B(b_mask));
+        if (mask_needs_cast) {
+            RAD_ISSUE_N(c, op_cast_mask, 1, mask, RAD_B(b_mask_s));
+            RAD_ISSUE_N(c, op_mask, 1, RAD_B(b_y), RAD_B(b_mask_s), RAD_NONE, RAD_B(b_mask));
+        } else {
+            RAD_ISSUE_N(c, op_mask, 1, RAD_B(b_y), mask, RAD_NONE, RAD_B(b_mask));
+        }
         RAD_ISSUE_N(c, op_add_h, 1, src, RAD_B(b_mask), dst);
     };
 
